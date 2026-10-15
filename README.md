@@ -70,6 +70,15 @@ so no stale source files survive.
 
 ### 4. Build
 
+First apply this project's fixes to ps3recomp (once after cloning, and again
+whenever `patches/ps3recomp/` gains a patch; already-applied ones are skipped):
+
+```sh
+git submodule update --init
+scripts/apply_patches.sh
+```
+
+
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo
