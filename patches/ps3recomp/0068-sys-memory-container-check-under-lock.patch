@@ -1,0 +1,48 @@
+0066 follow-up (MAGI-4's review nits): container capacity check under the bump lock
+
+The landed 0066 checked a container's free space before taking the bump lock,
+so two concurrent allocations could both pass it; the check now runs in
+mem_allocate under the lock, next to the charge. Comment fix: the Survival
+map block that hit the BSS was the eighth (slot 24), not the sixth.
+
+--- a/runtime/syscalls/sys_memory.c
++++ b/runtime/syscalls/sys_memory.c
+@@ -91,6 +91,14 @@
+         return (int64_t)(int32_t)CELL_ENOMEM;
+     }
+ 
++    /* A container refuses to grow past its size (checked under the lock, so
++     * two allocations cannot both pass it). */
++    if (cid > 0 && (uint64_t)g_sys_mem_containers[cid - 1].used_size + size >
++                   g_sys_mem_containers[cid - 1].total_size) {
++        bump_unlock();
++        return (int64_t)(int32_t)CELL_ENOMEM;
++    }
++
+     /* Find a free allocation slot */
+     int slot = -1;
+     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
+@@ -154,8 +162,8 @@
+  * address never written. Tokyo Jungle allocates its 16 MB map-block pool this
+  * way (func_001518F0) and carves 32 x 512 KB slots from the address it gets
+  * back -- from 0. The tutorial's blocks landed on the original PPU code image
+- * (dead in a recompile, so nothing showed), the Survival map's sixth block on
+- * the BSS at 0x00C00000 holding the sound middleware's state: "sgxBmg unknown
++ * (dead in a recompile, so nothing showed), the Survival map's eighth block (slot
++ * 24) on the BSS at 0x00C00000 holding the sound middleware's state: "sgxBmg unknown
+  * ID", "sgsFileGetResult unknown file handle", BROKEN_EXIT_HDDGAME, a white
+  * screen right after the tutorial.
+  *
+@@ -176,11 +184,7 @@
+             size, cid, flags);
+     int32_t charge = 0;
+     if (cid >= 1 && cid <= SYS_MEMORY_CONTAINER_MAX && g_sys_mem_containers[cid - 1].active) {
+-        const uint32_t align = (flags & SYS_MEMORY_PAGE_SIZE_1M) ? 0x100000u : 0x10000u;
+-        sys_mem_container_info* c = &g_sys_mem_containers[cid - 1];
+-        if ((uint64_t)c->used_size + VM_ALIGN_UP(size, align) > c->total_size)
+-            return (int64_t)(int32_t)CELL_ENOMEM;
+-        charge = (int32_t)cid;
++        charge = (int32_t)cid;   /* mem_allocate checks and charges it */
+     } else {
+         static int warned;
+         if (!warned++)
