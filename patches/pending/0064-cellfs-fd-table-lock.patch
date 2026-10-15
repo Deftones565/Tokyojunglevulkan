@@ -1,0 +1,167 @@
+cellFs (ppu_fs.cpp): one host lock for the fd/dir tables and every use of an fd
+
+lv2 file calls are thread-safe; ours had no lock. fd_alloc_file scanned then
+claimed (two concurrent opens could get the same fd), Close freed a FILE*
+another thread could be reading. Tokyo Jungle loads sound banks on its own
+thread (sgsfile-req-th) while the map loader and the game thread do file I/O.
+A recursive mutex is taken by every handler that touches the tables (AIO: not
+across the guest completion callback). A call that has to wait logs
+"[fs] <handler> waited for another thread's file call" (first 16, then every
+256th): each one ran concurrently before this patch.
+
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -20,6 +20,7 @@
+ #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
+ #include <stdint.h>
+ #include <stdio.h>
++#include <mutex>
+ #include <string.h>
+ #include <stdlib.h>
+ #include <sys/stat.h>
+@@ -149,6 +150,32 @@
+ }
+ 
+ /* ---- fd / dir handle tables ---- */
++/* One lock for the tables and every use of an fd. lv2's file calls are
++ * thread-safe and titles rely on it: Tokyo Jungle's sound library loads its
++ * banks on its own thread (sgsfile-req-th) while the map loader and the game
++ * thread open, read and close other files. Unlocked, two opens at the same
++ * moment could hand out the same fd (fd_alloc_file scans, then claims), and a
++ * close could free a FILE* another thread was reading. Held across the host
++ * I/O of a call, never across a call back into guest code. Recursive so a
++ * handler that ends up in another handler cannot deadlock itself. */
++static std::recursive_mutex g_fs_lock;
++/* Takes the lock; when another thread holds it, says so (first 16, then every
++ * 256th with a count): each of those is a call that, before this lock, ran
++ * concurrently with another thread's file call on the same tables. */
++struct fs_locked {
++    explicit fs_locked(const char* who) {
++        if (g_fs_lock.try_lock()) return;
++        static unsigned long n;
++        const unsigned long k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
++        if (k <= 16 || (k & 255) == 0)
++            fprintf(stderr, "[fs] %s waited for another thread's file call (#%lu)\n", who, k);
++        g_fs_lock.lock();
++    }
++    ~fs_locked() { g_fs_lock.unlock(); }
++    fs_locked(const fs_locked&) = delete;
++    fs_locked& operator=(const fs_locked&) = delete;
++};
++#define FS_LOCKED fs_locked fs_locked_(__func__)
+ #define FS_MAX 256
+ static FILE* g_files[FS_MAX];
+ static uint8_t g_fd_usm[FS_MAX];
+@@ -172,6 +199,7 @@
+ /* ---- handlers ---- */
+ static void cellFsOpen(ppu_context* ctx)
+ {
++    FS_LOCKED;
+     char gpath[1024], hpath[1100];
+     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+     uint32_t flags  = (uint32_t)ctx->gpr[4];
+@@ -269,6 +297,7 @@
+  * (gpr[6]) and its size (gpr[7]) are ignored. */
+ static void cellFsSdataOpen(ppu_context* ctx)
+ {
++    FS_LOCKED;
+     char gpath[1024], hpath[1100];
+     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
+@@ -343,6 +372,7 @@
+ 
+ static void cellFsClose(ppu_context* ctx)
+ {
++    FS_LOCKED;
+     int fd = (int)(uint32_t)ctx->gpr[3];
+     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
+         fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
+@@ -377,6 +407,7 @@
+ 
+ static void cellFsRead(ppu_context* ctx)
+ {
++    FS_LOCKED;
+     int fd          = (int)(uint32_t)ctx->gpr[3];
+     uint32_t buf    = (uint32_t)ctx->gpr[4];
+     uint64_t nbytes = ctx->gpr[5];
+@@ -447,6 +478,7 @@
+ 
+ static void cellFsWrite(ppu_context* ctx)
+ {
++    FS_LOCKED;
+     int fd          = (int)(uint32_t)ctx->gpr[3];
+     uint32_t buf    = (uint32_t)ctx->gpr[4];
+     uint64_t nbytes = ctx->gpr[5];
+@@ -510,6 +542,7 @@
+ 
+ static void cellFsFGetBlockSize(ppu_context* ctx)
+ {
++    FS_LOCKED;
+     int fd = (int)(uint32_t)ctx->gpr[3];
+     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
+         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO;
+@@ -527,6 +560,7 @@
+ 
+ static void cellFsLseek(ppu_context* ctx)
+ {
++    FS_LOCKED;
+     int fd        = (int)(uint32_t)ctx->gpr[3];
+     int64_t off   = (int64_t)ctx->gpr[4];
+     uint32_t wh   = (uint32_t)ctx->gpr[5];
+@@ -582,6 +616,7 @@
+ 
+ static void cellFsFstat(ppu_context* ctx)
+ {
++    FS_LOCKED;
+     int fd      = (int)(uint32_t)ctx->gpr[3];
+     uint32_t sb = (uint32_t)ctx->gpr[4];
+     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+@@ -610,6 +645,7 @@
+ 
+ static void cellFsOpendir(ppu_context* ctx)
+ {
++    FS_LOCKED;
+     char gpath[1024], hpath[1100];
+     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
+     uint32_t fd_ptr = (uint32_t)ctx->gpr[4];
+@@ -627,6 +663,7 @@
+ /* CellFsDirent: d_type(1) d_namlen(1) d_name[256]; total 0x102. */
+ static void cellFsReaddir(ppu_context* ctx)
+ {
++    FS_LOCKED;
+     int fd          = (int)(uint32_t)ctx->gpr[3];
+     uint32_t dirent = (uint32_t)ctx->gpr[4];
+     uint32_t nread_ptr = (uint32_t)ctx->gpr[5];
+@@ -648,6 +685,7 @@
+ 
+ static void cellFsClosedir(ppu_context* ctx)
+ {
++    FS_LOCKED;
+     int fd = (int)(uint32_t)ctx->gpr[3];
+     if (fd >= 0 && fd < FS_MAX && g_dirs[fd]) { closedir(g_dirs[fd]); g_dirs[fd] = nullptr; }
+     ctx->gpr[3] = CELL_OK;
+@@ -696,6 +734,7 @@
+  * each, then carries on; answering OK skipped those lines. */
+ static void cellFsFsync(ppu_context* ctx)
+ {
++    FS_LOCKED;
+     int fd = (int)(uint32_t)ctx->gpr[3];
+     if (fd < 0 || fd >= FS_MAX || !g_files[fd] || g_fd_rdonly[fd]) {
+         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return;
+@@ -764,6 +803,7 @@
+ 
+     size_t n = 0;
+     int32_t err = CELL_FS_ENOENT;
++    { FS_LOCKED;   /* released before the guest callback below */
+     if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
+         if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+         fs_prefault(buf, size);
+@@ -772,7 +812,7 @@
+         if (HOST_FSEEK64(g_files[fd], offset) == 0)
+             n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
+         err = CELL_OK;
+-    }
++    } }
+     if (getenv("PS3_FSLOG"))
+         fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu\n",
+                 id, fd, (unsigned long long)offset, (unsigned long long)size, n);
