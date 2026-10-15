@@ -29,7 +29,7 @@
      z->location = location; z->offset = offset;
      z->w = want_w; z->h = want_h;
      z->handle = handle;
-@@ -1311,6 +1319,212 @@
+@@ -1311,6 +1319,213 @@
      return 1;
  }
  
@@ -184,6 +184,7 @@
 +    if (on < 0) { const char* e = getenv("RSX_ENGINE_DEPTH_ARGB_GPU"); on = !(e && e[0] == '0'); }
 +    eng_zdepth* z = &g.zdepths[slot];
 +    if (!on || !z->guest_dirty || z->zfmt != 2u || !z->handle) return 0;   /* Z24S8 only */
++    if (rsx_texture_argb_is_rgba()) return 0;   /* the pass writes the TEX_RGBA=0 order */
 +    if (!g.be->depth_snapshot || !g.be->surface_view) return 0;
 +    if (!(t->format & 0x20u) || t->cubemap || t->mipmaps > 1u) return 0;   /* linear 2D */
 +    const u32 uw = z->used_w < z->w ? z->used_w : z->w;
@@ -242,7 +243,7 @@
  /* A depth write or clear through the current zeta, recorded with what the
   * guest-memory copy needs to lay it out. */
  static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
-@@ -1975,6 +2189,10 @@
+@@ -1975,6 +2190,10 @@
                  const u32 snap = eng_zdepth_snapshot((u32)zsrc);
                  if (snap) { textures[u] = snap; continue; }
              }
@@ -253,7 +254,7 @@
              if (eng_zdepth_to_guest((u32)zsrc)) {
                  textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                 t.width, t.height, t.mipmaps, t.pitch,
-@@ -2768,8 +2986,12 @@
+@@ -2768,8 +2987,12 @@
          if (g.pipelines[i].handle) g.be->pipeline_release(g.be->user, g.pipelines[i].handle);
      for (u32 i = 0; i < g.n_surfaces; i++)
          if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
