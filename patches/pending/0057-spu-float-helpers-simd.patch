@@ -1,0 +1,149 @@
+SPU float helpers: 4-lane SSE4.1/FMA fast path, bit-identical to the scalar code
+
+fa/fs/fm/fma/fms/fnms run as one addps/subps/mulps/vfmadd*ps when no lane has an
+exponent-255 operand or result (else the old per-lane code for the whole vector);
+fceq/fcgt/fcmeq/fcmgt become exact integer compares. Checked bit for bit against the
+old code by tools/spu-bisect/xf-harness (2.0e9 lane tests, 0 mismatches).
+
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -350,8 +350,117 @@
+     if (mag) { x = fabs(x); y = fabs(y); }
+     return gt ? x > y : x == y;
+ }
++#if defined(__SSE4_1__) && (defined(__x86_64__) || defined(_M_X64))
++#include <smmintrin.h>
++#if defined(__FMA__)
++#include <immintrin.h>
++#endif
++/* 4-lane fast path (the scalar loops below stay as the fallback and as the
++ * reference: tools/spu-bisect/xf-harness in the port checks every op of
++ * both bit for bit). The per-lane loop over spu__xf_op was ~30% of the SPURS
++ * job threads in gameplay: the op switch ran per lane and nothing inlined.
++ *
++ * Why it is exact: spu__xf_op flushes denormal operands, and when no used
++ * operand has exponent 255 it runs ONE IEEE single op (add, sub, mul, or a
++ * single-rounding fmaf) in the host's default mode (round-to-nearest, no
++ * DAZ/FTZ; MXCSR is never changed), keeps the result unless its exponent
++ * is 255, and flushes a denormal result. addps/subps/mulps/vfmadd*ps are the
++ * same IEEE ops lane by lane in the same MXCSR mode, so with the same
++ * flushed operands they give the same bits, signed zeros included (fnmadd
++ * negates the product exactly, = fmaf(a, -b, c); fmsub = fmaf(a, b, -c)).
++ * The host op cannot make a NaN here (no Inf/NaN operand reaches it), so an
++ * exponent-255 result lane only means overflow. Whenever any lane has an
++ * exponent-255 operand or result, the whole vector is redone by the scalar
++ * loop, which is the old code unchanged. */
++#define SPU_XF_SIMD 1
++/* The u128 wrappers are forced inline: the lifted functions are huge, the
++ * inliner gave up on them, and an out-of-line call passes and returns each
++ * u128 (a union with uint64_t members) through general registers. */
++#define SPU_XF_HOT static inline __attribute__((always_inline))
++SPU_XF_HOT __m128i spu__xf_ftz4(__m128i v) {
++    const __m128i z = _mm_cmpeq_epi32(_mm_and_si128(v, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
++    return _mm_andnot_si128(_mm_and_si128(z, _mm_set1_epi32(0x7FFFFFFF)), v);
++}
++SPU_XF_HOT __m128i spu__xf_ext4(__m128i v) {
++    const __m128i e = _mm_set1_epi32(0x7F800000);
++    return _mm_cmpeq_epi32(_mm_and_si128(v, e), e);
++}
++static __attribute__((noinline, cold)) u128 spu__xf_op4_slow(int op, u128 a, u128 b, u128 c) {
++    u128 r;
++    for (int i = 0; i < 4; i++)
++        r._u32[i] = spu__xf_op(op, a._u32[i], b._u32[i], op >= SPU_XF_MA ? c._u32[i] : 0);
++    return r;
++}
++/* op is a constant at every call site, so the switches fold away. */
++SPU_XF_HOT u128 spu__xf_op4(const int op, u128 a, u128 b, u128 c) {
++    __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16);
++    __m128i ext = _mm_or_si128(spu__xf_ext4(A), spu__xf_ext4(B));
++    A = spu__xf_ftz4(A); B = spu__xf_ftz4(B);
++    if (op >= SPU_XF_MA) { memcpy(&C, &c, 16); ext = _mm_or_si128(ext, spu__xf_ext4(C)); C = spu__xf_ftz4(C); }
++    else C = _mm_setzero_si128();
++    if (_mm_testz_si128(ext, ext)) {
++        const __m128 x = _mm_castsi128_ps(A), y = _mm_castsi128_ps(B), z = _mm_castsi128_ps(C);
++        __m128 f;
++        switch (op) {
++        case SPU_XF_ADD: f = _mm_add_ps(x, y); break;
++        case SPU_XF_SUB: f = _mm_sub_ps(x, y); break;
++        case SPU_XF_MUL: f = _mm_mul_ps(x, y); break;
++#if defined(__FMA__)
++        case SPU_XF_MA:  f = _mm_fmadd_ps(x, y, z); break;
++        case SPU_XF_MS:  f = _mm_fmsub_ps(x, y, z); break;
++        default:         f = _mm_fnmadd_ps(x, y, z); break;
++#else
++        default:         (void)z; return spu__xf_op4_slow(op, a, b, c);
++#endif
++        }
++        const __m128i R = _mm_castps_si128(f), re = spu__xf_ext4(R);
++        if (_mm_testz_si128(re, re)) {
++            const __m128i o = spu__xf_ftz4(R);
++            u128 r; memcpy(&r, &o, 16); return r;
++        }
++    }
++    return spu__xf_op4_slow(op, a, b, c);
++}
++SPU_XF_HOT u128 spu_fa(u128 a, u128 b) { return spu__xf_op4(SPU_XF_ADD, a, b, b); }
++SPU_XF_HOT u128 spu_fs(u128 a, u128 b) { return spu__xf_op4(SPU_XF_SUB, a, b, b); }
++SPU_XF_HOT u128 spu_fm(u128 a, u128 b) { return spu__xf_op4(SPU_XF_MUL, a, b, b); }
++SPU_XF_HOT u128 spu_fma(u128 a, u128 b, u128 c)  { return spu__xf_op4(SPU_XF_MA, a, b, c); }
++SPU_XF_HOT u128 spu_fms(u128 a, u128 b, u128 c)  { return spu__xf_op4(SPU_XF_MS, a, b, c); }
++SPU_XF_HOT u128 spu_fnms(u128 a, u128 b, u128 c) { return spu__xf_op4(SPU_XF_NMS, a, b, c); }
++/* Compares, all integer and exact for every input: after the denormal
++ * flush, SPU floats (exponent 255 included: spu__xf_in reads them as
++ * ordinary finite values, and there is no NaN) order exactly like their
++ * sign-magnitude bit patterns, with -0 == +0. key = sign ? -mag : mag maps
++ * that onto signed int32 order (mag <= 0x7FFFFFFF, both zeros -> 0); the
++ * magnitude compares use mag directly. */
++SPU_XF_HOT __m128i spu__xf_key4(__m128i v, int mag) {
++    const __m128i m = _mm_and_si128(v, _mm_set1_epi32(0x7FFFFFFF));
++    if (mag) return m;
++    const __m128i s = _mm_srai_epi32(v, 31);
++    return _mm_sub_epi32(_mm_xor_si128(m, s), s);
++}
++SPU_XF_HOT u128 spu__xf_cmp4(const int gt, const int mag, u128 a, u128 b) {
++    __m128i A, B; memcpy(&A, &a, 16); memcpy(&B, &b, 16);
++    A = spu__xf_key4(spu__xf_ftz4(A), mag); B = spu__xf_key4(spu__xf_ftz4(B), mag);
++    const __m128i o = gt ? _mm_cmpgt_epi32(A, B) : _mm_cmpeq_epi32(A, B);
++    u128 r; memcpy(&r, &o, 16); return r;
++}
++SPU_XF_HOT u128 spu_fceq(u128 a, u128 b)  { return spu__xf_cmp4(0, 0, a, b); }
++SPU_XF_HOT u128 spu_fcgt(u128 a, u128 b)  { return spu__xf_cmp4(1, 0, a, b); }
++SPU_XF_HOT u128 spu_fcmeq(u128 a, u128 b) { return spu__xf_cmp4(0, 1, a, b); }
++SPU_XF_HOT u128 spu_fcmgt(u128 a, u128 b) { return spu__xf_cmp4(1, 1, a, b); }
++#else
+ static inline u128 spu_fa(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_op(SPU_XF_ADD,a._u32[i],b._u32[i],0); return r; }
+ static inline u128 spu_fs(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_op(SPU_XF_SUB,a._u32[i],b._u32[i],0); return r; }
++static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_op(SPU_XF_MUL,a._u32[i],b._u32[i],0); return r; }
++static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_op(SPU_XF_MA,a._u32[i],b._u32[i],c._u32[i]); return r; }
++static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_op(SPU_XF_MS,a._u32[i],b._u32[i],c._u32[i]); return r; }
++static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_op(SPU_XF_NMS,a._u32[i],b._u32[i],c._u32[i]); return r; }
++static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_cmp(0,0,a._u32[i],b._u32[i])?0xFFFFFFFFu:0; return r; }
++static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_cmp(1,0,a._u32[i],b._u32[i])?0xFFFFFFFFu:0; return r; }
++static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_cmp(0,1,a._u32[i],b._u32[i])?0xFFFFFFFFu:0; return r; }
++static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_cmp(1,1,a._u32[i],b._u32[i])?0xFFFFFFFFu:0; return r; }
++#endif
+ 
+ /* RI8 scale: float-to-int uses 2^(173-i8), int-to-float 2^(i8-155).
+  * The canonical immediates 173 and 155 are identity conversions.
+@@ -365,12 +474,6 @@
+     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
+ static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
+     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
+-static inline u128 spu_fm(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_op(SPU_XF_MUL,a._u32[i],b._u32[i],0); return r; }
+-static inline u128 spu_fma(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_op(SPU_XF_MA,a._u32[i],b._u32[i],c._u32[i]); return r; }
+-static inline u128 spu_fms(u128 a, u128 b, u128 c)  { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_op(SPU_XF_MS,a._u32[i],b._u32[i],c._u32[i]); return r; }
+-static inline u128 spu_fnms(u128 a, u128 b, u128 c) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_op(SPU_XF_NMS,a._u32[i],b._u32[i],c._u32[i]); return r; }
+-static inline u128 spu_fceq(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_cmp(0,0,a._u32[i],b._u32[i])?0xFFFFFFFFu:0; return r; }
+-static inline u128 spu_fcgt(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_cmp(1,0,a._u32[i],b._u32[i])?0xFFFFFFFFu:0; return r; }
+ 
+ /* ---- SPU double-precision (2 doubles/reg; dword i = words 2i(high),2i+1(low)).
+  * Reassemble via _u32 -- our u128 is host-LE, so a naive _f64[i] would SWAP the
+@@ -487,8 +590,6 @@
+ static inline u128 spu_mpyhh(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i+1]; return r; }
+ static inline u128 spu_mpys(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int32_t p=(int32_t)a._s16[2*i]*(int32_t)b._s16[2*i]; r._s32[i]=(int16_t)(p>>16); } return r; }
+ static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
+-static inline u128 spu_fcmeq(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_cmp(0,1,a._u32[i],b._u32[i])?0xFFFFFFFFu:0; return r; }
+-static inline u128 spu_fcmgt(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=spu__xf_cmp(1,1,a._u32[i],b._u32[i])?0xFFFFFFFFu:0; return r; }
+ static const uint32_t spu_frest_fraction_lut[32] = {
+     0x7FFBE0, 0x7F87A6, 0x70EF72, 0x708B40, 0x638B12, 0x633AEA, 0x5792C4, 0x574AA0,
+     0x4CCA7E, 0x4C9262, 0x430A44, 0x42D62A, 0x3A2E12, 0x39FDFA, 0x3215E4, 0x31F1D2,
