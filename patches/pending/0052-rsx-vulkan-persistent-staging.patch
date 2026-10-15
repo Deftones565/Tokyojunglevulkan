@@ -1,0 +1,127 @@
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -477,6 +477,25 @@
+     memset(b, 0, sizeof *b);
+ }
+ 
++/* Staging for the engine's synchronous transfers (texture uploads, surface
++ * readbacks, depth snapshots). Each used to create, allocate, map and free a
++ * buffer per transfer: in Tokyo Jungle gameplay that was ~20% of the FIFO
++ * thread, with the copies into freshly mapped pages most of the rest of the
++ * upload cost. Every transfer that uses one is submitted and waited on before
++ * it returns, so the buffer is idle again by the next call; it only grows. */
++static vk_buffer s_stage_up;         /* TRANSFER_SRC, coherent: uploads     */
++static vk_buffer s_stage_dn;         /* TRANSFER_DST, cached: readbacks     */
++static vk_buffer s_stage_zz;         /* SRC|DST: depth -> R32F snapshots    */
++
++static int vk_stage(vk_buffer* b, VkDeviceSize bytes, VkBufferUsageFlags usage)
++{
++    if (b->buf && b->size >= bytes) return 0;
++    VkDeviceSize size = b->size ? b->size * 2u : (VkDeviceSize)1u << 20;
++    while (size < bytes) size *= 2u;
++    vk_destroy_buffer(b);
++    return vk_create_host_buffer(b, size, usage);
++}
++
+ /* Host writes to non-coherent memory need a flush; there is no
+  * vkFlushMappedMemoryRanges loaded, so writes only ever go to coherent
+  * buffers (every desktop/L4T driver exposes one). Reads invalidate. */
+@@ -2014,9 +2033,9 @@
+                                 const void* src, u32 row_bytes)
+ {
+     if (tight > row_bytes) tight = row_bytes;
+-    vk_buffer st = {0};
+-    if (vk_create_host_buffer(&st, (VkDeviceSize)tight * rows, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
+-        !st.coherent) { vk_destroy_buffer(&st); return -1; }
++    if (vk_stage(&s_stage_up, (VkDeviceSize)tight * rows, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
++        !s_stage_up.coherent) { vk_destroy_buffer(&s_stage_up); return -1; }
++    const vk_buffer st = s_stage_up;
+     for (u32 y = 0; y < rows; y++)
+         memcpy((u8*)st.ptr + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
+     int rc = vk_begin();
+@@ -2030,7 +2049,6 @@
+         pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+         rc = vk_submit_and_wait();
+     }
+-    vk_destroy_buffer(&st);
+     return rc;
+ }
+ 
+@@ -2269,10 +2287,10 @@
+     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+     if (!o || !out || !out_pitch || !w || !h || x + w > o->w || y + h > o->h) return;
+     const size_t tight = (size_t)w * o->bpp;
+-    vk_buffer st = {0};
+-    if (vk_create_host_buffer(&st, (VkDeviceSize)tight * h, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+-        vk_destroy_buffer(&st); return;
++    if (vk_stage(&s_stage_dn, (VkDeviceSize)tight * h, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
++        vk_destroy_buffer(&s_stage_dn); return;
+     }
++    vk_buffer st = s_stage_dn;
+     if (!vk_begin()) {
+         vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+         VkBufferImageCopy region = {
+@@ -2294,7 +2312,6 @@
+                 memcpy((u8*)out + (size_t)row * out_pitch, (const u8*)st.ptr + (size_t)row * tight, tight);
+         }
+     }
+-    vk_destroy_buffer(&st);
+ }
+ 
+ /* ---- E3: textures ---------------------------------------------------------
+@@ -2457,11 +2474,11 @@
+         if (vk_submit_and_wait()) return 0;
+     }
+ 
+-    vk_buffer st = {0};
+-    if (vk_create_host_buffer(&st, (VkDeviceSize)w * h * 4u,
+-                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+-        vk_destroy_buffer(&st); return 0;
++    if (vk_stage(&s_stage_zz, (VkDeviceSize)w * h * 4u,
++                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
++        vk_destroy_buffer(&s_stage_zz); return 0;
+     }
++    const vk_buffer st = s_stage_zz;
+     int rc = vk_begin();
+     if (!rc) {
+         vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
+@@ -2481,7 +2498,6 @@
+         pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, t->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+         rc = vk_submit_and_wait();
+     }
+-    vk_destroy_buffer(&st);
+     return rc ? 0 : snap;
+ }
+ /* The depth aspect of a D32_SFLOAT target copies out as 32-bit floats, which
+@@ -2495,10 +2511,10 @@
+         out_pitch < w * 4u || (s_vk.depth_format != VK_FORMAT_D32_SFLOAT &&
+                                   s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT))
+         return -1;
+-    vk_buffer st = {0};
+-    if (vk_create_host_buffer(&st, (VkDeviceSize)w * h * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+-        vk_destroy_buffer(&st); return -1;
++    if (vk_stage(&s_stage_dn, (VkDeviceSize)w * h * 4u, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
++        vk_destroy_buffer(&s_stage_dn); return -1;
+     }
++    vk_buffer st = s_stage_dn;
+     int rc = vk_begin();
+     if (!rc) {
+         vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
+@@ -2523,7 +2539,6 @@
+                        (const u8*)st.ptr + (size_t)row * w * 4u, (size_t)w * 4u);
+         }
+     }
+-    vk_destroy_buffer(&st);
+     return rc ? -1 : 0;
+ }
+ /* ---- E2: pipelines and draws ---------------------------------------------
+@@ -2921,6 +2936,9 @@
+ {
+     vk_batch_flush();
+     vk_batch_shutdown();
++    vk_destroy_buffer(&s_stage_up);
++    vk_destroy_buffer(&s_stage_dn);
++    vk_destroy_buffer(&s_stage_zz);
+     for (u32 i = 1; i <= VK_ENG_MAX_PIPE; i++) vk_eng_pipeline_release(user, i);
+     vk_eng_drop_framebuffers();
+     for (u32 f = 0; f < VK_ENG_RT_FORMATS; f++)
