@@ -1,0 +1,38 @@
+--- a/libs/video/rsx_draw_engine.c	2026-10-15 20:20:52.471629153 +0400
++++ b/libs/video/rsx_draw_engine.c	2026-10-15 20:20:52.472677646 +0400
+@@ -70,6 +70,8 @@
+ #define M_BLEND_DFACTOR       0x0318
+ #define M_BLEND_EQUATION      0x0320
+ #define M_BLEND_ENABLE_MRT    0x036C
++#define M_LOGIC_OP_ENABLE     0x0374
++#define M_LOGIC_OP            0x0378
+ #define M_COLOR_MASK          0x0324
+ #define M_STENCIL_TEST_ENABLE 0x0328
+ #define M_STENCIL_MASK        0x032C
+@@ -282,6 +284,26 @@
+     rs->sf_rgb = sfac & 0xFFFF; rs->sf_a = sfac >> 16;
+     rs->df_rgb = dfac & 0xFFFF; rs->df_a = dfac >> 16;
+     rs->eq_rgb = eq & 0xFFFF;   rs->eq_a = eq >> 16;
++    /* An enabled logic op takes precedence over blending (GL semantics,
++     * which the nv40 follows; RPCS3 VKGSRender.cpp: "If both are enabled,
++     * LogicOp takes precedence"). Tokyo Jungle leaves blending on and turns
++     * COPY on for its post chain (capture4 #96 grade, #97/#98 bright pass,
++     * #104 DOF compose), so those draws overwrite the target; blending them
++     * added the scene onto itself and washed the frame out. COPY is "write
++     * the fragment", i.e. blending off; it is the only op the title uses, so
++     * the other fifteen are not implemented and are drawn as COPY. */
++    if (rsx_dsp_reg(rsx, M_LOGIC_OP_ENABLE) & 1) {
++        const u32 op = rsx_dsp_reg(rsx, M_LOGIC_OP);
++        if (op != 0x1503u) {                                      /* GL_COPY */
++            static u32 warned;
++            if (warned != op) {
++                warned = op;
++                fprintf(stderr, "[rsx engine] logic op 0x%04X not implemented; drawn as COPY\n", op);
++            }
++        }
++        rs->blend_enable = 0;
++        rs->blend_mrt = 0;
++    }
+     rs->depth_test  = rsx_dsp_reg(rsx, M_DEPTH_TEST_ENABLE) & 1;
+     rs->depth_write = rsx_dsp_reg(rsx, M_DEPTH_WRITE) & 1;
+     rs->depth_func  = rsx_dsp_reg(rsx, M_DEPTH_FUNC);
