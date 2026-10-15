@@ -1,0 +1,35 @@
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2868,6 +2868,20 @@
+     return CELL_OK;
+ }
+ 
++/* Same mapping with an IOMAP flag word. The only flag
++ * (CELL_GCM_IOMAP_FLAG_STRICT_ORDERING) asks the RSX to keep reads and writes
++ * through this window in order, which a flat host VM already does, so the
++ * mapping itself is all there is to do. Faking it as CELL_OK left the window
++ * unmapped, so every later offset into it resolved nowhere. Tokyo Jungle maps
++ * one 1 MB window this way (ea 0x49000000 -> io 0x0F100000) as its movie
++ * starts. */
++s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags)
++{
++    printf("[cellGcmSys] MapEaIoAddressWithFlags(ea=0x%08X, io=0x%08X, size=0x%X, flags=0x%X)\n",
++           ea, io, size, flags);
++    return cellGcmMapEaIoAddress(ea, io, size);
++}
++
+ /* NID: 0xDB23E867 (disambiguation by context) */
+ s32 cellGcmUnmapEaIoAddress(u32 ea)
+ {
+diff --git a/libs/video/cellGcmSys.h b/libs/video/cellGcmSys.h
+index 424fb62..aa5a8a8 100644
+--- a/libs/video/cellGcmSys.h
++++ b/libs/video/cellGcmSys.h
+@@ -306,6 +306,7 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset);
+ 
+ /* NID: 0x5A41C10F */
+ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size);
++s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags);
+ 
+ /* NID: 0xDB23E867 (disambiguation by context) */
+ s32 cellGcmUnmapEaIoAddress(u32 ea);

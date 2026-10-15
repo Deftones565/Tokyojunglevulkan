@@ -1,0 +1,57 @@
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -424,6 +424,20 @@
+     ctx->status = SPU_STATUS_STOPPED;
+ }
+ 
++/* Set r1 the way the SPU ABI defines it: word 0 is the stack pointer, word 1
++ * the number of bytes of stack still available below it. Code built with
++ * stack checking subtracts every frame from all four words (ai r1,r1,-N) and
++ * halts as soon as word 1 goes negative (xswd + heqi -1), so an entry path
++ * that sets only word 0 makes the first checked function halt. `lowest_free`
++ * is the lowest local-store address the stack may grow down to. */
++static inline void spu_abi_set_stack(spu_context* ctx, uint32_t sp, uint32_t lowest_free)
++{
++    ctx->gpr[1]._u32[0] = sp;
++    ctx->gpr[1]._u32[1] = sp > lowest_free ? sp - lowest_free : 0;
++    ctx->gpr[1]._u32[2] = 0;
++    ctx->gpr[1]._u32[3] = 0;
++}
++
+ /* ---------------------------------------------------------------------------
+  * Local store access helpers
+  * -----------------------------------------------------------------------*/
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -344,7 +344,12 @@
+     spu_context_init(&ctx, 0);
+     ctx.image_id = image_id;
+     memcpy(ctx.ls, ls, SPU_LS_SIZE);
+-    ctx.gpr[1]._u32[0] = (stack_top - 16u) & ~15u;   /* SPU stack grows down */
++    /* SPU stack grows down from the top of the scratch+stack block, and may
++     * use everything above the scratch buffer. Word 1 of r1 (available stack)
++     * matters: left at 0, Tokyo Jungle's geometry and animation jobs
++     * (E7517A8D, E0CE22AC) halted in their stack check on every run, before
++     * writing anything, and the gameplay world was never drawn. */
++    spu_abi_set_stack(&ctx, (stack_top - 16u) & ~15u, s_ls + size_scr);
+     /* Link register: where the job returns when it is done. The job manager
+      * would pass an address inside itself; 0 makes the job re-enter its own
+      * entry at LS 0 and run a bogus second lap. */
+@@ -366,6 +371,17 @@
+     g_spurs_job_sent_event = 0;
+     spu_run_with_halt(entry, &ctx);
+ 
++    /* A halt with word 1 of r1 negative is the ABI stack check firing: the job
++     * ran out of stack and stopped before finishing its work. Unlike the
++     * end-of-job HALT noted above it means lost work, so say so. */
++    if (ctx.status == SPU_STATUS_STOPPED_BY_HALT && (int32_t)ctx.gpr[1]._u32[1] < 0) {
++        static unsigned long long n_stk = 0;
++        if (++n_stk <= 8 || n_stk % 1000 == 0)
++            fprintf(stderr, "[spurs-job] job 0x%08X image %d STACK CHECK HALT: out of stack "
++                            "(r1 sp=0x%05X avail=%d) -- the job's work was lost (#%llu)\n",
++                    job_ea, image_id, ctx.gpr[1]._u32[0], (int32_t)ctx.gpr[1]._u32[1], n_stk);
++    }
++
+     /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for
+      * the SPU printf service, NOT query results -- value 0x83C0 from the sound
+      * job points at " compressor, 1/n..." inside its own image. An earlier

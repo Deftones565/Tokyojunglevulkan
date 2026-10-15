@@ -1,0 +1,356 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index ac0a7a8..7ce0eb6 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -254,20 +254,57 @@ static u32 s_vblank_frequency   = 0;
+ #ifdef _WIN32
+ static volatile LONG s_user_command = 0;
+ #define GCM_USER_STORE(cmd) InterlockedExchange(&s_user_command, (LONG)(cmd))
+-/* Pair the pending marker with its cause so a later producer cannot
+- * overwrite a cause already claimed by the callback pump. */
+-static volatile LONG64 s_user_pending = 0;
+-#define GCM_USER_PENDING_STORE(value) InterlockedExchange64(&s_user_pending, (LONG64)(value))
+-#define GCM_USER_PENDING_TAKE() ((u64)InterlockedExchange64(&s_user_pending, 0))
++static volatile LONG s_ucmd_lock = 0;
++#define GCM_UCMD_LOCK()   while (InterlockedCompareExchange(&s_ucmd_lock, 1, 0)) YieldProcessor()
++#define GCM_UCMD_UNLOCK() InterlockedExchange(&s_ucmd_lock, 0)
+ #else
+ #include <stdatomic.h>
+ static atomic_uint s_user_command = 0;
+ #define GCM_USER_STORE(cmd) atomic_store(&s_user_command, (cmd))
+-static _Atomic(u64) s_user_pending = 0;
+-#define GCM_USER_PENDING_STORE(value) atomic_store(&s_user_pending, (value))
+-#define GCM_USER_PENDING_TAKE() atomic_exchange(&s_user_pending, 0)
++static atomic_flag s_ucmd_lock = ATOMIC_FLAG_INIT;
++#define GCM_UCMD_LOCK()   while (atomic_flag_test_and_set_explicit(&s_ucmd_lock, memory_order_acquire)) {}
++#define GCM_UCMD_UNLOCK() atomic_flag_clear_explicit(&s_ucmd_lock, memory_order_release)
+ #endif
+ 
++/* Retired SET_USER_COMMANDs waiting for the pump, oldest first. Each one is
++ * its own interrupt, as lv2 posts one event per 0xEB00 to the gcm interrupt
++ * thread; a single "latest cause" slot loses all but the last when two retire
++ * before a pump -- Tokyo Jungle queues 0xF5AAC0DE and 0x00086300 each frame
++ * and spins until the first one's handler has run. The pump pops one per
++ * call, at the point it claims its vblank/flip work, so a cause published
++ * from inside a callback waits for the next pump instead of jumping ahead. */
++#define GCM_UCMD_Q 16u
++static u32 s_ucmd_q[GCM_UCMD_Q];
++static u32 s_ucmd_head, s_ucmd_tail;
++
++static void gcm_ucmd_push(u32 cmd)
++{
++    int dropped = 0;
++    GCM_UCMD_LOCK();
++    if (s_ucmd_tail - s_ucmd_head >= GCM_UCMD_Q) { s_ucmd_head++; dropped = 1; }
++    s_ucmd_q[s_ucmd_tail++ % GCM_UCMD_Q] = cmd;
++    GCM_UCMD_UNLOCK();
++    if (dropped) { static int n = 0; if (n++ < 8)
++        fprintf(stderr, "[cellGcmSys] user-command queue full (%u): oldest dropped\n",
++                GCM_UCMD_Q); }
++}
++
++static int gcm_ucmd_pop(u32* cmd)
++{
++    int have = 0;
++    GCM_UCMD_LOCK();
++    if (s_ucmd_head != s_ucmd_tail) { *cmd = s_ucmd_q[s_ucmd_head++ % GCM_UCMD_Q]; have = 1; }
++    GCM_UCMD_UNLOCK();
++    return have;
++}
++
++static void gcm_ucmd_clear(void)
++{
++    GCM_UCMD_LOCK();
++    s_ucmd_head = s_ucmd_tail = 0;
++    GCM_UCMD_UNLOCK();
++}
++
+ /* Tile configuration (up to 15 tiles, 8 commonly used) */
+ static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
+ 
+@@ -458,7 +495,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+     s_second_v_frequency = 0;
+     s_vblank_frequency = 0;
+     GCM_USER_STORE(0);
+-    GCM_USER_PENDING_STORE(0);
++    gcm_ucmd_clear();
+ 
+     /* Set up the initial IO mapping for the command buffer region */
+     if (ioAddress != 0 && ioSize > 0) {
+@@ -697,7 +734,8 @@ void ppu_gcm_pump(void)
+ {
+     if (!GCM_PUMP_TRY_ENTER()) return;
+     long p = (long)GCM_PENDING_TAKE();
+-    u64 user = GCM_USER_PENDING_TAKE();
++    u32 cmd;
++    const int have_user = gcm_ucmd_pop(&cmd);
+     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
+     { static int d = -1; static unsigned nv, nf, calls;
+       if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
+@@ -717,8 +755,7 @@ void ppu_gcm_pump(void)
+             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
+         }
+     }
+-    if (user) {
+-        u32 cmd = (u32)user;
++    if (have_user) {
+         if (s_user_handler_opd && g_ps3_guest_caller)
+             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
+     }
+@@ -797,6 +834,12 @@ static u32 gcm_ea2io(u32 ea);   /* defined with the wrap callback below */
+ static u32 s_fifo_getoff  = 0;
+ static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
+ static u32 s_fifo_calloff = 0;
++/* Source of the last JUMP the walker took, and the park it is waiting on --
++ * see the JUMP-to-self case in the walker. */
++#define GCM_NO_OFF 0xFFFFFFFFu
++static u32 s_jump_src = GCM_NO_OFF;
++static u32 s_park_io = GCM_NO_OFF, s_park_word;
++static unsigned long long s_park_t0;
+ 
+ /* ---------------------------------------------------------------------------
+  * 2D transfer engines (FIFO subchannels != 0).
+@@ -1328,6 +1371,28 @@ static u32 gcm_spu_block_for_put(u32 put)
+  *
+  * Dropping DRAWS on a resync is survivable: a frame is lost. Dropping a FENCE
+  * is not, it deadlocks the title. Sweep the skipped range first. */
++/* A resync is about to skip the method header `w` at `io`. Publish what
++ * a title can block on: a SET_REFERENCE fence (returns 1, the caller counts
++ * them), or a SET_USER_COMMAND, raised as the walker would have. Tokyo
++ * Jungle's main loop spins until its user-command handler has run, so
++ * skipping one deadlocks it exactly as a lost fence does. */
++static unsigned gcm_rescue_at(u32 io, u32 w)
++{
++    if ((w >> 29) != 0) return 0;
++    u32 dea = gcm_io2ea(io + 4); if (!dea) return 0;
++    if ((w & 0xFFFCu) == 0xEB00u) {
++        extern void rsx_raise_user_cmd(u32 arg);
++        rsx_raise_user_cmd(vm_read32(dea));
++        { static int m = 0; if (m++ < 8)
++            fprintf(stderr, "[cellGcmSys] resync rescued user command 0x%08X"
++                    " at 0x%08X\n", vm_read32(dea), io); }
++        return 0;
++    }
++    if ((w & 0x1FFCu) != 0x0050u) return 0;
++    gcm_ref_push_at(vm_read32(dea), io);
++    return 1;
++}
++
+ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
+ {
+     static int n = 0;
+@@ -1354,17 +1419,87 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
+         unsigned rescued = 0;
+         for (u32 io = from; io + 8 <= land; io += 4) {
+             u32 ea = gcm_io2ea(io); if (!ea) continue;
+-            u32 w = vm_read32(ea);
+-            if ((w >> 29) != 0 || (w & 0x1FFCu) != 0x0050u) continue;
+-            u32 dea = gcm_io2ea(io + 4); if (!dea) continue;
+-            gcm_ref_push_at(vm_read32(dea), io);
+-            rescued++;
++            rescued += gcm_rescue_at(io, vm_read32(ea));
+         }
+         if (rescued) { static int m = 0; if (m++ < 8)
+             fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
+                     " 0x%08X..0x%08X\n", rescued, from, land); }
++    } else if (from > land) {
++        /* The ring wrapped between the last consumed offset and `put`: the
++         * skipped commands run from `from` to the ring's wrap JUMP, then from
++         * its target up to `land`. A word-by-word scan cannot tell that JUMP
++         * from a float in some method's data, so walk the stream by its
++         * headers instead -- method data is skipped by count, CALLs are not
++         * entered, and only a backward JUMP that lands at or before `land`
++         * counts as the wrap. Bounded, so a misread header cannot run away. */
++        unsigned rescued = 0;
++        int wrapped = 0;
++        u32 io = from;
++        for (u32 steps = 0; steps < 0x40000u; steps++) {
++            if (wrapped && io >= land) break;
++            u32 ea = gcm_io2ea(io); if (!ea) break;
++            u32 w = vm_read32(ea);
++            if ((w >> 29) == 1) {                          /* JUMP */
++                u32 tgt = w & 0x1FFFFFFCu;
++                if (wrapped || tgt >= io || tgt > land) break;
++                wrapped = 1; io = tgt; continue;
++            }
++            if ((w & 3u) == 2u || w == 0x00020000u || w == 0) { io += 4; continue; }
++            rescued += gcm_rescue_at(io, w);
++            io += 4 + ((w >> 18) & 0x7FFu) * 4;
++        }
++        if (rescued) { static int m = 0; if (m++ < 8)
++            fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) across the ring"
++                    " wrap 0x%08X..0x%08X\n", rescued, from, land); }
+     }
+     *getoff = land;
++    s_jump_src = GCM_NO_OFF;
++    s_park_io  = GCM_NO_OFF;
++}
++
++/* The walker is parked on a JUMP to itself at `park` (word `w`) and the title
++ * has moved `put` elsewhere. Two titles do this for opposite reasons:
++ *
++ *   - Twisted Metal abandons a park at the write head of one segment and moves
++ *     on to its other segment; it only patches a park when it reuses that
++ *     block. Waiting there would freeze the FIFO, so the walker resyncs.
++ *
++ *   - Tokyo Jungle JUMPs from its main ring into one of four per-frame
++ *     segments, the PPU writes a short header and a park, and an SPU job is
++ *     meant to fill in the frame's draws and patch the park so the GPU returns
++ *     to the ring, where `put` already is. The RSX sits on that park until it
++ *     is patched; resyncing drops the whole frame.
++ *
++ * The second kind is told apart by how the walker got here: the JUMP into
++ * this segment came from the same 1 MB IO block `put` is in, i.e. the title
++ * has queued more work behind the jump and expects the GPU to come back.
++ * (Comparing src < put is not enough: the main ring wraps.) Such a park is
++ * waited on -- the pass stops without consuming it, the next one re-reads the
++ * word -- for at most GCM_PARK_WAIT_MS of wall time, after which it is logged
++ * and resynced as before. Off (0) by default until Tokyo Jungle's segments are
++ * actually patched: waiting on a park nothing writes turns its gameplay into a
++ * stall. Try GCM_PARK_WAIT_MS=500. */
++static int gcm_park_should_wait(u32 park, u32 w, u32 put)
++{
++    static long wait_ms = -1;
++    if (wait_ms < 0) { const char* e = getenv("GCM_PARK_WAIT_MS");
++                       wait_ms = e ? atol(e) : 0; }
++    if (wait_ms <= 0 || s_jump_src == GCM_NO_OFF) return 0;
++    if ((s_jump_src >> 20) != (put >> 20) || (park >> 20) == (put >> 20)) return 0;
++
++    const unsigned long long now = ps3_ms_now();
++    if (park != s_park_io || w != s_park_word) {
++        s_park_io = park; s_park_word = w; s_park_t0 = now;
++        return 1;
++    }
++    if (now - s_park_t0 < (unsigned long long)wait_ms) return 1;
++
++    static unsigned n = 0;
++    if (n++ < 32 || (n % 256) == 0)
++        fprintf(stderr, "[cellGcmSys] park 0x%08X (entered from 0x%08X) unpatched after "
++                "%llu ms -- resync to put 0x%08X (#%u)\n",
++                park, s_jump_src, now - s_park_t0, put, n);
++    return 0;
+ }
+ 
+ static void gcm_fifo_dump_around(u32 getoff)
+@@ -1727,10 +1862,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                    * park standing -- it only patches a park when it reuses that
+                    * block. Waiting for a patch that will not come freezes the
+                    * FIFO for the rest of the run, so follow the write head. */
++                  if (put != s_fifo_getoff && gcm_park_should_wait(s_fifo_getoff, w, put)) {
++                      why = "park-wait";
++                      break;
++                  }
+                   if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
+                                               gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
+                   break;
+               }
++              s_park_io  = GCM_NO_OFF;
++              s_jump_src = s_fifo_getoff;
+               s_fifo_getoff = tgt; }
+             continue;
+         }
+@@ -1997,7 +2138,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+       } else burned = 0; }
+ 
+     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
+-      if (s_fifo_getoff == last && s_fifo_getoff != put) {
++      if (s_fifo_getoff == last && s_fifo_getoff != put && strcmp(why, "park-wait") != 0) {
+           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
+                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
+       } else { stuck = 0; last = s_fifo_getoff; } }
+@@ -3152,7 +3293,7 @@ void cellGcmTerminate(void)
+     s_io_map_reserved = 0;
+     s_default_fifo_mode = 0;
+     GCM_USER_STORE(0);
+-    GCM_USER_PENDING_STORE(0);
++    gcm_ucmd_clear();
+ 
+     memset(s_display_buffers, 0, sizeof(s_display_buffers));
+     memset(s_display_buffer_set, 0, sizeof(s_display_buffer_set));
+@@ -3369,13 +3510,13 @@ void cellGcmSetUserCommand(u32 cmd)
+     GCM_USER_STORE(cmd);
+ }
+ 
+-/* Called when a FIFO consumer retires a user-interrupt method. Publishing
+- * the cause and pending marker is atomic; guest code runs later in the pump.
+- * Like the driver cause register, multiple pending commands coalesce. */
++/* Called when a FIFO consumer retires a user-interrupt method. The command
++ * is queued; guest code runs later in the pump, one handler call per command
++ * in the order they retired. */
+ void cellGcmQueueUserCommand(u32 cmd)
+ {
+     GCM_USER_STORE(cmd);
+-    GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
++    gcm_ucmd_push(cmd);
+ }
+ 
+ /* Invalidate a tile region (unbind + clear) */
+@@ -3528,4 +3669,6 @@ void cellGcm_syscall_set_fifo(u32 put, u32 get)
+     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, get);
+     s_fifo_getoff  = get;
+     s_fifo_calloff = 0;
++    s_jump_src     = GCM_NO_OFF;
++    s_park_io      = GCM_NO_OFF;
+ }
+diff --git a/libs/video/tests/test_gcm_user_command.c b/libs/video/tests/test_gcm_user_command.c
+index 0df54db..1c11574 100644
+--- a/libs/video/tests/test_gcm_user_command.c
++++ b/libs/video/tests/test_gcm_user_command.c
+@@ -43,25 +43,30 @@ int main(void)
+ {
+     g_ps3_guest_caller = callback;
+     cellGcmSetUserHandler((CellGcmUserHandler)(uintptr_t)0x100);
++    /* Two commands retired before a pump are two interrupts, delivered in
++     * order, one per pump; a cause queued from inside a handler waits for
++     * the next pump (the nested pump is refused). */
+     cellGcmQueueUserCommand(1);
+     cellGcmQueueUserCommand(0xAA);
+     assert(calls == 0);
+     ppu_gcm_pump();
+-    assert(calls == 1 && last == 0xAA);
++    assert(calls == 1 && last == 1);
+     ppu_gcm_pump();
+-    assert(calls == 2 && last == 0xBB);
+-    ppu_gcm_pump(); assert(calls == 2);
++    assert(calls == 2 && last == 0xAA);
++    ppu_gcm_pump();
++    assert(calls == 3 && last == 0xBB);
++    ppu_gcm_pump(); assert(calls == 3);
+     cellGcmQueueUserCommand(0); ppu_gcm_pump();
+-    assert(calls == 3 && last == 0);
++    assert(calls == 4 && last == 0);
+     /* A vblank callback can publish another cause after this pump has
+      * claimed the old interrupt. It must not replace that claimed cause. */
+     s_vblank_handler_opd = 0x200;
+     cellGcmQueueUserCommand(0xCC);
+     cellGcmTickVBlank();
+-    ppu_gcm_pump(); assert(calls == 4 && last == 0xCC);
++    ppu_gcm_pump(); assert(calls == 5 && last == 0xCC);
+     s_vblank_handler_opd = 0;
+-    ppu_gcm_pump(); assert(calls == 5 && last == 0xDD);
+-    ppu_gcm_pump(); assert(calls == 5);
++    ppu_gcm_pump(); assert(calls == 6 && last == 0xDD);
++    ppu_gcm_pump(); assert(calls == 6);
+     /* While one host thread has claimed an interrupt but is still in a
+      * vblank callback, another pump must not deliver a newer cause first. */
+     pthread_t worker;
+@@ -72,14 +77,14 @@ int main(void)
+     while (!atomic_load(&paused)) sched_yield();
+     cellGcmQueueUserCommand(0xE2);
+     ppu_gcm_pump();
+-    assert(calls == 5);
++    assert(calls == 6);
+     atomic_store(&resume_pump, 1);
+     assert(pthread_join(worker, NULL) == 0);
+-    assert(calls == 6 && last == 0xE1);
++    assert(calls == 7 && last == 0xE1);
+     s_vblank_handler_opd = 0;
+-    ppu_gcm_pump(); assert(calls == 7 && last == 0xE2);
+-    ppu_gcm_pump(); assert(calls == 7);
++    ppu_gcm_pump(); assert(calls == 8 && last == 0xE2);
++    ppu_gcm_pump(); assert(calls == 8);
+     cellGcmSetUserHandler(NULL);
+-    cellGcmQueueUserCommand(7); ppu_gcm_pump(); assert(calls == 7);
++    cellGcmQueueUserCommand(7); ppu_gcm_pump(); assert(calls == 8);
+     puts("Deferred GCM user-command checks passed");
+ }

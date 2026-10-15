@@ -1,0 +1,59 @@
+# Tokyo Jungle -- project configuration
+#
+# NPUA80523 (US, PSN-only), EBOOT v1.01. scripts/analyze.py reads [input] and
+# [output]; everything else documents choices that are made in code, with where.
+
+[game]
+title_id = "NPUA80523"
+content_id = "UP9000-NPUA80523_00-TOKYOJUNGLE00001"
+version = "01.01"
+
+[input]
+# The decrypted PPU ELF. Supplied by the extraction step (BALTHASAR-2's
+# tools/extract/), never committed.
+elf_path = "input/EBOOT.ELF"
+
+[output]
+# Root for everything derived from the game: analysis/ and ppu/ (the lift) go
+# here, and spu/ when SPU images are captured. Gitignored.
+dir = "generated"
+# Lines per lifted source file. The lifter's default is 600000; the prior port's
+# 135 MB lift was one file and needed /bigobj. Lower this if the C++ compiler
+# runs out of memory (~2 GB per 240k lines at -O1 with GCC).
+chunk_lines = 300000
+
+[runtime]
+# These are environment variables the runner (src/main.cpp) reads. Listed here so
+# there is one place to look; the code is the source of truth.
+#
+# TJ_GAME_DIR        directory holding USRDIR/ and PARAM.SFO; or pass it as the
+#                    runner's second argument, or keep EBOOT.ELF inside USRDIR/
+# TJ_RUN_DIR         where the PS3-shaped VFS tree is built (default <exe dir>/vfs)
+# PS3_DEV_FLASH      a firmware dev_flash tree (system fonts for cellFont); default:
+#                    RPCS3's, once firmware is installed (tools/oracle/README.md)
+# PS3_BOOT_PATH      guest argv[0] (default /dev_hdd0/game/NPUA80523/USRDIR/EBOOT.BIN)
+# PS3_VFS_ROOT       bypass the VFS tree and use this directory as-is
+# PS3_VERBOSE=0      measure with this: the per-event log changes the title's timing
+# PS3RECOMP_VK_GUEST_PROGRAMS=1   run the title's own shaders on Vulkan
+# TJ_HEADLESS=1      no window (the default opens one when DISPLAY/WAYLAND_DISPLAY is set)
+# TJ_FRAME_DUMP=<dir>  write presented frames as numbered PPMs; with
+#                    TJ_FRAME_DUMP_EVERY (30), _SKIP (0), _MAX (100). See src/main.cpp.
+
+[graphics]
+# Chosen at build time: Vulkan on Linux (TJ_VULKAN, on by default), D3D12 on
+# Windows. Native output is 1280x720 at a 30 fps target.
+backend = "vulkan"
+width = 1280
+height = 720
+
+[modules]
+# Every import is answered by ps3recomp's HLE through the NID table the build
+# generates (tools/gen_hle_nids.py --all). Overrides go in src/stubs.cpp. The
+# modules the v1.00 EBOOT imported, for reference (docs/PRIOR_PORT.md):
+#   boot      sysPrxForUser, cellSysmodule, cellSysutil, cellGame, sys_fs
+#   graphics  cellGcmSys, cellResc, cellFont, cellFontFT
+#   audio     cellAudio            input  sys_io (cellPad)
+#   media     cellSail, cellPamf   SPU    cellSpurs
+#   network   sceNp, sceNpTrophy, sceNpCommerce2, cellNetCtl, cellHttp, cellSsl,
+#             sys_net, cellSysutilNpEula
+#   misc      cellRtc, cellL10n

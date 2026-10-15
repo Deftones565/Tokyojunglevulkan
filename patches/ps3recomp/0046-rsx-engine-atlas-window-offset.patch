@@ -1,0 +1,557 @@
+diff --color -ru a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+--- a/libs/video/rsx_draw_engine.c	2026-10-15 16:05:47.962100734 +0400
++++ b/libs/video/rsx_draw_engine.c	2026-10-15 16:08:53.235252064 +0400
+@@ -56,6 +56,8 @@
+  * dimensions. rsx_live_draw.c's surface-guard (2625) preserves the existing
+  * target rather than destroying a live one. */
+ #define ENG_MAX_SURFACE_DIM 8192u
++/* Textures cut out of a colour target (eng_region_texture). */
++#define ENG_MAX_REGIONS    64
+ 
+ #define ENG_VP_CB_BYTES    ((RSX_DSP_NUM_CONSTANTS + 2) * 16u)
+ #define ENG_FP_MAX_BYTES   0x10000u
+@@ -83,6 +85,7 @@
+ #define M_BACK_STENCIL_OP_ZPASS 0x0364
+ #define M_SCISSOR_HORIZONTAL  0x08C0
+ #define M_SCISSOR_VERTICAL    0x08C4
++#define M_WINDOW_OFFSET       0x02B8
+ #define M_DEPTH_FUNC          0x0A6C
+ #define M_DEPTH_WRITE         0x0A70
+ #define M_DEPTH_TEST_ENABLE   0x0A74
+@@ -131,6 +134,18 @@
+ 
+ typedef struct { u32 first, count; } eng_batch;
+ 
++/* A texture unit naming a rectangle INSIDE a colour target, copied into an
++ * image of its own. Keyed by the target (slot and the handle it had, so a
++ * recreated target misses) and the rectangle as the unit names it: a bloom
++ * chain reads its last levels one texel smaller than it wrote them. */
++typedef struct {
++    u32 slot, surface_handle;
++    u32 x, y, w, h, remap, format;
++    u32 handle;
++    u64 copied_serial;      /* the target's color_serial when last copied */
++    u64 last_use;
++} eng_region;
++
+ typedef struct {
+     u32 location, offset, pitch, width, height;
+     int valid;
+@@ -150,6 +165,9 @@
+     u32 n_zdepths;
+     eng_texture textures[ENG_MAX_TEXTURES];
+     u32 n_textures;
++    eng_region regions[ENG_MAX_REGIONS];
++    u32 n_regions;
++    u64 region_use_serial;
+     eng_pipeline pipelines[ENG_MAX_PIPELINES];
+     u32 n_pipelines;
+     eng_display_buffer display_buffers[8];
+@@ -528,21 +546,41 @@
+     return g.tex_staging;
+ }
+ 
+-/* The colour target for this (location, offset), created or reallocated when
+- * the size or format moved. Returns a slot index, or ENG_INVALID.
+- * rsx_live_draw.c's surface_get (2605-2690). */
++/* The colour target for this (location, offset), at least want_w x want_h,
++ * created or reallocated when it is too small or its format or pitch moved.
++ * Returns a slot index, or ENG_INVALID. rsx_live_draw.c's surface_get
++ * (2605-2690).
++ *
++ * A target only GROWS while its pitch and format stay put. The guest memory
++ * behind it is one pitch-linear image, and a title packs several passes into
++ * it by moving the window rather than the colour offset: Tokyo Jungle's bloom
++ * and auto-exposure chain draws its 640x360, 320x180 ... 20x12 levels side by
++ * side into the 2560-pixel-wide atlas at 0x0E300000 (capture4 draws 97-103).
++ * Resizing the target to each draw's clip, as this did, destroyed the atlas
++ * with every level, and the compose then read its exposure input from stale
++ * guest bytes and painted the frame white. Growing keeps what is there. A
++ * pitch or format change is a different image over the same bytes and still
++ * starts over. */
+ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+-                          rsx_be_format want_fmt)
++                          rsx_be_format want_fmt, u32 pitch)
+ {
+     if (!want_w) want_w = g.width;
+     if (!want_h) want_h = g.height;
+ 
+     u32 slot = ENG_MAX_SURFACES;
++    int grow = 0;
+     for (u32 i = 0; i < g.n_surfaces; i++)
+         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset) {
+-            if (g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
+-                g.surfaces[i].fmt == want_fmt)
++            const eng_surface* s = &g.surfaces[i];
++            const int same_layout = s->fmt == want_fmt &&
++                                    (!pitch || !s->pitch || s->pitch == pitch);
++            if (same_layout && s->w >= want_w && s->h >= want_h)
+                 return i;
++            if (same_layout && s->handle) {
++                grow = 1;
++                if (s->w > want_w) want_w = s->w;
++                if (s->h > want_h) want_h = s->h;
++            }
+             slot = i;
+             break;
+         }
+@@ -565,30 +603,98 @@
+     u32 seed_row = 0;
+     const void* seed = eng_surface_seed(location, offset, want_w, want_h,
+                                         want_fmt, &seed_row);
++    /* Growing: the old image goes into the top-left of the new one, over the
++     * guest bytes (or zeros) the rest starts with. RGBA8 only, the format the
++     * seed rows and readback agree on; anything else starts over as before. */
++    u8* grown = NULL;
++    if (grow && want_fmt == RSX_BE_FMT_R8G8B8A8 && g.be->readback) {
++        const eng_surface* old = &g.surfaces[slot];
++        const u32 row = want_w * 4u;
++        grown = (u8*)calloc((size_t)row * want_h, 1);
++        if (grown) {
++            if (seed && seed_row)
++                for (u32 y = 0; y < want_h; y++)
++                    memcpy(grown + (size_t)y * row, (const u8*)seed + (size_t)y * seed_row,
++                           seed_row < row ? seed_row : row);
++            g.be->readback(g.be->user, old->handle, 0, 0, old->w, old->h, grown, row);
++            seed = grown;
++            seed_row = row;
++        }
++    }
+     const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
+                                                  want_w, want_h, seed, seed_row);
++    free(grown);
+     if (!handle)
+         return (slot < g.n_surfaces && g.surfaces[slot].handle) ? slot : ENG_INVALID;
+ 
+     eng_surface* s = &g.surfaces[slot];
++    const u64 kept_serial = grow ? s->color_serial : 0;
++    const int kept_dirty = grow ? s->guest_dirty : 0;
+     if (s->handle) g.be->color_target_release(g.be->user, s->handle);
+     s->location = location; s->offset = offset;
+     s->w = want_w; s->h = want_h; s->fmt = want_fmt;
++    s->pitch = pitch;
+     s->handle = handle;
+-    s->color_serial = 0;
+-    s->guest_dirty = 0;
++    /* A grown target still holds what was rendered into it; its serial stays
++     * so a region copied before the growth is recopied (the handle changed). */
++    s->color_serial = kept_serial;
++    s->guest_dirty = kept_dirty;
+     if (slot == g.n_surfaces) g.n_surfaces++;
+-    { static u32 logs = 0; if (logs++ < 16)
++    { static u32 logs = 0; if (logs++ < 32)
+         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
+                 location, offset, want_w, want_h, (int)want_fmt,
+-                seed ? " (seeded from guest memory)" : ""); }
++                grow ? " (grown, contents kept)"
++                     : seed ? " (seeded from guest memory)" : ""); }
+     return slot;
+ }
+ 
++/* Where this draw's window sits in its colour target, and how far it reaches.
++ * NV4097 WINDOW_OFFSET moves the window origin; the viewport and scissor are
++ * relative to it. Every atlas draw in capture4 sets SURFACE_CLIP's origin to
++ * the same point, so the extent takes the further of the two. */
++static void eng_draw_window(const rsx_dsp_surface* sf, u32* ox, u32* oy,
++                            u32* ext_w, u32* ext_h)
++{
++    const u32 wo = rsx_dsp_reg(&g.rsx, M_WINDOW_OFFSET);
++    *ox = wo & 0xFFFFu;
++    *oy = wo >> 16;
++    const u32 x0 = *ox > sf->clip_x ? *ox : sf->clip_x;
++    const u32 y0 = *oy > sf->clip_y ? *oy : sf->clip_y;
++    *ext_w = x0 + (sf->clip_w ? sf->clip_w : g.width);
++    *ext_h = y0 + (sf->clip_h ? sf->clip_h : g.height);
++}
++
++/* The rectangle of target `slot` a draw or clear may touch: the window at
++ * (ox, oy), w x h, narrowed by the guest scissor (window-relative) and the
++ * surface. */
++static void eng_window_scissor(u32 slot, u32 ox, u32 oy, u32 w, u32 h,
++                               u32* sx, u32* sy, u32* sw, u32* sh)
++{
++    u32 x0 = ox, y0 = oy, x1 = ox + w, y1 = oy + h;
++    const u32 hreg = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
++    const u32 vreg = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
++    const u32 gx = hreg & 0xFFFFu, gw = hreg >> 16;
++    const u32 gy = vreg & 0xFFFFu, gh = vreg >> 16;
++    if (gw > 0 && gh > 0) {
++        if (ox + gx > x0) x0 = ox + gx;
++        if (oy + gy > y0) y0 = oy + gy;
++        if (ox + gx + gw < x1) x1 = ox + gx + gw;
++        if (oy + gy + gh < y1) y1 = oy + gy + gh;
++    }
++    if (slot < g.n_surfaces) {
++        if (x1 > g.surfaces[slot].w) x1 = g.surfaces[slot].w;
++        if (y1 > g.surfaces[slot].h) y1 = g.surfaces[slot].h;
++    }
++    *sx = x0; *sy = y0;
++    *sw = x1 > x0 ? x1 - x0 : 0;
++    *sh = y1 > y0 ? y1 - y0 : 0;
++}
++
+ /* The colour targets SET_SURFACE_COLOR_TARGET names, as slots into
+  * g.surfaces, with A first. One for an ordinary draw; an MRT set adds B, C
+- * and D, each created at target A's size and format, which is the rule the
+- * vtable path's target_for binds by. Resolution stops at the first member
++ * and D in target A's format, each at least as big as the draw's window
++ * (eng_draw_window); the backend renders the set over its smallest member.
++ * Resolution stops at the first member
+  * that cannot be created, as that path stops at the first gap. Returns how
+  * many were resolved, or 0. */
+ /* Bytes per pixel of an NV4097 surface colour format. */
+@@ -619,15 +725,21 @@
+      * that offset: Tokyo Jungle's display buffer 0 is at offset 0, so its
+      * shadow pass recreated that surface at the shadow map's size every frame.
+      * Draw such a pass into a scratch target that no guest address maps to. */
++    const u32 bpp = eng_surface_bpp(sf.color_format);
+     const int no_color = sf.color_pitch[sel] <= 64u &&
+-                         sf.color_pitch[sel] < sf.clip_w * eng_surface_bpp(sf.color_format);
++                         sf.color_pitch[sel] < sf.clip_w * bpp;
++    /* Each target is made at least as big as this draw's window reaches; a
++     * row never holds more pixels than the pitch does. */
++    u32 ox, oy, ext_w, ext_h;
++    eng_draw_window(&sf, &ox, &oy, &ext_w, &ext_h);
++    { const u32 row_px = sf.color_pitch[sel] / bpp;
++      if (!no_color && row_px >= sf.clip_w && ext_w > row_px) ext_w = row_px; }
+     const u32 first = no_color
+-        ? eng_surface_get(ENG_SCRATCH_LOCATION, (sf.clip_w << 16) | sf.clip_h,
+-                          sf.clip_w, sf.clip_h, fmt)   /* one scratch per size */
++        ? eng_surface_get(ENG_SCRATCH_LOCATION, (ext_w << 16) | ext_h,
++                          ext_w, ext_h, fmt, 0)   /* one scratch per size */
+         : eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
+-                          sf.clip_w, sf.clip_h, fmt);
++                          ext_w, ext_h, fmt, sf.color_pitch[sel]);
+     if (first == ENG_INVALID) return 0;
+-    g.surfaces[first].pitch = sf.color_pitch[sel];
+     slots[0] = first;
+     u32 n = 1;
+     if (no_color) return n;
+@@ -638,11 +750,15 @@
+     };
+     for (u32 i = 0; i < 3; i++) {
+         if (sf.color_target < mrt_from[i]) break;
++        /* B, C and D cover this draw's window, not target A's whole size:
++         * A may be an atlas grown far past it (capture4 #97 draws A at
++         * (0,0) of the atlas and B at its row 704), and a B that big would
++         * claim bytes the atlas's own levels live in. The backend renders an
++         * MRT set over the smallest member. */
+         const u32 slot = eng_surface_get(sf.color_location[i + 1],
+                                          sf.color_offset[i + 1],
+-                                         sf.clip_w, sf.clip_h, fmt);
++                                         ext_w, ext_h, fmt, sf.color_pitch[i + 1]);
+         if (slot == ENG_INVALID) break;
+-        g.surfaces[slot].pitch = sf.color_pitch[i + 1];
+         /* A set naming one buffer twice would attach the same target twice,
+          * which no host API allows. */
+         int seen = 0;
+@@ -1687,6 +1803,85 @@
+     dc.n_idx++;
+ }
+ 
++/* A w x h rectangle of colour target `slot`, at (x, y), as a texture of its
++ * own: copied on the GPU when the backend can, otherwise read back and
++ * uploaded, and refreshed whenever the target has been written since. The
++ * unit's crossbar becomes the image's view as it does for a surface view.
++ * Returns the texture, or 0. */
++static u32 eng_region_texture(u32 slot, u32 x, u32 y, u32 w, u32 h,
++                              u32 remap, u32 format)
++{
++    const eng_surface* s = &g.surfaces[slot];
++    eng_region* r = NULL;
++    for (u32 i = 0; i < g.n_regions; i++) {
++        eng_region* e = &g.regions[i];
++        if (e->slot == slot && e->x == x && e->y == y && e->w == w &&
++            e->h == h && e->remap == remap && e->format == format) { r = e; break; }
++    }
++    if (r && r->handle && r->surface_handle != s->handle) {
++        g.be->texture_release(g.be->user, r->handle);   /* target recreated */
++        r->handle = 0;
++    }
++    if (!r) {
++        if (g.n_regions < ENG_MAX_REGIONS) {
++            r = &g.regions[g.n_regions++];
++        } else {
++            r = &g.regions[0];
++            for (u32 i = 1; i < g.n_regions; i++)
++                if (g.regions[i].last_use < r->last_use) r = &g.regions[i];
++            if (r->handle) g.be->texture_release(g.be->user, r->handle);
++        }
++        memset(r, 0, sizeof *r);
++        r->slot = slot; r->x = x; r->y = y; r->w = w; r->h = h;
++        r->remap = remap; r->format = format;
++    }
++    r->last_use = ++g.region_use_serial;
++    if (!r->handle) {
++        r->handle = g.be->texture_create(g.be->user, s->fmt, w, h, 1, 1, remap, format);
++        if (!r->handle) return 0;
++        r->surface_handle = s->handle;
++        r->copied_serial = ~0ull;
++    }
++    if (r->copied_serial != s->color_serial) {
++        int ok = g.be->copy_surface_region
++            ? g.be->copy_surface_region(g.be->user, s->handle, x, y, w, h, r->handle)
++            : -1;
++        if (ok != 0 && g.be->readback && s->fmt == RSX_BE_FMT_R8G8B8A8 &&
++            eng_staging_reserve(w * 4u * h)) {
++            g.be->readback(g.be->user, s->handle, x, y, w, h, g.tex_staging, w * 4u);
++            g.be->texture_upload(g.be->user, r->handle, 0, 0, w, h,
++                                 g.tex_staging, w * 4u, h);
++            ok = 0;
++        }
++        if (ok != 0) return 0;
++        r->copied_serial = s->color_serial;
++    }
++    return r->handle;
++}
++
++/* The colour target whose bytes a linear A8R8G8B8 texture unit names as a
++ * rectangle smaller than the whole target: at its start (a target grown past
++ * the size this unit reads) or inside it (an atlas level, eng_surface_at's
++ * rule: same pitch, closest base). The target may be one this draw writes:
++ * each bloom level reads the level the previous draw put into the same atlas
++ * (capture4 #100-#103, and #106/#107 read the row-704 levels while drawing
++ * at (0,0)); the region is a copy taken before this draw, which is what the
++ * hardware reads as long as the rectangle is not under the window being
++ * drawn. Returns the slot and the rectangle's origin, or ENG_INVALID. */
++static u32 eng_region_source(const rsx_dsp_texture* t, u32 base_fmt,
++                             u32* x, u32* y)
++{
++    if (base_fmt != RSX_TEX_FMT_A8R8G8B8 || !(t->format & 0x20u) || t->cubemap ||
++        t->mipmaps > 1u || !t->width || !t->height || !t->pitch)
++        return ENG_INVALID;
++    const u32 slot = eng_surface_at(t->location, t->offset, t->pitch, x, y);
++    if (slot == ENG_INVALID) return ENG_INVALID;
++    const eng_surface* s = &g.surfaces[slot];
++    if (*x + t->width > s->w || *y + t->height > s->h) return ENG_INVALID;
++    if (*x == 0 && *y == 0 && t->width == s->w && t->height == s->h) return ENG_INVALID;
++    return slot;
++}
++
+ /* Which texture units this draw binds, and from where: a unit naming a
+  * registered colour surface samples that live target rather than guest
+  * memory (every post-process, shadow and reflection in a PS3 title is a
+@@ -1749,6 +1944,35 @@
+                 continue;
+             }
+         }
++        /* A unit naming the target this draw writes -- Tokyo Jungle's
++         * compose (capture4 #104) reads its own colour target 0x003A0000 as
++         * t2 -- samples a copy of what the target holds now. Sampling the
++         * attachment itself is undefined on every host API, and the old
++         * fallback read guest memory, which only held what the last 2D blit
++         * put there (a stale frame) and kept the frame white. RPCS3 copies
++         * the surface before such a draw too. */
++        if (own && zsrc < 0 && surface_at >= 0 && base_fmt == RSX_TEX_FMT_A8R8G8B8 &&
++            !t.cubemap && t.mipmaps <= 1u && t.width && t.height &&
++            t.width <= g.surfaces[surface_at].w && t.height <= g.surfaces[surface_at].h) {
++            const u32 rt = eng_region_texture((u32)surface_at, 0, 0, t.width, t.height,
++                                              t.remap & 0xFFFFu, t.format);
++            if (rt) { textures[u] = rt; continue; }
++        }
++        /* A rectangle of a colour target rather than the whole of one: an
++         * atlas level, or a target grown past what this unit reads. Before
++         * this, a unit naming bytes inside a target read stale guest memory
++         * (Tokyo Jungle's compose read its exposure input that way and
++         * painted the frame white). */
++        if (zsrc < 0 && (sampled >= 0 || surface_at < 0)) {
++            u32 rx = 0, ry = 0;
++            const u32 rslot = eng_region_source(&t, base_fmt, &rx, &ry);
++            /* A target starting exactly here owns the address: only it. */
++            if (rslot != ENG_INVALID && (surface_at < 0 || rslot == (u32)surface_at)) {
++                const u32 rt = eng_region_texture(rslot, rx, ry, t.width, t.height,
++                                                  t.remap & 0xFFFFu, t.format);
++                if (rt) { textures[u] = rt; continue; }
++            }
++        }
+         if (sampled >= 0 && zsrc < 0 &&
+             g.surfaces[sampled].fmt == RSX_BE_FMT_R8G8B8A8 &&
+             eng_format_reinterprets_rgba8(base_fmt) &&
+@@ -2263,28 +2487,20 @@
+     g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
+     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
+     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
+-    g.be->set_viewport(g.be->user, 0.0f, 0.0f, W, H);
+-
+-    /* The guest scissor intersected with the surface. The nv40 reset is a
+-     * full 4096x4096 window and a never-written register reads 0 here, which
+-     * the w == 0 test treats as no scissor, so only a real game scissor
+-     * narrows anything (rsx_live_draw.c:6180-6197). */
++    /* The window sits at WINDOW_OFFSET inside the target; the viewport and
++     * scissor are relative to it (capture4's atlas draws: viewport and
++     * scissor (0,0,w,h), window at the level's place in the atlas). */
++    u32 ox, oy, ext_w, ext_h;
++    eng_draw_window(&sf, &ox, &oy, &ext_w, &ext_h);
++    g.be->set_viewport(g.be->user, (float)ox, (float)oy, W, H);
++
++    /* The guest scissor intersected with the window and the surface. The
++     * nv40 reset is a full 4096x4096 window and a never-written register
++     * reads 0 here, which the w == 0 test treats as no scissor, so only a
++     * real game scissor narrows anything (rsx_live_draw.c:6180-6197). */
+     {
+-        u32 sx = 0, sy = 0;
+-        u32 sw = g.surfaces[target].w, sh = g.surfaces[target].h;
+-        const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+-        const u32 v = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
+-        const u32 gx = h & 0xFFFFu, gw = h >> 16;
+-        const u32 gy = v & 0xFFFFu, gh = v >> 16;
+-        if (gw > 0 && gh > 0) {
+-            u32 right = sx + sw, bottom = sy + sh;
+-            if (gx > sx) sx = gx;
+-            if (gy > sy) sy = gy;
+-            if (gx + gw < right)  right = gx + gw;
+-            if (gy + gh < bottom) bottom = gy + gh;
+-            sw = right > sx ? right - sx : 0;
+-            sh = bottom > sy ? bottom - sy : 0;
+-        }
++        u32 sx, sy, sw, sh;
++        eng_window_scissor(target, ox, oy, (u32)W, (u32)H, &sx, &sy, &sw, &sh);
+         g.be->set_scissor(g.be->user, sx, sy, sw, sh);
+     }
+     /* Dynamic, and deliberately outside the pipeline key. */
+@@ -2332,9 +2548,35 @@
+         };
+         /* Every target the set names, not only A: a deferred pass clears its
+          * whole G-buffer in one CLEAR_SURFACE, and B, C and D would otherwise
+-         * keep whatever the last frame left in them. */
+-        for (u32 i = 0; i < n_targets; i++)
+-            g.be->clear_color(g.be->user, g.surfaces[targets[i]].handle, rgba);
++         * keep whatever the last frame left in them. Only the window (and
++         * scissor) is cleared: on a target grown into an atlas the rest is
++         * other passes' output (capture4 #106 clears a 358x118 corner of the
++         * bloom atlas). */
++        rsx_dsp_surface csf;
++        rsx_dsp_get_surface(&g.rsx, &csf);
++        u32 ox, oy, ext_w, ext_h;
++        eng_draw_window(&csf, &ox, &oy, &ext_w, &ext_h);
++        const u32 cw = csf.clip_w ? csf.clip_w : g.width;
++        const u32 ch = csf.clip_h ? csf.clip_h : g.height;
++        for (u32 i = 0; i < n_targets; i++) {
++            const eng_surface* t = &g.surfaces[targets[i]];
++            u32 sx, sy, sw, sh;
++            eng_window_scissor(targets[i], ox, oy, cw, ch, &sx, &sy, &sw, &sh);
++            const int whole = sx == 0 && sy == 0 && sw >= t->w && sh >= t->h;
++            if (whole || !g.be->color_target_write || t->fmt != RSX_BE_FMT_R8G8B8A8) {
++                g.be->clear_color(g.be->user, t->handle, rgba);
++                continue;
++            }
++            if (!sw || !sh) continue;
++            const u32 row = sw * 4u;
++            u8* px = (u8*)malloc((size_t)row * sh);
++            if (!px) { g.be->clear_color(g.be->user, t->handle, rgba); continue; }
++            const u8 rgba8[4] = { (u8)((c >> 16) & 0xFF), (u8)((c >> 8) & 0xFF),
++                                  (u8)(c & 0xFF), (u8)((c >> 24) & 0xFF) };
++            for (u32 k = 0; k < sw * sh; k++) memcpy(px + (size_t)k * 4u, rgba8, 4);
++            g.be->color_target_write(g.be->user, t->handle, sx, sy, sw, sh, px, row);
++            free(px);
++        }
+         eng_surfaces_wrote(targets, n_targets);
+     }
+     if (mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) {
+@@ -2482,6 +2724,8 @@
+         g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_SHUTDOWN);
+     for (u32 i = 0; i < g.n_textures; i++)
+         if (g.textures[i].handle) g.be->texture_release(g.be->user, g.textures[i].handle);
++    for (u32 i = 0; i < g.n_regions; i++)
++        if (g.regions[i].handle) g.be->texture_release(g.be->user, g.regions[i].handle);
+     for (u32 i = 0; i < g.n_pipelines; i++)
+         if (g.pipelines[i].handle) g.be->pipeline_release(g.be->user, g.pipelines[i].handle);
+     for (u32 i = 0; i < g.n_surfaces; i++)
+diff --color -ru a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+--- a/libs/video/rsx_draw_engine.h	2026-10-15 16:05:47.964093693 +0400
++++ b/libs/video/rsx_draw_engine.h	2026-10-15 16:05:47.965110052 +0400
+@@ -145,6 +145,16 @@
+      * in when it is decoded, so only a surface bind needs this; 0 means the
+      * backend has no view and the engine binds the target itself. */
+     u32  (*surface_view)(void* user, u32 surface, u32 remap, u32 rsx_format);
++    /* Optional. Copy the w x h rectangle at (x, y) of a colour target into
++     * mip 0 of `texture`, which texture_create made with the target's format
++     * and exactly that size. A texture unit that names bytes INSIDE a target
++     * -- a bloom chain packed into one atlas, each level placed with the
++     * window offset -- samples only its own rectangle, and clamps at that
++     * rectangle's edge rather than bleeding into its neighbours, which is
++     * why it gets an image of its own rather than a UV remap into the atlas.
++     * Returns 0 on success. NULL: the engine reads back and uploads instead. */
++    int  (*copy_surface_region)(void* user, u32 surface, u32 x, u32 y,
++                                u32 w, u32 h, u32 texture);
+ 
+     /* One depth target per guest zeta address. */
+     u32  (*depth_target_create)(void* user, u32 w, u32 h);
+diff --color -ru a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+--- a/libs/video/rsx_vulkan_backend.c	2026-10-15 16:05:47.965330244 +0400
++++ b/libs/video/rsx_vulkan_backend.c	2026-10-15 16:05:47.967416310 +0400
+@@ -99,7 +99,7 @@
+     X(vkCmdBindVertexBuffers) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) \
+     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdDraw) \
+     X(vkCmdSetStencilReference) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
+-    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage)
++    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCmdBlitImage) X(vkCmdCopyImage)
+ /* Window-system entry points, loaded only when a window was requested, so a
+  * headless run never depends on a driver that can present. */
+ #define VK_WSI_INSTANCE_FNS(X) \
+@@ -2346,6 +2346,33 @@
+     o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
+     return hd;
+ }
++/* A rectangle of a colour target copied into its own texture (same format,
++ * the rectangle's size), on the GPU: an atlas level read through its own
++ * image, so it clamps at its own edge. */
++static int vk_eng_copy_surface_region(void* user, u32 surface, u32 x, u32 y,
++                                      u32 w, u32 h, u32 texture)
++{
++    (void)user;
++    vk_eng_obj* src = vk_eng_get(surface, VK_ENG_COLOR);
++    vk_eng_obj* dst = vk_eng_get(texture, VK_ENG_TEXTURE);
++    if (!src || !dst || !w || !h || src->fmt != dst->fmt || dst->cube ||
++        x + w > src->w || y + h > src->h || w > dst->w || h > dst->h)
++        return -1;
++    if (vk_begin()) return -1;
++    vk_barrier_image(src->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
++    vk_barrier_image(dst->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
++    VkImageCopy region = {
++        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .srcOffset = { (int32_t)x, (int32_t)y, 0 },
++        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .dstOffset = { 0, 0, 0 },
++        .extent = { w, h, 1 },
++    };
++    pvkCmdCopyImage(s_vk.cmd, src->im.img, VK_IMAGE_LAYOUT_GENERAL,
++                    dst->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
++    return vk_submit_and_wait() ? -1 : 0;
++}
++
+ /* ---- E4: depth snapshots --------------------------------------------------
+  * A depth target read as a texture, which the engine asks for only after a
+  * depth-writing draw. Metal resolves it with a fullscreen pass into R32Float;
+@@ -3091,8 +3118,22 @@
+         if (!(s_e2.warned & 32u)) { VK_LOG("engine: draw into colour format %d with a pipeline built for %d skipped\n", (int)rt0->fmt, (int)P->rt_fmt); s_e2.warned |= 32u; }
+         return;
+     }
+-    const u32 w = rt0->w, h = rt0->h;
++    /* The set renders over its smallest member: the engine sizes B, C and D
++     * to the draw's window, while A may be an atlas grown well past it. */
++    u32 w = rt0->w, h = rt0->h;
++    for (u32 i = 1; i < n; i++) {
++        const vk_eng_obj* o = &s_eobj[s_eng_bound.rt[i]];
++        if (o->w < w) w = o->w;
++        if (o->h < h) h = o->h;
++    }
+     vk_eng_obj* zo = vk_eng_get(s_eng_bound.depth, VK_ENG_DEPTH);
++    /* A zeta smaller than an atlas colour target still serves a draw whose
++     * scissor stays inside it: render over the zeta's size instead. */
++    if (zo && (zo->w < w || zo->h < h) && s_e2.have_sc &&
++        s_e2.sc[0] + s_e2.sc[2] <= zo->w && s_e2.sc[1] + s_e2.sc[3] <= zo->h) {
++        if (zo->w < w) w = zo->w;
++        if (zo->h < h) h = zo->h;
++    }
+     VkImageView dview = (zo && zo->w >= w && zo->h >= h) ? zo->im.view : vk_eng_scratch_depth(w, h);
+     if (!dview) return;
+     const u32 dkey = (zo && dview == zo->im.view) ? s_eng_bound.depth : 0xFFFFFFFFu;
+@@ -3164,6 +3205,7 @@
+     .color_target_create  = vk_eng_color_target_create,
+     .color_target_release = vk_eng_release,
+     .surface_view         = vk_eng_surface_view,
++    .copy_surface_region  = vk_eng_copy_surface_region,
+     .depth_target_create  = vk_eng_depth_target_create,
+     .depth_target_release = vk_eng_release,
+     .depth_snapshot       = vk_eng_depth_snapshot,

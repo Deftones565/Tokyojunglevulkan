@@ -1,0 +1,305 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 5e3b510..675bf32 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2156,8 +2156,22 @@ static struct {
+     u16 max_grab;
+     int run_count;
+     volatile long running;   /* 1 while a host thread walks this chain */
++    volatile long alive;     /* 1 until that host thread has actually exited  */
++    volatile long stop;      /* set by Shutdown: the walker must leave        */
+ } s_jobchains[MAX_JOBCHAINS];
+ 
++/* The stop flag of the chain this host thread walks (NULL off a walker thread).
++ *
++ * Shutdown used to clear `running` and nothing else, so Join returned at once
++ * while the walker was still parked in jg_wait. Tokyo Jungle re-creates its
++ * "soc-job" chain on the same EA and guard for every DSP module query; the new
++ * Run then started a SECOND walker, and the stale one won the next guard
++ * credit, ran the query and answered it -- so every module read the reply to
++ * the previous module's query (decoder 0s, synth got the decoder's sizes),
++ * racily, and SGX failed to register its modules. */
++static __thread volatile long* t_jc_stop;
++static int jc_stopping(void) { return t_jc_stop && *t_jc_stop; }
++
+ static void jc_dump_commands(const char* tag, u32 ea, int max_words)
+ {
+     printf("[cellSpurs] %s chain@0x%08X commands:", tag, ea);
+@@ -2445,6 +2459,8 @@ s32 cellSpursJobGuardNotify(u64 guard_ea)
+      * was still running -- the title notified 6 times and the chain completed
+      * 2 laps, so the thread waiting on the other 4 completions never woke. */
+     s_jobguards[i].pending++;
++    { static int t = -1; if (t < 0) t = getenv("SPURS_JC_TRACE") ? 1 : 0;
++      if (t) fprintf(stderr, "[jc-trace] notify guard=0x%08X pending=%u\n", ea, s_jobguards[i].pending); }
+     { u32 remaining = (s_jobguards[i].pending >= s_jobguards[i].reset)
+                     ? 0u : s_jobguards[i].reset - s_jobguards[i].pending;
+       s_jobguards[i].count = remaining;
+@@ -2476,6 +2492,7 @@ static int jg_wait(u32 ea)
+     int i = jg_find(ea);
+     if (i < 0) return 1;
+     for (int spin = 0; spin < 20000; spin++) {     /* ~20 s at 1 ms */
++        if (jc_stopping()) return 0;               /* Shutdown: leave, take nothing */
+         if (s_jobguards[i].pending >= s_jobguards[i].reset) {
+             /* Consume exactly one release worth of credits, so notifies that
+              * arrived during the previous lap still count. */
+@@ -2509,7 +2526,7 @@ static int jg_wait(u32 ea)
+ #  define SPURS_JOB_TLS __thread
+ #endif
+ extern SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr, g_spurs_job_cmd;
+-extern SPURS_JOB_TLS int g_spurs_job_mbox_valid;
++extern SPURS_JOB_TLS int g_spurs_job_mbox_valid, g_spurs_job_sent_event;
+ 
+ /* SPURS_EVENT_D3=<n>: probe. The value a job query returns to the PPU is read
+  * from the completion event's data3 field (the guest stores r7 at sp+0xB8 and
+@@ -2524,8 +2541,26 @@ static u64 spurs_event_data3_probe(void)
+     return (u64)(unsigned)v;
+ }
+ 
++/* Synthetic per-job completion events (below). Real SPURS sends none: a job
++ * chain's PPU side hears from its jobs only through the events the job's own
++ * SPU code sends (send_event to a port cellSpursAttachLv2EventQueue bound). The
++ * synthetic ones stand in for that in titles whose jobs don't send their own,
++ * but where a job does, they collide with it: Tokyo Jungle's SOC job answers on
++ * a ONE-deep queue, a synthetic event took the slot first, the job's real
++ * event bounced (queue full), and the audio thread read the synthetic event's
++ * data2 -- a running job count, ~1700 -- as a DSP module index and called
++ * through a garbage callback. A title whose jobs report themselves turns
++ * them off with cellSpurs_set_synthetic_job_events(0). */
++static int s_synthetic_job_events = 1;
++void cellSpurs_set_synthetic_job_events(int on) { s_synthetic_job_events = on; }
++
+ static void jc_signal_done(u32 jc_ea, int job_index)
+ {
++    if (!s_synthetic_job_events) {
++        g_spurs_job_mbox_valid = 0;
++        g_spurs_job_sent_event = 0;
++        return;
++    }
+     /* Carry the job's mailbox answer in the completion event. On hardware the
+      * SPU's outbound/interrupt mailbox is what the SPURS event delivers; a
+      * synthetic payload means the caller reads back zero for whatever it
+@@ -2557,19 +2592,28 @@ static void jc_signal_done(u32 jc_ea, int job_index)
+      * mailbox never goes in data2, which is the job index above: a mailbox
+      * value there would end the consumer's wait early. */
+     enum { SGX_Q_IN_BUSES = 0x105, SGX_Q_OUT_BUSES = 0x106 };
+-    const int answers_a_count = (g_spurs_job_cmd == SGX_Q_IN_BUSES ||
+-                                 g_spurs_job_cmd == SGX_Q_OUT_BUSES);
++    /* SPURS_FWD_ALL_MBOX=1: forward every command's reply, not just the counts. */
++    static int fwd_all = -1;
++    if (fwd_all < 0) fwd_all = getenv("SPURS_FWD_ALL_MBOX") ? 1 : 0;
++    const int answers_a_count = fwd_all || (g_spurs_job_cmd == SGX_Q_IN_BUSES ||
++                                            g_spurs_job_cmd == SGX_Q_OUT_BUSES);
+     if (g_spurs_job_mbox_valid) {
+         mbox = g_spurs_job_mbox;
+         d3 = g_spurs_job_mbox_intr; (void)d3;
+         g_spurs_job_mbox_valid = 0;
+     }
++    /* The job reported itself with a real event: don't add a synthetic one. */
++    if (g_spurs_job_sent_event) { g_spurs_job_sent_event = 0; return; }
+     for (int i = 0; i < s_spurs_event_queue_n; i++) {
+         int rc = sys_event_queue_push_by_id(s_spurs_event_queue[i],
+                                             SPURS_EVENT_PORT, jc_ea, d2,
+                                             d3_probe_valid
+                                                 ? spurs_event_data3_probe()
+                                                 : (answers_a_count ? mbox : 0));
++        { static int t = -1; if (t < 0) t = getenv("SPURS_JC_TRACE") ? 1 : 0;
++          if (t) fprintf(stderr, "[jc-trace] done job=%d q=%u cmd=0x%X mbox=0x%08X d3=0x%llX rc=%d\n",
++                         job_index, s_spurs_event_queue[i], g_spurs_job_cmd, (unsigned)mbox,
++                         (unsigned long long)(answers_a_count ? mbox : 0), rc); }
+         static int n = 0;
+         if (n++ < 8)
+             printf("[cellSpurs] chain 0x%08X job %d done -> event queue %u "
+@@ -2593,6 +2637,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+     int idle = 0;
+     for (;; idle++) {
+         if (idle > 4096) break;
++        if (jc_stopping()) return;
+         u64 cmd = vm_read64(pc);
+         u32 op  = (u32)(cmd & 7);
+         u32 ext = (u32)(cmd & 127);
+@@ -2610,13 +2655,52 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+             jc_signal_done(jc_ea, idx);
+             pc += 8; continue;
+         }
++        if (op == 6) {                                    /* JOBLIST */
++            /* CellSpursJobList { u32 numJobs; u32 sizeOfJob; u64 eaJobList; }:
++             * an array of job descriptors run as one command. This used to be
++             * skipped as a NOP, and in Tokyo Jungle that is most of the frame:
++             * the geom-jobchain, anim-jobchain and job_cid chains all lead with
++             * a JOBLIST, and its geometry jobs are what write each gameplay
++             * frame's RSX commands into the segment the main ring jumps to --
++             * without them every gameplay frame drew nothing. */
++            const u32 jl   = (u32)(cmd & ~7ull);
++            const u32 n    = vm_read32(jl + 0);
++            const u32 size = vm_read32(jl + 4);
++            const u32 list = (u32)vm_read64(jl + 8);
++            { static int _n = 0;
++              if (n && _n++ < 4)
++                  printf("[cellSpurs] chain 0x%08X: JOBLIST @0x%08X n=%u size=%u list=0x%08X\n",
++                         jc_ea, jl, n, size, list); }
++            { static int t = -1; if (t < 0) t = getenv("SPURS_JC_TRACE") ? 1 : 0;
++              if (t) fprintf(stderr, "[jc-trace] chain 0x%08X JOBLIST @0x%08X n=%u size=%u list=0x%08X\n",
++                             jc_ea, jl, n, size, list); }
++            if (n == 0) { pc += 8; continue; }    /* an empty list is valid: nothing to run */
++            if (n <= 4096 && size >= 64 && size <= 0x1000 && list) {
++                for (u32 i = 0; i < n; i++) {
++                    if (jc_stopping()) return;
++                    { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
++                    int idx = jobs++;
++                    jc_run_one_job(list + i * size, idx, size);
++                    jc_signal_done(jc_ea, idx);
++                }
++                idle = 0;
++            } else {
++                static int _b = 0;
++                if (_b++ < 8)
++                    printf("[cellSpurs] chain 0x%08X: implausible JOBLIST @0x%08X "
++                           "(n=%u size=%u list=0x%08X) -- skipped\n", jc_ea, jl, n, size, list);
++            }
++            pc += 8; continue;
++        }
+         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
+         if (op == 3) { pc = (u32)(cmd & ~7ull); continue; }   /* NEXT     */
+         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
+         if (op == 7) {
+             if (ext == (7 | (15 << 3))) {                     /* END */
+                 printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
+-                if (jobs) jc_signal_done(jc_ea, jobs - 1);
++                /* SPURS_ONE_EVENT_PER_JOB=1: the per-job signal above already
++                 * reported the last job; a second one is a stale extra event. */
++                if (jobs && !getenv("SPURS_ONE_EVENT_PER_JOB")) jc_signal_done(jc_ea, jobs - 1);
+                 return;
+             }
+             if (ext == (7 | (14 << 3))) {                     /* RET */
+@@ -2634,7 +2718,7 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+             pc += 8; continue;
+         }
+         /* NOP(0) / SYNC+LWSYNC(2, one virtual SPU: nothing to wait for) /
+-         * FLUSH(5) / JOBLIST(6, nested arrays TODO) / SET_LABEL */
++         * FLUSH(5) / SET_LABEL */
+         pc += 8;
+     }
+     printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d "
+@@ -2652,12 +2736,15 @@ static DWORD WINAPI jc_thread(LPVOID p)
+      * Confirms timing-vs-never before committing to the async rewrite. */
+     { const char* d = getenv("SPURS_JC_DELAY");
+       if (d && *d) Sleep((unsigned)atoi(d)); }
++    t_jc_stop = &s_jobchains[slot].stop;
+     jc_execute(s_jobchains[slot].entry_ea, s_jobchains[slot].jc_ea,
+                s_jobchains[slot].size_desc);
+     s_jobchains[slot].running = 0;
+     /* Tell the application the chain is done. Without this the walk finishes
+      * in silence and a thread waiting on the attached queue never runs again. */
+-    jc_signal_done(s_jobchains[slot].jc_ea, -1);
++    if (!s_jobchains[slot].stop && !getenv("SPURS_ONE_EVENT_PER_JOB"))
++        jc_signal_done(s_jobchains[slot].jc_ea, -1);
++    s_jobchains[slot].alive = 0;
+     return 0;
+ }
+ 
+@@ -2690,9 +2777,19 @@ static s32 jc_start(u64 jc_ea, const char* who)
+         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
+         /* Coalesce: a chain already being walked must not start twice. */
+         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
++            /* A shut-down walker may still be on its way out; never run two. */
++            while (s_jobchains[i].alive) {
++#ifdef _WIN32
++                Sleep(0);
++#else
++                usleep(100);
++#endif
++            }
++            s_jobchains[i].stop  = 0;
++            s_jobchains[i].alive = 1;
+             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
+             if (th) CloseHandle(th);
+-            else s_jobchains[i].running = 0;
++            else { s_jobchains[i].alive = 0; s_jobchains[i].running = 0; }
+         }
+         return CELL_OK;
+     }
+@@ -2724,6 +2821,7 @@ s32 cellSpursShutdownJobChain(u64 jc_ea)
+     if (_n++ < 8) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea);
+     for (int i = 0; i < MAX_JOBCHAINS; i++) {
+         if (s_jobchains[i].jc_ea == (u32)jc_ea) {
++            s_jobchains[i].stop = 1;      /* the walker leaves at its next step or guard */
+             s_jobchains[i].running = 0;   /* stop the walker; Join can now succeed */
+             return CELL_OK;
+         }
+@@ -2747,7 +2845,9 @@ s32 cellSpursJoinJobChain(u64 jc_ea)
+      * so that frame's data was never written at all. */
+     for (int i = 0; i < MAX_JOBCHAINS; i++) {
+         if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
+-        while (s_jobchains[i].running) {
++        /* Wait for the thread itself, not just the flag: after a Shutdown
++         * `running` is already 0 while the walker is still in jg_wait. */
++        while (s_jobchains[i].running || s_jobchains[i].alive) {
+ #ifdef _WIN32
+             Sleep(0);
+ #else
+diff --git a/libs/spurs/cellSpurs.h b/libs/spurs/cellSpurs.h
+index a537581..a22f9a5 100644
+--- a/libs/spurs/cellSpurs.h
++++ b/libs/spurs/cellSpurs.h
+@@ -301,6 +301,11 @@ s32 cellSpursEventFlagClear(CellSpursEventFlag* eventFlag, u16 bits);
+ s32 cellSpursEventFlagGetDirection(CellSpursEventFlag* eventFlag,
+                                    u32* direction);
+ 
++/* Port configuration (not a firmware call): 0 stops the job-chain walker from
++ * pushing synthetic per-job completion events, for titles whose SPU jobs send
++ * their own (see jc_signal_done). Default 1. Call before the game boots. */
++void cellSpurs_set_synthetic_job_events(int on);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
+index 9e58833..9ee871a 100644
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -145,6 +145,13 @@ SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
+  * expects an answer back through the completion event. */
+ SPURS_JOB_TLS uint32_t g_spurs_job_cmd;
+ SPURS_JOB_TLS int g_spurs_job_mbox_valid;
++/* Set when the running job delivered a real SPU user event (send_event to a
++ * port cellSpursAttachLv2EventQueue bound). Its completion is then already on
++ * the right queue with the job's own payload, so the job chain must not add a
++ * synthetic one: Tokyo Jungle's SOC job answers each DSP module query on port
++ * 16, whose queue is ONE deep, and a synthetic zero-payload event racing the
++ * real one made modules register with sizes of 0 (sgxbus "failed to regist"). */
++SPURS_JOB_TLS int g_spurs_job_sent_event;
+ 
+ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+                       uint32_t job_ea, uint32_t job_desc_size)
+@@ -356,6 +363,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+      * and trips its parameter guard, which HALTS -- ending the run. So the
+      * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
+      * noise, not a failure: the job's real work finished before the jump. */
++    g_spurs_job_sent_event = 0;
+     spu_run_with_halt(entry, &ctx);
+ 
+     /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index bcb1df4..fad8389 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -1646,8 +1646,19 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
+         }
+         result = CELL_ENOTCONN;
+         if (queue) {
++            if (!spu->spu_group_id) {
++#ifdef _WIN32
++                extern __declspec(thread) int g_spurs_job_sent_event;
++#else
++                extern __thread int g_spurs_job_sent_event;
++#endif
++                g_spurs_job_sent_event = 1;
++            }
+             int rc = sys_event_queue_push_by_id(queue, 0xFFFFFFFF53505501ull,
+                 spu->spu_id, ((uint64_t)port << 32) | (value & 0xFFFFFFu), data);
++            { static int t = -1; if (t < 0) t = getenv("SPURS_JC_TRACE") ? 1 : 0;
++              if (t) fprintf(stderr, "[jc-trace] SPU send_event port=%u q=%u data0=0x%06X data=0x%08X rc=%d\n",
++                             port, queue, value & 0xFFFFFFu, data, rc); }
+             result = rc == 0 ? CELL_OK : CELL_EBUSY;
+         }
+     }

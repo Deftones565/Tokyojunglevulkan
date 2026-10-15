@@ -1,0 +1,18 @@
+# Game data: never commit copyrighted files
+*.pkg
+*.rap
+*.rif
+input/
+extracted/
+generated/
+build*/
+.venv/
+__pycache__/
+# agent board runtime state
+.agents/board.log
+.agents/*.lock
+.agents/names
+.agents/.seen/
+.agents/board.*.log
+*.tsv
+.claude/settings.local.json

@@ -1,0 +1,6 @@
+[submodule "third_party/ps3recomp"]
+	path = third_party/ps3recomp
+	url = https://github.com/sp00nznet/ps3recomp
+[submodule "third_party/tokyojungle-ref"]
+	path = third_party/tokyojungle-ref
+	url = https://github.com/sp00nznet/tokyojungle

@@ -1,0 +1,146 @@
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3590,6 +3590,51 @@
+         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
+ }
+ 
++/* Guest stack and thread identity for a callback run by ppu_guest_call/_ct.
++ *
++ * Every host thread used to start its callbacks at one fixed address,
++ * 0xCFFE0000 (inside RSX local memory), and every host-only thread ran them as
++ * thread 0x7FFF0000. Two threads calling back at once (the GCM ticker and an
++ * HLE worker) then shared their frames, and every owner-tracking primitive saw
++ * one thread. Each host thread now takes its own stack from the thread-stack
++ * allocator the first time it calls back (sys_ppu_thread.c), and each host-only
++ * thread its own id. A callback nested inside another on the same thread starts
++ * below the outer one's live frame instead of on top of it. */
++extern "C" uint32_t ppu_thread_alloc_callback_stack(uint32_t size);
++
++static PPU_THREAD_LOCAL uint32_t s_cb_lo = 0, s_cb_hi = 0;
++static PPU_THREAD_LOCAL uint64_t s_cb_host_tid = 0;
++
++static uint32_t cb_stack_pointer(void)
++{
++    if (!s_cb_hi) {
++        const uint32_t size = 0x80000;
++        uint32_t base = ppu_thread_alloc_callback_stack(size);
++        if (!base) {
++            fprintf(stderr, "[ppu] guest_call: the guest stack region is exhausted\n");
++            abort();
++        }
++        s_cb_lo = base;
++        s_cb_hi = base + size;
++    }
++    if (g_active_ctx) {
++        uint32_t sp = (uint32_t)g_active_ctx->gpr[1];
++        if (sp > s_cb_lo + 0x10000u && sp <= s_cb_hi)
++            return (sp - 0x400u) & ~0xFu;
++    }
++    return s_cb_hi - 0x100u;
++}
++
++static uint64_t cb_thread_id(void)
++{
++    if (g_active_ctx) return g_active_ctx->thread_id;
++    if (!s_cb_host_tid) {
++        static LONG n = 0;
++        s_cb_host_tid = 0x7FFF0000ull | ((uint32_t)InterlockedIncrement(&n) & 0xFFFFu);
++    }
++    return s_cb_host_tid;
++}
++
+ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+@@ -3614,14 +3659,10 @@
+                 vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
+         return 0; }
+ 
+-    /* Private scratch stack high in the guest stack region, distinct from the
+-     * main + ppu_thread stacks. One callback at a time per caller thread. */
+-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
+-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+ 
+     ppu_context ctx;
+     memset(&ctx, 0, sizeof(ctx));
+-    ctx.gpr[1]  = s_cb_sp;
++    ctx.gpr[1]  = cb_stack_pointer();
+     ctx.gpr[2]  = toc;
+     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
+     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
+@@ -3635,13 +3676,8 @@
+     /* Thread identity: a zeroed scratch ctx used to run callbacks as thread_id 0
+      * -- aliasing the main thread in every owner-tracking primitive. Inherit the
+      * calling guest thread's id; host-only threads (ticker) get a per-host-thread
+-     * sentinel far above the thread table's range. */
+-#ifdef _WIN32
+-    ctx.thread_id = saved_active ? saved_active->thread_id
+-                                 : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
+-#else
+-    ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
+-#endif
++     * id far above the thread table's range (cb_thread_id). */
++    ctx.thread_id = cb_thread_id();
+     g_active_ctx = &ctx;
+     fn(&ctx);
+     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+@@ -3661,12 +3697,10 @@
+     ppu_fn fn = ppu_lookup(code);
+     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
+ 
+-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
+-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+ 
+     ppu_context ctx;
+     memset(&ctx, 0, sizeof(ctx));
+-    ctx.gpr[1]  = s_cb_sp;
++    ctx.gpr[1]  = cb_stack_pointer();
+     ctx.gpr[2]  = toc;
+     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
+     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
+@@ -3676,12 +3710,7 @@
+      * so a dangling g_active_ctx after return corrupts the crash handler / diagnostics. */
+     ppu_context* saved_active = g_active_ctx;
+     /* Inherit the caller's thread identity (see ppu_guest_call above). */
+-#ifdef _WIN32
+-    ctx.thread_id = saved_active ? saved_active->thread_id
+-                                 : (0x7FFF0000ull | (GetCurrentThreadId() & 0xFFFFu));
+-#else
+-    ctx.thread_id = saved_active ? saved_active->thread_id : 0x7FFF0000ull;
+-#endif
++    ctx.thread_id = cb_thread_id();
+     g_active_ctx = &ctx;
+     fn(&ctx);
+     while (g_trampoline_fn) { void (*tf)(void*) = g_trampoline_fn; g_trampoline_fn = 0; tf(&ctx); }
+--- a/runtime/syscalls/sys_ppu_thread.c
++++ b/runtime/syscalls/sys_ppu_thread.c
+@@ -243,6 +243,19 @@
+     return 1;
+ }
+ 
++/* A guest stack for a host thread that calls into guest code through
++ * ppu_guest_call (the GCM ticker, HLE worker threads, synchronous HLE
++ * callbacks). Same allocator and lock as sys_ppu_thread_create, so it is a
++ * real stack in the 0xD0000000 region that never overlaps a thread's.
++ * Returns the stack's lowest address, or 0 when the region is exhausted. */
++uint32_t ppu_thread_alloc_callback_stack(uint32_t size)
++{
++    table_lock();
++    uint32_t base = vm_stack_allocate(&g_vm_stack_alloc, size);
++    table_unlock();
++    return base;
++}
++
+ /* ---------------------------------------------------------------------------
+  * sys_ppu_thread_create
+  *
+--- a/runtime/syscalls/sys_ppu_thread.h
++++ b/runtime/syscalls/sys_ppu_thread.h
+@@ -89,6 +89,7 @@
+  * Call before the first sys_ppu_thread_create so no created thread aliases
+  * main (thread_id 0 broke every owner-tracking sync primitive). */
+ uint64_t ppu_thread_register_main(void);
++uint32_t ppu_thread_alloc_callback_stack(uint32_t size);
+ int64_t sys_ppu_thread_exit(ppu_context* ctx);
+ int64_t sys_ppu_thread_join(ppu_context* ctx);
+ int64_t sys_ppu_thread_detach(ppu_context* ctx);

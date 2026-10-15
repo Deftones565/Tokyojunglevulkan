@@ -1,0 +1,49 @@
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -79,6 +79,18 @@
+ static u32           s_max_connect = 0;
+ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
+ static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
++
++/* A pad with nothing behind it: no buttons, sticks centred. The PS3 reports a
++ * centred stick as 0x80; zero is held fully up-left, which a menu reads as a
++ * held direction and auto-repeats -- Tokyo Jungle's title cursor wandered onto
++ * a different item on every run, so scripted input picked Stats or Archives
++ * instead of Survival depending on timing. */
++static void pad_host_state_neutral(PadHostState* hs)
++{
++    memset(hs, 0, sizeof *hs);
++    hs->analog_lx = hs->analog_ly = 0x80;
++    hs->analog_rx = hs->analog_ry = 0x80;
++}
+ /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
+ static int s_data_fresh[PAD_MAX_HOST_PORTS];
+ 
+@@ -196,7 +208,7 @@
+ 
+         DWORD result = XInputGetState((DWORD)i, &state);
+         if (result != ERROR_SUCCESS) {
+-            s_host_state[i].connected = 0;
++            pad_host_state_neutral(&s_host_state[i]);
+             continue;
+         }
+ 
+@@ -301,7 +313,7 @@
+ 
+         SDL_GameController* gc = s_sdl_controllers[i];
+         if (!gc || !SDL_GameControllerGetAttached(gc)) {
+-            s_host_state[i].connected = 0;
++            pad_host_state_neutral(&s_host_state[i]);
+             if (gc) {
+                 SDL_GameControllerClose(gc);
+                 s_sdl_controllers[i] = NULL;
+@@ -484,7 +496,8 @@
+     s_pad_initialized = 1;
+     s_max_connect = max_connect > CELL_PAD_MAX_PORT_NUM ? CELL_PAD_MAX_PORT_NUM : max_connect;
+     memset(s_port_setting, 0, sizeof(s_port_setting));
+-    memset(s_host_state, 0, sizeof(s_host_state));
++    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++)
++        pad_host_state_neutral(&s_host_state[i]);
+ 
+     pad_init_backend();
+ 

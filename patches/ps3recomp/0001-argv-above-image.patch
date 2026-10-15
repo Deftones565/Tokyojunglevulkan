@@ -1,0 +1,35 @@
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index bf75dc8..6be8496 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1193,6 +1193,8 @@ extern "C" uint32_t ppu_vm_size = 0;
+  * the free window just below the mmapper region (0x11000000) and above any
+  * game's high data segments, so it doesn't collide with the static image. */
+ static uint32_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
++/* Highest PT_LOAD vaddr+memsz, so ppu_run can keep the argv block out of BSS. */
++static uint32_t g_image_end = 0;
+ #define PPU_TLS_IMG   0x10F00000u
+ #define PPU_TLS_TP    (PPU_TLS_IMG + 0x7000u)
+ 
+@@ -3370,6 +3372,7 @@ extern "C" uint32_t ppu_load_elf(const char* path)
+         if (p_memsz > p_filesz)
+             memset(vm_base + (uint32_t)p_vaddr + (uint32_t)p_filesz, 0, (size_t)(p_memsz - p_filesz));
+         loaded++;
++        if ((uint32_t)(p_vaddr + p_memsz) > g_image_end) g_image_end = (uint32_t)(p_vaddr + p_memsz);
+     }
+     free(file);
+     fprintf(stderr, "[ppu] loaded %d PT_LOAD segments, entry OPD 0x%08X\n", loaded, entry);
+@@ -3782,7 +3785,12 @@ extern "C" int ppu_run(uint32_t entry_opd, uint32_t stack_top)
+             }
+         }
+ 
+-        uint32_t argv_base = 0x00B00000u;          /* scratch in the .data/heap gap */
++        /* Scratch in the .data/heap gap -- unless the image's BSS reaches past it
++         * (Tokyo Jungle's runs to 0xC0E188), then the first page above the image.
++         * $PS3_ARGV_BASE overrides. */
++        uint32_t argv_base = 0x00B00000u;
++        if (g_image_end > argv_base) argv_base = (g_image_end + 0xFFFu) & ~0xFFFu;
++        if (const char* ab = getenv("PS3_ARGV_BASE"); ab && *ab) argv_base = (uint32_t)strtoul(ab, nullptr, 0);
+         /* argc_n argv pointers, a NULL argv terminator, then a NULL envp. */
+         uint32_t slots     = (argc_n + 2u) * 8u;
+         uint32_t str_addr  = argv_base + ((slots + 0x1Fu) & ~0x1Fu);

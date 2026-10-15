@@ -1,0 +1,154 @@
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -114,6 +114,8 @@
+  * In a full emulator these would be in guest VM memory; here we allocate
+  * host buffers and expose their addresses through portAddr/readIndexAddr. */
+ #define AUDIO_PORT_BUF_MAX  (CELL_AUDIO_BLOCK_32 * CELL_AUDIO_BLOCK_SAMPLES * CELL_AUDIO_PORT_8CH)
++#define AUDIO_STAMP_RING    256
++#define AUDIO_BLOCK_US(n)   ((u64)(n) * CELL_AUDIO_BLOCK_SAMPLES * 1000000ULL / CELL_AUDIO_SAMPLE_RATE)
+ 
+ typedef struct {
+     int                  in_use;
+@@ -126,6 +128,9 @@
+     /* For address reporting to guest */
+     u64                  port_addr;      /* guest-visible buffer address */
+     u64                  read_idx_addr;  /* guest-visible read index address */
++    /* System time (us) at which each recent block was mixed, by tag. libsail
++     * sets its A/V clock from these, so they must follow real time. */
++    u64                  stamp_us[AUDIO_STAMP_RING];
+ } AudioPortSlot;
+ 
+ static int            s_audio_initialized = 0;
+@@ -141,6 +146,21 @@
+ /* Timestamp anchor for cellAudioGetPortTimestamp (microseconds, set at init) */
+ static u64            s_audio_start_us = 0;
+ 
++/* Host monotonic time in microseconds: the clock sys_time_get_system_time
++ * and cellGcmGetLastFlipTime report. */
++static u64 audio_now_us(void)
++{
++#ifdef _WIN32
++    LARGE_INTEGER f, c;
++    QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
++    return (u64)(c.QuadPart / f.QuadPart) * 1000000ULL +
++           (u64)(c.QuadPart % f.QuadPart) * 1000000ULL / (u64)f.QuadPart;
++#else
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (u64)ts.tv_sec * 1000000ULL + (u64)ts.tv_nsec / 1000ULL;
++#endif
++}
++
+ /* Mixing thread */
+ static unsigned long long g_audio_dropped;   /* frames the device had no room for */
+ static volatile int  s_mix_thread_running = 0;
+@@ -411,6 +431,7 @@
+ /* Mix one block from all active ports into s_mix_buffer (stereo float) */
+ static void audio_mix_one_block(void)
+ {
++    const u64 now_us = audio_now_us();
+     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
+ 
+     mutex_lock(&s_audio_mutex);
+@@ -501,6 +522,14 @@
+         /* Keep the monotonic counter for tags/timestamps, but publish the
+          * ring slot to the guest. SurMixer multiplies this value by the block
+          * size directly; an unbounded counter walks beyond the audio buffer. */
++        {   /* Never step backwards: a clock base taken from these must not jump. */
++            u64 t = now_us;
++            if (port->read_index) {
++                const u64 prev = port->stamp_us[(port->read_index - 1) % AUDIO_STAMP_RING];
++                if (t <= prev) t = prev + 1;
++            }
++            port->stamp_us[port->read_index % AUDIO_STAMP_RING] = t;
++        }
+         port->read_index++;
+         if (port->read_idx_addr)
+             vm_write64((u32)port->read_idx_addr, port->read_index % nblock);
+@@ -608,17 +637,43 @@
+     (void)arg;
+     printf("[cellAudio] Mixing thread started\n");
+ 
++    /* Pace to real time: one block every 5.33 ms, as on the PS3. The old
++     * usleep(2000)/usleep(5000) loop mixed a block per ~5.1 ms into SDL's
++     * unbounded queue (the dummy driver drains it as fast), so block tags,
++     * and the port timestamps derived from them, ran ~5% ahead of the system
++     * clock. libsail's A/V clock takes its base from those timestamps and its
++     * video time from cellGcmGetLastFlipTime, so no movie frame was ever due.
++     * Wait for the device to have room too, so its queue stays short. */
++    u64 base_us = audio_now_us();
++    unsigned long long blocks = 0;
+     while (s_mix_thread_running) {
++        const int room = audio_backend_room();
++        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
++        const u64 now = audio_now_us();
++        const u64 due = base_us + AUDIO_BLOCK_US(blocks);
++        if (now < due) {
++            const u64 d = due - now;
++            usleep(d > 1000 ? 1000 : (useconds_t)d);
++            continue;
++        }
++        /* More than 50 ms behind (stalled host, debugger stop): drop the
++         * backlog instead of mixing it in a burst. */
++        if (now - due > 50000)
++            base_us = now - AUDIO_BLOCK_US(blocks);
++        blocks++;
++
+         audio_mix_one_block();
+         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+         audio_notify_event_queues();
+ 
+-        u32 queued = audio_backend_queued_samples();
+-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
+-            usleep(5000);
+-        } else {
+-            usleep(2000);
+-        }
++        /* AUDIO_RATE=1: blocks mixed vs real time. */
++        { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
++          if (on) { static u64 r0; static unsigned n;
++            n++; if (!r0) r0 = now;
++            if (now - r0 >= 5000000) {
++                fprintf(stderr, "[audio-rate] %.2f blocks/s (real time 187.50), queued %u%c",
++                        n * 1e6 / (double)(now - r0), audio_backend_queued_samples(), 10);
++                n = 0; r0 = now; } } }
+     }
+ 
+     printf("[cellAudio] Mixing thread stopped\n");
+@@ -928,12 +983,33 @@
+         return CELL_AUDIO_ERROR_PARAM;
+ 
+     mutex_lock(&s_audio_mutex);
+-    u64 global_counter = s_ports[portNum].read_index;
+-    mutex_unlock(&s_audio_mutex);
+-    if (tag > global_counter)
++    const AudioPortSlot* port = &s_ports[portNum];
++    u64 global_counter = port->read_index;
++    if (tag > global_counter) {
++        mutex_unlock(&s_audio_mutex);
+         return CELL_AUDIO_ERROR_TAG_NOT_FOUND;
++    }
++    /* The time that block was actually mixed. Blocks not mixed yet (tag ==
++     * read_index) or already out of the ring are extrapolated from the
++     * nearest recorded one at the nominal 5.33 ms per block. */
++    u64 t;
++    const u64 oldest = global_counter > AUDIO_STAMP_RING ? global_counter - AUDIO_STAMP_RING : 0;
++    if (global_counter == 0)
++        t = s_audio_start_us + AUDIO_BLOCK_US(tag);
++    else if (tag == global_counter)
++        t = port->stamp_us[(tag - 1) % AUDIO_STAMP_RING] + AUDIO_BLOCK_US(1);
++    else if (tag < oldest)
++        t = port->stamp_us[oldest % AUDIO_STAMP_RING] - AUDIO_BLOCK_US(oldest - tag);
++    else
++        t = port->stamp_us[tag % AUDIO_STAMP_RING];
++    mutex_unlock(&s_audio_mutex);
+ 
+-    u64 t = s_audio_start_us + tag * 256000000ULL / 48000ULL;
++    /* AUDIO_TSDBG=1: timestamp vs system time; should stay ~constant. */
++    { static int on = -1; if (on < 0) on = getenv("AUDIO_TSDBG") ? 1 : 0;
++      if (on) { static unsigned n; if ((n++ % 500) == 0)
++        fprintf(stderr, "[audio-ts] port %u tag %llu ridx %llu stamp-now %+lld us%c", portNum,
++                (unsigned long long)tag, (unsigned long long)global_counter,
++                (long long)(t - audio_now_us()), 10); } }
+     vm_write64(stamp_ea, t);
+     return CELL_OK;
+ }

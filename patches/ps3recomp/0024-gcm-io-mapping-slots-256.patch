@@ -1,0 +1,33 @@
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -3661,11 +3661,11 @@
+ void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size)
+ {
+     populate_offset_table(ea, io, size);
+-    if (s_io_mapping_count < CELL_GCM_MAX_IO_MAPPINGS) {
+-        s_io_mappings[s_io_mapping_count].ea     = ea;
+-        s_io_mappings[s_io_mapping_count].io     = io;
+-        s_io_mappings[s_io_mapping_count].size   = size;
+-        s_io_mappings[s_io_mapping_count].active = 1;
++    /* A free slot, not slot[count]: after an unmap the count no longer
++     * points past the last active entry and would overwrite a live one. */
++    IoMapping* m = find_free_mapping();
++    if (m) {
++        m->ea = ea; m->io = io; m->size = size; m->active = 1;
+         s_io_mapping_count++;
+     }
+     if (!s_config.ioSize) { s_config.ioAddress = ea; s_config.ioSize = size; }
+--- a/libs/video/cellGcmSys.h
++++ b/libs/video/cellGcmSys.h
+@@ -72,7 +72,10 @@
+ #define CELL_GCM_LOCATION_MAIN          1  /* main memory */
+ 
+ /* IO mapping limits */
+-#define CELL_GCM_MAX_IO_MAPPINGS        16
++/* One slot per mapping call. lv2 has no such limit: the RSX IO space is 256
++ * pages of 1 MB, so 256 slots can never run out first. 16 refused Tokyo
++ * Jungle's 17th mapping during stage load and the load stalled for good. */
++#define CELL_GCM_MAX_IO_MAPPINGS        256
+ 
+ /* Debug output levels */
+ #define CELL_GCM_DEBUG_LEVEL0           0

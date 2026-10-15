@@ -1,0 +1,94 @@
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -682,9 +682,13 @@
+  * -----------------------------------------------------------------------*/
+ #ifdef _WIN32
+ #include <windows.h>
+-static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
++static volatile LONG s_gcm_pending = 0;    /* bit1 = flip; vblanks are counted in s_vblank_pend */
+ #define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
+ #define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
++static volatile LONG s_vblank_pend = 0;    /* vblanks not yet delivered */
++#define VBLANK_PEND_ADD()      InterlockedIncrement(&s_vblank_pend)
++#define VBLANK_PEND_TAKE()     InterlockedExchange(&s_vblank_pend, 0)
++#define VBLANK_PEND_ADDN(n)    InterlockedExchangeAdd(&s_vblank_pend, (n))
+ static volatile LONG s_gcm_pumping = 0;
+ #define GCM_PUMP_TRY_ENTER() (InterlockedCompareExchange(&s_gcm_pumping, 1, 0) == 0)
+ #define GCM_PUMP_LEAVE()     InterlockedExchange(&s_gcm_pumping, 0)
+@@ -693,6 +697,10 @@
+ static atomic_int s_gcm_pending = 0;
+ #define GCM_PENDING_SET(bits)  atomic_fetch_or(&s_gcm_pending, (bits))
+ #define GCM_PENDING_TAKE()     atomic_exchange(&s_gcm_pending, 0)
++static atomic_int s_vblank_pend = 0;       /* vblanks not yet delivered */
++#define VBLANK_PEND_ADD()      atomic_fetch_add(&s_vblank_pend, 1)
++#define VBLANK_PEND_TAKE()     atomic_exchange(&s_vblank_pend, 0)
++#define VBLANK_PEND_ADDN(n)    atomic_fetch_add(&s_vblank_pend, (n))
+ static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
+ #define GCM_PUMP_TRY_ENTER() (!atomic_flag_test_and_set_explicit(&s_gcm_pumping, memory_order_acquire))
+ #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
+@@ -719,10 +727,12 @@
+       if (need < 0) { const char* e = getenv("GCM_FLIP_NEEDS_FIFO"); need = e ? atoi(e) : 0; }
+       if (need) {
+           u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+-          GCM_PENDING_SET(s_fifo_getoff == put ? 3 : 1);
++          VBLANK_PEND_ADD();
++          if (s_fifo_getoff == put) GCM_PENDING_SET(2);
+           return;
+       } }
+-    GCM_PENDING_SET(3);
++    VBLANK_PEND_ADD();
++    GCM_PENDING_SET(2);
+ }
+ 
+ /* Deliver pending handlers on the calling host thread. Serialize the entire
+@@ -734,19 +744,36 @@
+ {
+     if (!GCM_PUMP_TRY_ENTER()) return;
+     long p = (long)GCM_PENDING_TAKE();
++    /* Every vblank since the last pump, not just "at least one": the vblank
++     * handler is a title's frame clock -- Tokyo Jungle's counts its calls and
++     * raises a frame-ready flag every Nth -- and lv2 calls it once per vblank.
++     * Pending was a bit, so ticks that landed between two pumps merged into one
++     * call: the game saw 10,541 vblanks for 14,938 real ones, its clock ran at
++     * ~44 Hz, and everything timed by it ran 30% slow. At most 4 are delivered
++     * per pump and at most 4 more carried to the next one, so a stalled thread
++     * catches up over a couple of pumps instead of in one burst, and a backlog
++     * beyond that (a long stall) is dropped, as missed interrupts would be. */
++    long nvb = (long)VBLANK_PEND_TAKE();
++    if (nvb > 4) {
++        long rest = nvb - 4;
++        VBLANK_PEND_ADDN(rest > 4 ? 4 : rest);
++        nvb = 4;
++    }
+     u32 cmd;
+     const int have_user = gcm_ucmd_pop(&cmd);
+     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
+     { static int d = -1; static unsigned nv, nf, calls;
+       if (d < 0) d = getenv("GCM_PUMP_DBG") ? 1 : 0;
+-      if (d) { calls++; if (p & 1) nv++; if (p & 2) nf++;
++      if (d) { calls++; nv += (unsigned)nvb; if (p & 2) nf++;
+                if ((calls % 20000) == 0)
+                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
+                            calls, nv, nf, s_vblank_count, 10); } }
+-    if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
+-        ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
+-        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
+-                           0, 0, 0, 0, 0, 0, 0);
++    if (s_vblank_handler_opd && g_ps3_guest_caller) {
++        for (long i = nvb; i > 0; i--) {
++            ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
++            g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)(s_vblank_count - (u32)(i - 1)),
++                               0, 0, 0, 0, 0, 0, 0);
++        }
+     }
+     if (p & 2) {
+         s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+@@ -764,7 +791,7 @@
+ 
+ /* Back-compat: the old direct entry points now just mark a tick pending (so any
+  * caller other than the ticker still works) -- delivery stays on the main thread. */
+-void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
++void cellGcmTickVBlank(void) { s_vblank_count++; VBLANK_PEND_ADD(); }
+ /* Only deliver a flip completion when a flip is actually outstanding.
+  *
+  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when

@@ -1,0 +1,92 @@
+diff --color -ru a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+--- a/libs/video/rsx_draw_engine.c	2026-10-15 16:14:55.800913877 +0400
++++ b/libs/video/rsx_draw_engine.c	2026-10-15 16:14:55.795475830 +0400
+@@ -69,6 +69,7 @@
+ #define M_BLEND_SFACTOR       0x0314
+ #define M_BLEND_DFACTOR       0x0318
+ #define M_BLEND_EQUATION      0x0320
++#define M_BLEND_ENABLE_MRT    0x036C
+ #define M_COLOR_MASK          0x0324
+ #define M_STENCIL_TEST_ENABLE 0x0328
+ #define M_STENCIL_MASK        0x032C
+@@ -274,6 +275,7 @@
+     rs->alpha_ref_format = sf.color_format;
+     rs->rt_fp16 = sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16;
+     rs->blend_enable = rsx_dsp_reg(rsx, M_BLEND_ENABLE) & 1;
++    rs->blend_mrt = rsx_dsp_reg(rsx, M_BLEND_ENABLE_MRT) & 0xEu;
+     const u32 sfac = rsx_dsp_reg(rsx, M_BLEND_SFACTOR);
+     const u32 dfac = rsx_dsp_reg(rsx, M_BLEND_DFACTOR);
+     const u32 eq   = rsx_dsp_reg(rsx, M_BLEND_EQUATION);
+@@ -315,6 +317,7 @@
+     ENG_HASH_FIELD(alpha_test_enable);
+     ENG_HASH_FIELD(alpha_func);
+     ENG_HASH_FIELD(blend_enable);
++    ENG_HASH_FIELD(blend_mrt);
+     ENG_HASH_FIELD(sf_rgb);
+     ENG_HASH_FIELD(df_rgb);
+     ENG_HASH_FIELD(sf_a);
+diff --color -ru a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+--- a/libs/video/rsx_draw_engine.h	2026-10-15 16:14:55.801262995 +0400
++++ b/libs/video/rsx_draw_engine.h	2026-10-15 16:14:55.797508249 +0400
+@@ -76,6 +76,11 @@
+ typedef struct rsx_be_render_state {
+     u32 alpha_test_enable, alpha_func, alpha_ref_raw, alpha_ref_format;
+     u32 blend_enable, sf_rgb, df_rgb, sf_a, df_a, eq_rgb, eq_a;
++    /* BLEND_ENABLE_MRT bits 1..3: whether targets B, C and D blend too.
++     * BLEND_ENABLE governs target A only; an MRT member whose bit is clear
++     * is written straight (Tokyo Jungle's bright-pass in target B is
++     * overwritten every frame while target A accumulates). */
++    u32 blend_mrt;
+     u32 depth_test, depth_write, depth_func;
+     u32 cull_enable, cull_face, front_face;
+     u32 color_mask;
+diff --color -ru a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+--- a/libs/video/rsx_vulkan_backend.c	2026-10-15 16:14:55.801508554 +0400
++++ b/libs/video/rsx_vulkan_backend.c	2026-10-15 16:16:35.671640780 +0400
+@@ -193,6 +193,7 @@
+      * additionally blits the frame into the window's swapchain. */
+     int              eng_active;      /* the register-file engine drives us */
+     int              bc_ok;           /* textureCompressionBC enabled       */
++    int              independent_blend; /* per-attachment blend enables   */
+     u32              max_dim;         /* maxImageDimension2D of the device  */
+     int              windowed;
+     SDL_Window*      window;
+@@ -2826,16 +2827,25 @@
+         .stencilTestEnable = rs->stencil_enable ? VK_TRUE : VK_FALSE,
+         .front = front, .back = back };
+     /* nv40 COLOR_MASK: B [0:7], G [8:15], R [16:23], A [24:31], any bit set.
+-     * Every attachment takes target A's blend and mask (see rsx_draw_engine.h). */
++     * Every attachment takes target A's mask and blend factors (see
++     * rsx_draw_engine.h); targets B, C and D blend only when their
++     * BLEND_ENABLE_MRT bit is set as well. COLOR_MASK_MRT (0x0370) is not
++     * honoured yet: B-D take A's mask (Tokyo Jungle sets it to all-on). */
+     VkColorComponentFlags wm = 0;
+     if ((rs->color_mask >> 16) & 0xFFu) wm |= VK_COLOR_COMPONENT_R_BIT;
+     if ((rs->color_mask >>  8) & 0xFFu) wm |= VK_COLOR_COMPONENT_G_BIT;
+     if ((rs->color_mask >>  0) & 0xFFu) wm |= VK_COLOR_COMPONENT_B_BIT;
+     if ((rs->color_mask >> 24) & 0xFFu) wm |= VK_COLOR_COMPONENT_A_BIT;
+     VkPipelineColorBlendAttachmentState cba[RSX_BE_MAX_COLOR_TARGETS];
++    u32 mrt = rs->blend_mrt;
++    if (!s_vk.independent_blend && P->rt_count > 1 && rs->blend_enable && (mrt & 0xEu) != 0xEu) {
++        if (!(s_e2.warned & 64u)) { VK_LOG("engine: no independentBlend; MRT targets B-D blend like A\n"); s_e2.warned |= 64u; }
++        mrt = 0xEu;                    /* every attachment the same, as before */
++    }
+     for (u32 r = 0; r < P->rt_count; r++)
+         cba[r] = (VkPipelineColorBlendAttachmentState){
+-            .blendEnable = rs->blend_enable ? VK_TRUE : VK_FALSE,
++            .blendEnable = (rs->blend_enable && (r == 0 || ((mrt >> r) & 1u)))
++                         ? VK_TRUE : VK_FALSE,
+             .srcColorBlendFactor = vk_gcm_blend_factor(rs->sf_rgb),
+             .dstColorBlendFactor = vk_gcm_blend_factor(rs->df_rgb),
+             .colorBlendOp = vk_gcm_blend_op(rs->eq_rgb),
+@@ -3303,6 +3313,10 @@
+     pvkGetPhysicalDeviceFeatures(s_vk.phys, &have);
+     want.textureCompressionBC = have.textureCompressionBC;
+     s_vk.bc_ok = have.textureCompressionBC ? 1 : 0;
++    /* BLEND_ENABLE_MRT lets targets B-D skip the blend target A does; a
++     * pipeline whose attachments differ in blendEnable needs this feature. */
++    want.independentBlend = have.independentBlend;
++    s_vk.independent_blend = have.independentBlend ? 1 : 0;
+     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+                                .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
+                                .enabledExtensionCount = s_vk.windowed ? 1u : 0u,
