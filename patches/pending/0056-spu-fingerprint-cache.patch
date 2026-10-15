@@ -1,0 +1,130 @@
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -38,6 +38,100 @@
+     return h;
+ }
+ 
++/* Fingerprint cache for the per-run dispatch paths.
++ *
++ * The dispatchers fingerprint the whole image on every run only to find its
++ * lifted entry in the registry, and a SPURS job chain runs the same few job
++ * binaries from the same guest addresses thousands of times a second: the
++ * byte-at-a-time FNV above was 12.5% of the job-chain threads' CPU. Each slot
++ * keeps a private copy of the bytes it last fingerprinted for an (image
++ * pointer, size) pair; when memcmp finds the guest bytes unchanged the stored
++ * fp is the FNV of those very bytes, so the registry decision is the same as
++ * hashing again. On any difference the bytes are copied into the slot first
++ * and the copy is hashed, so the stored fp always matches the stored bytes
++ * even if the guest is rewriting the image meanwhile.
++ *
++ * One global table, not per-thread: spu_async creates a thread per dispatch,
++ * and thread-local copies would be lost (or leaked) with each of them. A
++ * slot is held with a try-lock; a thread that finds its slot busy just hashes
++ * directly, so nobody waits on another thread's memcmp.
++ *
++ * SPU_FP_CACHE=0 turns the cache off. SPU_FP_CACHE_VERIFY=1 also hashes the
++ * guest bytes on every cache hit and aborts if the fps differ. */
++#define SPU_FP_CACHE_SLOTS 64u
++
++typedef struct {
++    volatile LONG  busy;
++    const uint8_t* ptr;
++    size_t         size;
++    uint64_t       fp;
++    uint8_t*       copy;      /* malloc'd, `cap` bytes; holds `size` valid bytes */
++    size_t         cap;
++} spu_fp_cache_slot;
++
++static spu_fp_cache_slot s_fp_cache[SPU_FP_CACHE_SLOTS];
++static volatile LONG     s_fp_cache_mode = -1;   /* -1 unread, 0 off, 1 on, 2 on+verify */
++
++static int spu_fp_cache_mode(void)
++{
++    LONG m = s_fp_cache_mode;
++    if (m < 0) {
++        const char* e = getenv("SPU_FP_CACHE");
++        const char* v = getenv("SPU_FP_CACHE_VERIFY");
++        m = (e && e[0] == '0') ? 0 : ((v && v[0] && v[0] != '0') ? 2 : 1);
++        InterlockedExchange(&s_fp_cache_mode, m);
++        if (m != 1)
++            fprintf(stderr, "[spu_workload] fingerprint cache %s\n",
++                    m == 0 ? "OFF (SPU_FP_CACHE=0)" : "ON with verify (SPU_FP_CACHE_VERIFY=1)");
++    }
++    return (int)m;
++}
++
++static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, size_t n)
++{
++    int mode = spu_fp_cache_mode();
++    if (mode == 0) return spu_workload_fingerprint(image, n);
++
++    uintptr_t k = (uintptr_t)image ^ ((uintptr_t)n * 0x9E3779B1u);
++    k ^= k >> 7; k ^= k >> 17;
++    spu_fp_cache_slot* s = &s_fp_cache[k % SPU_FP_CACHE_SLOTS];
++    if (InterlockedExchange(&s->busy, 1) != 0)
++        return spu_workload_fingerprint(image, n);   /* slot in use: hash directly */
++
++    uint64_t fp;
++    if (s->ptr == image && s->size == n && s->copy && memcmp(s->copy, image, n) == 0) {
++        fp = s->fp;
++        if (mode == 2) {
++            uint64_t ref = spu_workload_fingerprint(image, n);
++            if (ref != fp) {
++                fprintf(stderr, "[spu_workload] FATAL: fingerprint cache mismatch "
++                        "image=%p size=%zu cached=0x%016llX fnv=0x%016llX\n",
++                        (const void*)image, n, (unsigned long long)fp,
++                        (unsigned long long)ref);
++                fflush(stderr);
++                abort();
++            }
++        }
++    } else {
++        if (s->cap < n) {
++            uint8_t* nb = (uint8_t*)realloc(s->copy, n);
++            if (!nb) {                    /* keep the old slot, hash directly */
++                InterlockedExchange(&s->busy, 0);
++                return spu_workload_fingerprint(image, n);
++            }
++            s->copy = nb;
++            s->cap  = n;
++        }
++        memcpy(s->copy, image, n);
++        fp = spu_workload_fingerprint(s->copy, n);
++        s->ptr  = image;
++        s->size = n;
++        s->fp   = fp;
++    }
++    InterlockedExchange(&s->busy, 0);
++    return fp;
++}
++
+ /* ---- registry ---------------------------------------------------------- */
+ 
+ #ifndef SPU_WORKLOAD_MAX
+@@ -199,7 +293,7 @@
+ {
+     if (!image || image_size == 0) return 0;
+ 
+-    uint64_t fp = spu_workload_fingerprint(image, image_size);
++    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
+     spu_lifted_entry_fn fn = NULL;
+     int image_id = 0;
+     for (unsigned i = 0; i < s_registry_count; i++)
+@@ -807,7 +901,7 @@
+ {
+     if (!image || image_size == 0) return 0;
+ 
+-    uint64_t fp = spu_workload_fingerprint(image, image_size);
++    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
+     spu_lifted_entry_fn fn = NULL;
+     int image_id = 0;
+     for (unsigned i = 0; i < s_registry_count; i++)
+@@ -1170,7 +1264,7 @@
+ {
+     if (!image || image_size == 0) return 0;
+ 
+-    uint64_t fp = spu_workload_fingerprint(image, image_size);
++    uint64_t fp = spu_workload_fingerprint_cached(image, image_size);
+     spu_lifted_entry_fn fn = NULL;
+     int image_id = 0;
+     for (unsigned i = 0; i < s_registry_count; i++)
