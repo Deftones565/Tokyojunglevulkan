@@ -1,0 +1,103 @@
+--- a/libs/spurs/cellSpurs.c	2026-10-15 22:09:52.073363596 +0400
++++ b/libs/spurs/cellSpurs.c	2026-10-15 22:09:52.077402731 +0400
+@@ -2115,6 +2115,23 @@
+ {
+     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
+     printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
++    /* Let the RSX catch up first. The PPU signals a task to start its next
++     * round once it has queued the GPU commands that read the task's previous
++     * output; on hardware the RSX has consumed them by then, but our drain
++     * trails the PPU by up to a frame. Tokyo Jungle's fur task (taskset
++     * 0x441D0B00) rewrites vertex data the queued fur draws still had to read:
++     * the Pomeranian's fur exploded whenever that task ran fast (docs/STATUS.md,
++     * SPU image 9). Bounded: SPURS_SIGNAL_RSX_SYNC_MS (default 50, 0 = off). */
++    { static long ms = -1;
++      if (ms < 0) { const char* e = getenv("SPURS_SIGNAL_RSX_SYNC_MS"); ms = e ? atol(e) : 50; }
++      if (ms > 0) {
++          extern int cellGcm_rsx_wait_consumed(unsigned timeout_ms);
++          if (!cellGcm_rsx_wait_consumed((unsigned)ms)) {
++              static int _n = 0;
++              if (_n++ < 8)
++                  fprintf(stderr, "[cellSpurs] _SendSignal: RSX still busy after %ld ms; signalling anyway\n", ms);
++          }
++      } }
+     /* Real delivery now that SPU tasks execute (comment was stale). */
+     if (taskset_ea) spu_taskset_signal_task(taskset_ea, taskId);
+     return CELL_OK;
+--- a/libs/video/cellGcmSys.c	2026-10-15 22:09:52.071355194 +0400
++++ b/libs/video/cellGcmSys.c	2026-10-15 22:09:52.075256941 +0400
+@@ -11,6 +11,9 @@
+ #include "rsx_live_draw.h"
+ #include "rsx_draw_engine.h"
+ #include "cellGcmSys.h"
++#ifndef _WIN32
++#include <unistd.h>
++#endif
+ #include "../../runtime/platform/win32_compat.h"
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32 (translate + byte-swap, OOB-safe) */
+ #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+@@ -1629,6 +1632,11 @@
+  * itself performs guest reads) and never blocks a spinning game thread. */
+ static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
+ static void gcm_rsx_process_fifo_unlocked(void);
++/* Drain passes, for cellGcm_rsx_wait_consumed: s_drain_seq numbers each pass
++ * (taken right after it reads `put`), s_drain_caught_seq is the number of the
++ * last pass that ended with the walker at that `put`. */
++static volatile u32 s_drain_seq, s_drain_caught_seq;
++
+ 
+ /* Kick event: a game thread whose fence wait finds the queue DRY signals the
+  * present thread to run the FIFO walker NOW instead of on its next 16 ms
+@@ -1695,6 +1703,35 @@
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+ }
+ 
++/* Wait, up to timeout_ms, until the RSX has consumed every command the guest
++ * had queued when this was called: until a drain pass that started after the
++ * call (so it saw at least today's `put`) has ended caught up. Called from a
++ * guest (PPU) thread; the drain itself runs on the frame-clock thread, so this
++ * only polls. Returns 1 when consumed (or nothing was queued), 0 on timeout.
++ *
++ * Real hardware consumes the command stream while the PPU builds the next
++ * frame; our drain trails the PPU by up to a frame (it runs on a wake cadence
++ * and stops at each flip). A title that kicks SPU work on the assumption that
++ * the GPU has already read the buffers that work rewrites needs this ordering:
++ * see cellSpurs.c's _cellSpursSendSignal. */
++int cellGcm_rsx_wait_consumed(unsigned timeout_ms)
++{
++    if (!s_gcm_context_ea && !s_gcm_syscall_mode) return 1;
++    if (vm_read32(GCM_CONTROL_GUEST_ADDR + 0) == vm_read32(GCM_CONTROL_GUEST_ADDR + 4)) return 1;
++    const u32 seq0 = __atomic_load_n(&s_drain_seq, __ATOMIC_ACQUIRE);
++    extern unsigned long long ps3_ms_now(void);
++    const unsigned long long t0 = ps3_ms_now();
++    for (;;) {
++        if ((s32)(__atomic_load_n(&s_drain_caught_seq, __ATOMIC_ACQUIRE) - seq0) > 0) return 1;
++        if (ps3_ms_now() - t0 >= timeout_ms) return 0;
++#ifdef _WIN32
++        Sleep(0);
++#else
++        usleep(100);
++#endif
++    }
++}
++
+ static void gcm_rsx_process_fifo_unlocked(void)
+ {
+     { static unsigned _n = 0; static unsigned long long _t0 = 0;
+@@ -1729,6 +1766,7 @@
+      * own command ring, so everything after the jump (including the reference
+      * writes its waits spin on) silently never executed. */
+     u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
++    const u32 drain_seq = ++s_drain_seq;
+     /* The words behind `put` were stored by another thread (the title, or the
+      * recycle below) before it stored `put`. On x86 the hardware keeps loads
+      * in order; on arm64 it does not, so without an acquire here the ring
+@@ -2301,6 +2339,8 @@
+     { static int eq = -1;
+       if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
+       vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
++    if (s_fifo_getoff == put)
++        __atomic_store_n(&s_drain_caught_seq, drain_seq, __ATOMIC_RELEASE);
+ 
+     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
+     gcm_ref_publish_one();

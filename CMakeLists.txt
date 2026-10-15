@@ -271,9 +271,11 @@ if(SPU_SOURCES)
                 set(SPU_HOST_SIMD_DEFAULT ON)
             endif()
         endif()
-        # OFF until fixed: with it ON, Tokyo Jungle's geometry/bone jobs produced
-        # exploded meshes (mel-104 vs mel-105), so the flags do change results.
-        set(SPU_HOST_SIMD_DEFAULT OFF)
+        # It was forced OFF for a while: with it ON the Pomeranian's fur exploded.
+        # The flags never changed a result (tools/spu-bisect/harness: SPU image 9's
+        # functions are bit-identical either way); the faster fur task exposed a
+        # race with our RSX, fixed by patch 0055 + the drain-on-put loop in
+        # src/main.cpp (docs/STATUS.md). On again: ~60% more gameplay frames.
         option(PORT_SPU_HOST_SIMD "Build the lifted SPU sources with SSE4.1 + FMA (x86-64)" ${SPU_HOST_SIMD_DEFAULT})
         if(PORT_SPU_HOST_SIMD AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
             list(APPEND SPU_COMPILE_OPTIONS -msse4.1 -mfma -ffp-contract=off)

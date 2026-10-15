@@ -122,6 +122,7 @@ uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
 void     cellGcmTickVBlank(void);
 void     cellGcmTickFlip(void);
 int      cellGcm_take_flip_pending(void);
+extern "C" { extern uint8_t* vm_base; extern uint32_t ppu_hle_inject_base; }
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
 unsigned cellGcm_flip_request_count(void);
 }
@@ -329,8 +330,39 @@ static DWORD WINAPI frame_clock(LPVOID)
     bool quitting = false;
     vclock::time_point quit_deadline;
 
+    /* Drain when the guest queues work, not on a fixed 4 ms beat. The PPU
+     * publishes new commands by storing `put` into CellGcmControl (lifted code,
+     * no hook), and real hardware starts consuming them at once. Draining only
+     * every 4 ms (plus the pass itself) left our RSX up to a frame behind the
+     * PPU, and Tokyo Jungle's SPU fur task (image 9) then rewrote vertex data
+     * that queued draws had not read yet: the exploding Pomeranian fur whenever
+     * that task ran fast (bal-9 vs bal-17 in docs/STATUS.md). So the loop now
+     * polls `put` every TJ_DRAIN_POLL_US (default 250 us; 0 = the old fixed
+     * Sleep(4)) and wakes as soon as it moved, a vblank tick is due, or 4 ms
+     * passed. A walker parked on a segment an SPU hasn't patched yet leaves
+     * put != get without being able to progress; that doesn't count as new
+     * work, or the loop would spin. */
+    static long poll_us = -1;
+    if (poll_us < 0) { const char* e = getenv("TJ_DRAIN_POLL_US"); poll_us = e ? atol(e) : 250; if (poll_us < 0) poll_us = 0; }
+    auto ctrl_word = [](uint32_t off) -> uint32_t {
+        const uint8_t* p = vm_base + ppu_hle_inject_base + 0x2000u + off;   /* CellGcmControl */
+        return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+    };
+    uint32_t drained_put = 0, drained_get = 0;   /* put/get when the last drain ended */
+
     for (;;) {
-        Sleep(4);
+        if (!poll_us || !vm_base) {
+            Sleep(4);
+        } else {
+            const vclock::time_point w0 = vclock::now();
+            for (;;) {
+                usleep((useconds_t)poll_us);
+                const vclock::time_point t = vclock::now();
+                if (t - w0 >= std::chrono::milliseconds(4) || t >= tick_due(vk)) break;
+                const uint32_t put = ctrl_word(0), get = ctrl_word(4);
+                if (put != get && !(put == drained_put && get == drained_get)) break;   /* new work */
+            }
+        }
         vclock::time_point now = vclock::now();
 
         if (quitting && now >= quit_deadline) {
@@ -383,6 +415,7 @@ static DWORD WINAPI frame_clock(LPVOID)
             }
             vclock::time_point t1 = tick_stats ? vclock::now() : vclock::time_point();
             cellGcm_rsx_process_fifo();
+            if (vm_base) { drained_put = ctrl_word(0); drained_get = ctrl_word(4); }
             if (tick_stats) {
                 static double pmax, fmax, psum, fsum; static unsigned long n, slow;
                 const double pm = std::chrono::duration<double, std::milli>(t1 - t0).count();
