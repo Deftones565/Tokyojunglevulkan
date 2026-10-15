@@ -1,0 +1,76 @@
+SPU DMA path: bounded IO-mapping scan per PUT; POISON-DMA payload scan off by default
+
+gcm_ea2io_range (the per-PUT pushbuffer hook) scanned all 256 IO mapping
+slots; it now stops at one past the highest slot find_free_mapping ever
+handed out, which returns the same result (higher slots were never active).
+The POISON-DMA detector scanned every PUT payload word by word for another
+title's bug and only logs: SPU_POISON_DMA=1 turns it on.
+
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -167,6 +167,11 @@
+ } IoMapping;
+ 
+ static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
++/* One past the highest slot ever handed out (find_free_mapping, or slot 0 at
++ * init): every slot at or above it has never been active, so a scan can stop
++ * there. gcm_ea2io_range runs on every SPU PUT, and walking all 256 slots
++ * there was a few percent of Tokyo Jungle's SPU task threads. Only grows. */
++static volatile int s_io_mappings_hi;
+ static int s_io_mapping_count = 0;
+ 
+ /* Callback handlers — these are GUEST OPD addresses passed by the
+@@ -420,8 +425,10 @@
+ static IoMapping* find_free_mapping(void)
+ {
+     for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+-        if (!s_io_mappings[i].active)
++        if (!s_io_mappings[i].active) {
++            if (i + 1 > s_io_mappings_hi) s_io_mappings_hi = i + 1;
+             return &s_io_mappings[i];
++        }
+     }
+     return NULL;
+ }
+@@ -509,6 +516,7 @@
+         s_io_mappings[0].size   = ioSize;
+         s_io_mappings[0].active = 1;
+         s_io_mapping_count = 1;
++        if (s_io_mappings_hi < 1) s_io_mappings_hi = 1;
+     }
+ 
+     /* Zero the guest-visible control register (put/get/ref). */
+@@ -1387,7 +1395,8 @@
+ /* EA -> IO through the mapping list (range lookup; the by-ea helper is exact). */
+ static u32 gcm_ea2io_range(u32 ea, u32* room)
+ {
+-    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
++    const int hi = s_io_mappings_hi;
++    for (int i = 0; i < hi; i++) {
+         IoMapping* m = &s_io_mappings[i];
+         if (!m->active || !m->size) continue;
+         if (ea >= m->ea && ea < m->ea + m->size) {
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -694,7 +694,11 @@
+          * (0x40003000-0x40005000) or carry the 0xC708C708 poison? This host-side
+          * memcpy bypasses vm_write32/AWATCH, so it's the prime suspect for the
+          * garbage fn-ptr fields that cause the 0xC708C708 vcall crash. */
+-        { uint32_t e = (uint32_t)ea;
++        /* SPU_POISON_DMA=1 turns it on: it scanned every PUT's payload word
++         * by word, on every title, for one title's bug. Logging only. */
++        { static int s_pd = -1; if (s_pd < 0) s_pd = getenv("SPU_POISON_DMA") ? 1 : 0;
++          if (s_pd) {
++          uint32_t e = (uint32_t)ea;
+           int hitregion = (e < 0x40005000u && e + size > 0x40003000u);
+           int haspoison = 0;
+           for (uint32_t o = 0; o + 4 <= size; o += 4) {
+@@ -706,7 +710,7 @@
+               if (_n++ < 12)
+                   fprintf(stderr, "[POISON-DMA] img%u PUT ea=0x%08X size=0x%X lsa=0x%X hitregion=%d haspoison=%d\n",
+                           spu->image_id, e, size, lsa, hitregion, haspoison);
+-          } }
++          } } }
+     }
+ 
+     return 0;
