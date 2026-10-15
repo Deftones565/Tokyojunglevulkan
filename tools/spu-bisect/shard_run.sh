@@ -18,7 +18,7 @@ python3 tools/spu-bisect/shards.py $fd --thresh 0.45 --top 20 | tee build-runs/$
 python3 - "$fd" <<'PY'
 import os, re, sys
 d = sys.argv[1]
-fs = sorted(os.listdir(d), key=lambda f: int(re.search(r'flip(\d+)', f).group(1)))
+fs = sorted((f for f in os.listdir(d) if re.search(r'flip(\d+)', f)), key=lambda f: int(re.search(r'flip(\d+)', f).group(1)))
 keep = set()
 for line in open(os.path.join(os.path.dirname(d), 'shards.txt')):
     m = re.search(r'flip\s+(\d+)', line)

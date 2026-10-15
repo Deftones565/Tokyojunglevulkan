@@ -1,0 +1,34 @@
+SPURS Run/KickJobChain wait for the RSX to consume queued commands (like 0055)
+
+Fixes one-frame model glitches (all model types) that appeared once the SPU
+jobs got fast. SPURS_JOBCHAIN_RSX_SYNC_MS (default 50, 0 = off).
+
+--- a/libs/spurs/cellSpurs.c	2026-10-16 02:32:19.132907964 +0400
++++ b/libs/spurs/cellSpurs.c	2026-10-16 02:32:19.186524532 +0400
+@@ -2795,6 +2795,26 @@
+             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
+         }
+         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
++        /* Let the RSX catch up first, as _cellSpursSendSignal does (0055). The
++         * chain's jobs (Tokyo Jungle's bone and geometry jobs) rewrite per-frame
++         * vertex and matrix data that draws already queued for the RSX still
++         * have to read. On hardware the RSX has consumed those by now; our drain
++         * can trail the PPU, and once the SPU jobs got fast (0056-0062) every
++         * kind of model showed one-frame glitches: a car drawn displaced, wolves
++         * and the Pomeranian stretched into bands, a screen-wide triangle
++         * (tools/spu-bisect/shards.py: 5 glitch frames in 818 without this, 0
++         * in 1735 with it; ~0-6% fewer flips/s). Bounded by
++         * SPURS_JOBCHAIN_RSX_SYNC_MS (default 50, 0 = off). */
++        { static long ms = -1;
++          if (ms < 0) { const char* e = getenv("SPURS_JOBCHAIN_RSX_SYNC_MS"); ms = e ? atol(e) : 50; }
++          if (ms > 0) {
++              extern int cellGcm_rsx_wait_consumed(unsigned timeout_ms);
++              if (!cellGcm_rsx_wait_consumed((unsigned)ms)) {
++                  static int _n = 0;
++                  if (_n++ < 8)
++                      fprintf(stderr, "[cellSpurs] %s: RSX still busy after %ld ms; starting the chain anyway\n", who, ms);
++              }
++          } }
+         /* Coalesce: a chain already being walked must not start twice. */
+         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
+             /* A shut-down walker may still be on its way out; never run two. */
