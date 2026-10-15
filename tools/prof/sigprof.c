@@ -29,6 +29,8 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <pthread.h>
 
 #define MAX_DEPTH 48
 
@@ -55,6 +57,49 @@ static void on_prof(int sig, siginfo_t* si, void* uc)
     rec.depth = n > 0 ? (uint32_t)n : 0;
     for (int i = 0; i < n; i++) rec.pc[i] = (uint64_t)(uintptr_t)buf[i];
     (void)!write(s_fd, &rec, 8 + 8 * (size_t)rec.depth);
+}
+
+/* PROF_WALL_HZ=<hz>: wall-clock mode. Instead of sampling whoever burns CPU,
+ * a helper thread signals EVERY thread of the process <hz> times a second, so
+ * a thread blocked in a wait shows up with the stack of that wait (what is the
+ * game thread waiting for?). Samples per thread / hz = seconds of wall time.
+ * Blocking calls are restarted (SA_RESTART); a sleep may return early, which
+ * perturbs timing slightly. */
+static pid_t s_wall_tid;
+static void* wall_thread(void* arg)
+{
+    const long hz = (long)(intptr_t)arg;
+    s_wall_tid = (pid_t)syscall(SYS_gettid);
+    const pid_t pid = getpid();
+    struct timespec ts = { 0, 1000000000L / hz };
+    for (;;) {
+        nanosleep(&ts, NULL);
+        /* Something in the process may reset SIGPROF (the default action
+         * kills it); put the handler back before signalling anyone. */
+        struct sigaction cur;
+        if (sigaction(SIGPROF, NULL, &cur) == 0 && cur.sa_sigaction != on_prof) {
+            static int warned;
+            if (!warned++) {
+                static const char m[] = "[sigprof] SIGPROF handler was replaced; reinstalling\n";
+                (void)!write(2, m, sizeof m - 1);
+            }
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = on_prof;
+            sa.sa_flags = SA_SIGINFO | SA_RESTART;
+            sigemptyset(&sa.sa_mask);
+            sigaction(SIGPROF, &sa, NULL);
+        }
+        DIR* d = opendir("/proc/self/task");
+        if (!d) continue;
+        struct dirent* e;
+        while ((e = readdir(d))) {
+            const pid_t tid = (pid_t)atoi(e->d_name);
+            if (tid > 0 && tid != s_wall_tid) syscall(SYS_tgkill, pid, tid, SIGPROF);
+        }
+        closedir(d);
+    }
+    return NULL;
 }
 
 __attribute__((constructor)) static void prof_init(void)
@@ -87,6 +132,12 @@ __attribute__((constructor)) static void prof_init(void)
     sa.sa_flags = SA_SIGINFO | SA_RESTART;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGPROF, &sa, NULL);
+    const char* wall = getenv("PROF_WALL_HZ");
+    if (wall && atoi(wall) > 0) {
+        pthread_t th;
+        pthread_create(&th, NULL, wall_thread, (void*)(intptr_t)atoi(wall));
+        return;
+    }
     struct itimerval it = { { 0, 1000000 / hz }, { 0, 1000000 / hz } };
     setitimer(ITIMER_PROF, &it, NULL);
 }
