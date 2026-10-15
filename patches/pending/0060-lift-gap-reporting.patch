@@ -1,0 +1,343 @@
+diff --color -ruN base/libs/spurs/cellSpurs.c ps3recomp-magi4/libs/spurs/cellSpurs.c
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -12,6 +12,7 @@
+ #include "cellSpurs.h"
+ #include "../../runtime/platform/win32_compat.h"
+ #include "../../runtime/ps3_log.h"
++#include "../../runtime/diag/lift_gap.h"   /* [LIFT-GAP] lines, PS3_STRICT_LIFT */
+ #include "spu_workload.h"   /* SPU image -> lifted-entry dispatch (runtime/spu) */
+ #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+@@ -2374,6 +2375,8 @@
+         if (_b++ < 4)
+             printf("[cellSpurs]   job[%d]: implausible binary (ea=0x%08X size=%u) -- skipped\n",
+                    idx, ea_bin, size_bin);
++        ps3_lift_gap("spurs-job-implausible", job_ea, "job[%d] binary ea=0x%08X size=%u is not "
++                     "code the port can look up; job skipped", idx, ea_bin, size_bin);
+         return;
+     }
+     /* A jobchain job is NOT a SPURS task: Sony's jm2 stages the whole working
+diff --color -ruN base/runtime/diag/lift_gap.c ps3recomp-magi4/runtime/diag/lift_gap.c
+--- /dev/null
++++ b/runtime/diag/lift_gap.c
+@@ -0,0 +1,78 @@
++/* lift_gap.c -- see lift_gap.h. */
++#include "lift_gap.h"
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#ifdef _MSC_VER
++#include <windows.h>
++#define LG_CAS_PTR(p, o, n) InterlockedCompareExchangePointer((PVOID volatile*)(p), (PVOID)(n), (PVOID)(o))
++#define LG_INC(p)           ((uint32_t)InterlockedIncrement((volatile LONG*)(p)))
++#else
++#define LG_CAS_PTR(p, o, n) __sync_val_compare_and_swap((p), (o), (n))
++#define LG_INC(p)           __sync_add_and_fetch((p), 1u)
++#endif
++
++#define LIFT_GAP_KINDS     32
++#define LIFT_GAP_FIRST     16u
++#define LIFT_GAP_EVERY   1024u
++
++static struct {
++    const char* volatile kind;
++    volatile uint32_t count;
++} s_kinds[LIFT_GAP_KINDS];
++
++int ps3_lift_strict(void)
++{
++    static int strict = -1;
++    if (strict < 0) {
++        const char* e = getenv("PS3_STRICT_LIFT");
++        strict = (e && e[0] && e[0] != '0') ? 1 : 0;
++    }
++    return strict;
++}
++
++/* Count one more of `kind`; the count after this one. Slots are claimed with
++ * a compare-and-swap so two threads never share one; a full table still
++ * reports (count 0 = no rate limit). */
++static uint32_t lift_gap_bump(const char* kind)
++{
++    for (int i = 0; i < LIFT_GAP_KINDS; i++) {
++        const char* k = s_kinds[i].kind;
++        if (!k) {
++            k = (const char*)LG_CAS_PTR(&s_kinds[i].kind, (const char*)NULL, kind);
++            if (!k) k = kind;
++        }
++        if (k == kind || strcmp(k, kind) == 0)
++            return LG_INC(&s_kinds[i].count);
++    }
++    return 0;
++}
++
++void ps3_lift_gap(const char* kind, uint32_t addr, const char* fmt, ...)
++{
++    const uint32_t n = lift_gap_bump(kind);
++    const int strict = ps3_lift_strict();
++    if (!strict && n > LIFT_GAP_FIRST && (n % LIFT_GAP_EVERY) != 0) return;
++
++    char detail[256];
++    detail[0] = 0;
++    if (fmt) {
++        va_list ap;
++        va_start(ap, fmt);
++        vsnprintf(detail, sizeof detail, fmt, ap);
++        va_end(ap);
++    }
++    if (n > LIFT_GAP_FIRST)
++        fprintf(stderr, "[LIFT-GAP] %s addr=0x%08X %s (#%u of this kind)\n", kind, addr, detail, n);
++    else
++        fprintf(stderr, "[LIFT-GAP] %s addr=0x%08X %s\n", kind, addr, detail);
++    if (strict) {
++        fprintf(stderr, "[LIFT-GAP] FATAL: PS3_STRICT_LIFT=1 -- add 0x%08X as an entry point and "
++                        "re-lift (never interpret it)\n", addr);
++        fflush(stderr);
++        exit(4);
++    }
++}
+diff --color -ruN base/runtime/diag/lift_gap.h ps3recomp-magi4/runtime/diag/lift_gap.h
+--- /dev/null
++++ b/runtime/diag/lift_gap.h
+@@ -0,0 +1,40 @@
++/* lift_gap.h -- one loud, greppable line for every lift gap.
++ *
++ * A lift gap is guest code the port reached but has no lifted function for:
++ * an indirect call to an unregistered PPU address, an SPU thread or SPURS job
++ * whose image is not in the lifted registry, a branch into unlifted local
++ * store, an SPU instruction the lifter could not translate. The fix is always
++ * to add the entry point and re-lift, never to interpret the bytes. Several
++ * runtime paths used to step over these quietly (return 0, complete the job,
++ * log a few lines and go on); each now also reports through ps3_lift_gap():
++ *
++ *   [LIFT-GAP] <kind> addr=0x%08X <detail>
++ *
++ * Always on, whatever PS3_VERBOSE says. Rate-limited per kind: the first 16,
++ * then every 1024th with a running count. PS3_STRICT_LIFT=1 makes the first
++ * one fatal (exit code 4) after printing it, so a run proves there are none.
++ */
++#ifndef PS3_LIFT_GAP_H
++#define PS3_LIFT_GAP_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* `kind` must be a string literal (it is the rate-limit key). */
++void ps3_lift_gap(const char* kind, uint32_t addr, const char* fmt, ...)
++#if defined(__GNUC__) || defined(__clang__)
++    __attribute__((format(printf, 3, 4)))
++#endif
++    ;
++
++/* PS3_STRICT_LIFT=1 */
++int ps3_lift_strict(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PS3_LIFT_GAP_H */
+diff --color -ruN base/runtime/ppu/ppu_loader.cpp ps3recomp-magi4/runtime/ppu/ppu_loader.cpp
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -34,6 +34,7 @@
+ #include "ppu_recomp.h"
+ #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
+ #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
++#include "../diag/lift_gap.h"  /* [LIFT-GAP] lines, PS3_STRICT_LIFT */
+ #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
+ #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+ #ifndef _WIN32
+@@ -2674,6 +2675,8 @@
+         if (fn2) {
+             static int _n = 0;
+             if (_n++ < 8) fprintf(stderr, "[ppu] OPD-swap fixup: ctr=0x%08X not a func, using r2=0x%08X\n", addr, toc_reg);
++            ps3_lift_gap("ppu-opd-swap", addr, "not a lifted function; r2=0x%08X is, called that instead "
++                         "(lr=0x%08X)", toc_reg, (uint32_t)ctx->lr);
+             ctx->gpr[2] = addr;        /* callee TOC = the (TOC) value from the code slot */
+             addr = toc_reg; ctx->ctr = toc_reg;
+             fn = fn2;
+@@ -2688,6 +2691,8 @@
+             static int warned = 0;
+             if (warned++ < 8)
+                 fprintf(stderr, "[ppu] recursion cap @0x%08X depth=%d -- skipping\n", addr, s_depth);
++            ps3_lift_gap("ppu-recursion-cap", addr, "dispatch depth %d, call skipped (lr=0x%08X)",
++                         s_depth, (uint32_t)ctx->lr);
+             return;
+         }
+         s_depth++;
+@@ -2754,6 +2759,8 @@
+         if (_invalid) {
+             static int _gn = 0;
+             if (_gn++ < 12) fprintf(stderr, "[ppu] garbage vcall -> 0x%08X this=0x%08X (uninit/stale object) -- no-op, r3=0\n", tgt, (uint32_t)ctx->gpr[3]);
++            ps3_lift_gap("ppu-garbage-vcall", tgt, "not code; call skipped with r3=0 (this=0x%08X lr=0x%08X)",
++                         (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr);
+ #ifdef _WIN32
+             if (getenv("PPU_VCALL_BT")) { static int _b=0; if(_b++<4){
+                 char* mb=(char*)GetModuleHandleA(0); void* bt[26]; unsigned short fr=RtlCaptureStackBackTrace(0,26,bt,0);
+@@ -2798,6 +2805,8 @@
+         return;   /* don't spam the log on a tight retry loop */
+     }
+     last = cur; streak = 0;
++    ps3_lift_gap("ppu-unresolved-call", cur, "no lifted function; call returned without running "
++                 "(lr=0x%08X)", (uint32_t)ctx->lr);
+     fprintf(stderr, "[ppu] unresolved indirect call -> 0x%08X (tid=%llu lr=0x%08X)\n",
+             (uint32_t)ctx->ctr, (unsigned long long)ctx->thread_id, (uint32_t)ctx->lr);
+     /* With no NID table the very first one of these is the expected outcome
+@@ -2981,6 +2990,8 @@
+         fprintf(stderr, "[ppu] call to unlifted function 0x%08X\n", (uint32_t)addr);
+         logged++;
+     }
++    ps3_lift_gap("ppu-unlifted-stub", (uint32_t)addr, "direct call to a function the lifter did not "
++                 "emit; returned without running (lr=0x%08X)", ctx ? (uint32_t)ctx->lr : 0u);
+ }
+ 
+ /* The real lv2 syscall table (runtime/syscalls/lv2_register.c). */
+diff --color -ruN base/runtime/spu/spu_channels.c ps3recomp-magi4/runtime/spu/spu_channels.c
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -15,6 +15,7 @@
+ #include "spu_dma.h"
+ #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
+ #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
++#include "../diag/lift_gap.h" /* [LIFT-GAP] lines, PS3_STRICT_LIFT */
+ #include "spu_lockstep.h"
+ #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
+ #include <stdint.h>
+@@ -2335,6 +2336,9 @@
+               spu_interp_run(ctx, p);
+               return;
+           } }
++        ps3_lift_gap("spu-unlifted-branch", ctx->pc & SPU_LS_MASK, "img=%d branched into LS with "
++                     "no lifted function (lr=0x%05X); job ended", ctx->image_id,
++                     ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+         spu_halt(ctx);
+         return;
+     }
+diff --color -ruN base/runtime/spu/spu_helpers.h ps3recomp-magi4/runtime/spu/spu_helpers.h
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -14,6 +14,7 @@
+ #define SPU_HELPERS_H
+ 
+ #include "spu_context.h"
++#include "../diag/lift_gap.h"   /* spu_unsupported -> [LIFT-GAP] */
+ #include <string.h>
+ #include <math.h>
+ 
+@@ -112,15 +113,12 @@
+  * atomic address with no hint of where it came from. Most of these are data
+  * embedded in .text that never executes; this fires only if one actually runs.
+  * One line per site. */
++/* An instruction the lifter could not translate was reached: a lift gap
++ * ([LIFT-GAP] spu-unsupported-insn, fatal under PS3_STRICT_LIFT=1). */
+ static inline void spu_unsupported(uint32_t pc, const char* mnemonic)
+ {
+-    static int warned;
+-    if (warned < 64) {
+-        warned++;
+-        fprintf(stderr, "[spu] UNSUPPORTED %s at LS 0x%05X -- executed, "
+-                        "result is wrong from here\n", mnemonic, pc);
+-        fflush(stderr);
+-    }
++    ps3_lift_gap("spu-unsupported-insn", pc, "%s executed in lifted SPU code; result is "
++                 "wrong from here", mnemonic);
+ }
+ 
+ static inline u128 spu_link(uint32_t addr) {
+diff --color -ruN base/runtime/spu/spu_raw.c ps3recomp-magi4/runtime/spu/spu_raw.c
+--- a/runtime/spu/spu_raw.c
++++ b/runtime/spu/spu_raw.c
+@@ -33,6 +33,7 @@
+ #include "../syscalls/lv2_syscall_table.h"
+ #include "../../include/ps3emu/error_codes.h"
+ #include "ps3emu/nid.h"      /* ps3_compute_nid */
++#include "../diag/lift_gap.h"  /* [LIFT-GAP] lines, PS3_STRICT_LIFT */
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -289,6 +290,8 @@
+                         "registered -- the SPU cannot run. Lift the image and "
+                         "register it (see a port's src/spu_images.c).\n", n);
+         fflush(stderr);
++        ps3_lift_gap("spu-raw-unlifted", s->base, "raw spu%u (addr = its base) run requested, LS image has no "
++                     "lifted entry; SPU not started", n);
+         return;
+     }
+ #ifdef _WIN32
+diff --color -ruN base/runtime/spu/spu_workload.c ps3recomp-magi4/runtime/spu/spu_workload.c
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -8,6 +8,7 @@
+ #include "spu_workload.h"
+ #include "spu_lifted_job.h"   /* spu_run_lifted_job */
+ #include "../ps3_log.h"      /* ps3_log_verbose */
++#include "../diag/lift_gap.h"  /* [LIFT-GAP] lines, PS3_STRICT_LIFT */
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -209,6 +210,8 @@
+             "[spu_workload] dispatch MISS fp=0x%016llX size=%u "
+             "(no lifted SPU binary registered for this image)\n",
+             (unsigned long long)fp, image_size);
++        ps3_lift_gap("spurs-task-unlifted", args_ea, "task image fp=0x%016llX size=%u is not in the "
++                     "lifted registry; task not run", (unsigned long long)fp, image_size);
+         return 0;
+     }
+ 
+@@ -844,6 +847,10 @@
+                   }
+               }
+           } }
++        /* After the dump, so PS3_STRICT_LIFT still leaves the image on disk. */
++        ps3_lift_gap("spurs-job-unlifted", job_ea, "job image fp=0x%016llX size=%u is not in the "
++                     "lifted registry; job not run (SPU_DUMP_MISS=<dir> saves it)",
++                     (unsigned long long)fp, image_size);
+         return 0;
+     }
+     /* Two lines plus two explicit flushes PER JOB. A title running its audio
+@@ -1199,6 +1206,9 @@
+           } }
+         fprintf(stderr, "[spu_workload] async dispatch MISS fp=0x%016llX size=%u\n",
+                 (unsigned long long)fp, image_size);
++        ps3_lift_gap("spurs-async-unlifted", args_ea, "workload image fp=0x%016llX size=%u is not in "
++                     "the lifted registry; not run (SPU_DUMP_MISS=<dir> saves it)",
++                     (unsigned long long)fp, image_size);
+         return 0;
+     }
+ 
+diff --color -ruN base/runtime/spu/tests/test_workload.deps ps3recomp-magi4/runtime/spu/tests/test_workload.deps
+--- a/runtime/spu/tests/test_workload.deps
++++ b/runtime/spu/tests/test_workload.deps
+@@ -1,2 +1,2 @@
+ # Extra sources for the workload-dispatch test: the dispatch layer itself.
+-EXTRA="$RUNTIME_SPU/spu_workload.c"
++EXTRA="$RUNTIME_SPU/spu_workload.c $RUNTIME_SPU/../diag/lift_gap.c"
+diff --color -ruN base/runtime/syscalls/lv2_register.c ps3recomp-magi4/runtime/syscalls/lv2_register.c
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -13,6 +13,7 @@
+ #include <stdlib.h>   /* calloc, free */
+ #include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
+ #include "lv2_syscall_table.h"
++#include "../diag/lift_gap.h"   /* [LIFT-GAP] lines, PS3_STRICT_LIFT */
+ #include "sys_ppu_thread.h"
+ #include "sys_mutex.h"
+ #include "sys_cond.h"
+@@ -1106,6 +1107,9 @@
+             user = NULL;
+         }
+         if (!fb) {
++            ps3_lift_gap("spu-thread-unlifted", t->entry_point,
++                         "SPU thread tid=0x%X image @0x%08X has no lifted code; completed "
++                         "instantly with exit 0", t->tid, t->img_ea);
+             t->exit_status = 0;
+             t->running = 0;
+             instant++; nofb++;

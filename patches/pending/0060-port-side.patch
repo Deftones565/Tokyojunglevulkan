@@ -1,0 +1,126 @@
+diff --git a/scripts/check_no_emulation.py b/scripts/check_no_emulation.py
+index cb5b520..bcb003c 100644
+--- a/scripts/check_no_emulation.py
++++ b/scripts/check_no_emulation.py
+@@ -12,11 +12,15 @@ still true, so the rule doesn't depend on reviewers remembering it:
+   2. Every function in the runtime that can execute guest bytes still opens
+      with the PS3RECOMP_NO_INTERP fatal guard.
+   3. No other function that interprets, JITs or steps guest code has appeared
+-     in the runtime, the HLE libraries or src/ (names are matched against an
++     in the runtime, the HLE libraries, src/, libs/ or the lifted code in
++     generated/ (names are matched against an
+      allowlist of the guarded ones above; extend it only for a function that
+      really doesn't run guest code, and say why).
+   4. Nothing maps host memory executable at run time beyond the known
+-     guest-permission helpers (a JIT needs that).
++     guest-permission helpers (a JIT needs that): neither by name (PROT_EXEC,
++     PAGE_EXECUTE*, MAP_JIT, ...) nor by number (mmap/mprotect/VirtualAlloc/
++     VirtualProtect with a literal protection value that has an execute bit,
++     also through a #define in the same file).
+   5. With --binary: the built executable carries the guard's message, i.e.
+      the guard was really compiled in.
+ 
+@@ -67,6 +71,71 @@ EXEC_MEM = re.compile(r"\b(PROT_EXEC|MAP_JIT|PAGE_EXECUTE\w*|VM_PROT_EXECUTE)\b"
+ 
+ SOURCE_EXT = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".inc")
+ 
++# Calls that set host page protection, and which argument is the protection.
++# Execute bits: POSIX PROT_EXEC = 4; Windows PAGE_EXECUTE = 0x10,
++# PAGE_EXECUTE_READ = 0x20, PAGE_EXECUTE_READWRITE = 0x40,
++# PAGE_EXECUTE_WRITECOPY = 0x80.
++PROT_CALLS = {
++    "mmap": (2, 0x4), "mmap64": (2, 0x4), "mprotect": (2, 0x4), "pkey_mprotect": (2, 0x4),
++    "VirtualAlloc": (3, 0xF0), "VirtualAllocEx": (4, 0xF0), "VirtualAlloc2": (5, 0xF0),
++    "VirtualProtect": (2, 0xF0), "VirtualProtectEx": (3, 0xF0),
++    "MapViewOfFile3": (6, 0xF0), "CreateFileMappingA": (2, 0xF0),
++    "CreateFileMappingW": (2, 0xF0),
++}
++PROT_CALL = re.compile(r"\b(%s)\s*\(" % "|".join(sorted(PROT_CALLS, key=len, reverse=True)))
++NUM_DEFINE = re.compile(r"^\s*#\s*define\s+(\w+)\s+\(?\s*((?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*"
++                        r"(?:\s*\|\s*(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*)*)\s*\)?\s*$",
++                        re.MULTILINE)
++NUM_EXPR = re.compile(r"^\(?\s*(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*"
++                      r"(?:\s*\|\s*(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*)*\s*\)?$")
++
++
++def call_args(text, start):
++    """Top-level arguments of the call whose '(' is at text[start], or None."""
++    depth, args, cur = 0, [], []
++    for i in range(start, min(len(text), start + 2000)):
++        c = text[i]
++        if c == "(":
++            depth += 1
++            if depth == 1:
++                continue
++        elif c == ")":
++            depth -= 1
++            if depth == 0:
++                args.append("".join(cur).strip())
++                return args
++        elif c == "," and depth == 1:
++            args.append("".join(cur).strip())
++            cur = []
++            continue
++        cur.append(c)
++    return None
++
++
++def numeric_value(expr):
++    expr = expr.strip()
++    if not NUM_EXPR.match(expr):
++        return None
++    v = 0
++    for part in re.findall(r"0[xX][0-9a-fA-F]+|\d+", expr):
++        v |= int(part, 0)
++    return v
++
++
++def numeric_exec_protections(text):
++    """(offset, call, protection text) for each protection call whose
++    protection is a literal number (or a #define of one) with an execute bit."""
++    defines = {m.group(1): m.group(2) for m in NUM_DEFINE.finditer(text)}
++    for m in PROT_CALL.finditer(text):
++        idx, bits = PROT_CALLS[m.group(1)]
++        args = call_args(text, m.end() - 1)
++        if not args or len(args) <= idx:
++            continue
++        arg = args[idx]
++        val = numeric_value(defines.get(arg, arg))
++        if val is not None and val & bits:
++            yield m.start(), m.group(1), arg
++
+ 
+ def sources(top):
+     for dirpath, dirnames, filenames in os.walk(top):
+@@ -118,7 +187,9 @@ def main():
+                               "guard (%s)" % (rel, name, GUARD_CALL))
+ 
+     # 3 + 4. No new interpreter/JIT/stepper, no executable host memory.
+-    for top, prefix in ((rt, ""), (os.path.join(ROOT, "src"), "src/")):
++    for top, prefix in ((rt, ""), (os.path.join(ROOT, "src"), "src/"),
++                        (os.path.join(ROOT, "libs"), "libs/"),
++                        (os.path.join(ROOT, "generated"), "generated/")):
+         for path in sources(top):
+             rel = prefix + os.path.relpath(path, top).replace(os.sep, "/")
+             if rel.startswith(("tools/", "third_party/")):
+@@ -136,6 +207,11 @@ def main():
+                     line = text.count("\n", 0, m.start()) + 1
+                     errors.append("%s:%d: executable host memory (%s): JIT is not "
+                                   "allowed" % (rel, line, m.group(1)))
++            # Numeric protections are never allowed, not even in the files above.
++            for off, call, arg in numeric_exec_protections(text):
++                line = text.count("\n", 0, off) + 1
++                errors.append("%s:%d: %s with an executable protection given as a "
++                              "number (%s): JIT is not allowed" % (rel, line, call, arg))
+ 
+     # 5. The guard is really in the binary.
+     if args.binary:
+diff --git a/tools/spu-bisect/harness/stubs.c b/tools/spu-bisect/harness/stubs.c
+index bd4a5ce..8f1645f 100644
+--- a/tools/spu-bisect/harness/stubs.c
++++ b/tools/spu-bisect/harness/stubs.c
+@@ -2,3 +2,4 @@
+ #define STUB(n) void n(void){ fprintf(stderr,"stub " #n " called\n"); }
+ STUB(spu_drain_call) STUB(spu_halt) STUB(spu_img_restore) STUB(spu_indirect_branch)
+ STUB(spu_ls_watch_slow) STUB(spu_rdch) STUB(spu_register_function) STUB(spu_stop) STUB(spu_wrch)
++STUB(ps3_lift_gap)   /* spu_unsupported, runtime/diag/lift_gap.c */
