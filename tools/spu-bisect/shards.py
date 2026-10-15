@@ -27,21 +27,25 @@ def main():
     ap.add_argument('--diff', type=int, default=48)
     ap.add_argument('--agree', type=int, default=16)
     ap.add_argument('--top', type=int, default=15)
+    ap.add_argument('--max-pn', type=float, default=6.0, help='skip frames whose neighbours differ by more than this mean |p-n| (camera cuts, fast motion)')
     a = ap.parse_args()
     fs = []
     for f in os.listdir(a.dir):
         m = re.search(r'flip(\d+)', f)
         if m and a.lo <= int(m.group(1)) <= a.hi: fs.append((int(m.group(1)), f))
     fs.sort()
+    # A present without a new guest flip repeats the last frame: keep one dump per flip.
+    fs = [x for i, x in enumerate(fs) if i == 0 or x[0] != fs[i - 1][0]]
     hits, n = [], 0
     prev = cur = None
     for i, (flip, f) in enumerate(fs):
         nxt = load(os.path.join(a.dir, f))
         if prev is not None and cur is not None and fs[i - 1][0] - fs[i - 2][0] <= 2 and flip - fs[i - 1][0] <= 2:
-            m = (np.abs(cur - prev) > a.diff) & (np.abs(cur - nxt) > a.diff) & (np.abs(prev - nxt) < a.agree)
+            pn = np.abs(prev - nxt)
+            m = (np.abs(cur - prev) > a.diff) & (np.abs(cur - nxt) > a.diff) & (pn < a.agree)
             pct = 100.0 * m.mean()
             n += 1
-            if pct > a.thresh:
+            if pct > a.thresh and pn.mean() <= a.max_pn:
                 ys, xs = np.nonzero(m)
                 hits.append((pct, fs[i - 1][0], fs[i - 1][1], xs.min(), ys.min(), xs.max(), ys.max()))
         prev, cur = cur, nxt

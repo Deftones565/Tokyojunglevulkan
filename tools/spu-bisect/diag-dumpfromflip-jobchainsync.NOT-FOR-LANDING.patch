@@ -1,0 +1,34 @@
+--- a/libs/video/rsx_vulkan_backend.c	2026-10-15 20:55:53.566776716 +0400
++++ b/libs/video/rsx_vulkan_backend.c	2026-10-16 02:08:24.954452898 +0400
+@@ -1929,7 +1929,16 @@
+     s_vk.presented++;
+     s_g.last_draws = s_g.draws;
+     s_g.draws = 0;
+-    if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
++    /* DIAG (MELCHIOR-1, not for landing): PS3RECOMP_VK_DUMP_FROM_FLIP=<n> dumps only
++     * from guest flip n on, and only presents that show a new flip. */
++    { static long from = -2; static unsigned last_flip = ~0u;
++      extern unsigned cellGcm_flip_request_count(void);
++      if (from == -2) { const char* e = getenv("PS3RECOMP_VK_DUMP_FROM_FLIP"); from = e ? atol(e) : -1; }
++      if (from >= 0) {
++          const unsigned fl = cellGcm_flip_request_count();
++          if (s_vk.dump_path && fl >= (unsigned)from && fl != last_flip) { last_flip = fl; vk_dump_ppm(px); }
++      } else if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
++    }
+     vk_present_window();
+ }
+ 
+--- a/libs/spurs/cellSpurs.c	2026-10-16 01:35:16.440616311 +0400
++++ b/libs/spurs/cellSpurs.c	2026-10-16 02:16:56.994638391 +0400
+@@ -2795,6 +2795,11 @@
+             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
+         }
+         if (s_off || !s_jobchains[i].entry_ea) return CELL_OK;
++        /* DIAG (MELCHIOR-1, not for landing yet): SPURS_JOBCHAIN_RSX_SYNC_MS=<ms> makes
++         * Run/KickJobChain wait for the RSX like 0055 does for _SendSignal. */
++        { static long ms = -1;
++          if (ms < 0) { const char* e = getenv("SPURS_JOBCHAIN_RSX_SYNC_MS"); ms = e ? atol(e) : 0; }
++          if (ms > 0) { extern int cellGcm_rsx_wait_consumed(unsigned); cellGcm_rsx_wait_consumed((unsigned)ms); } }
+         /* Coalesce: a chain already being walked must not start twice. */
+         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
+             /* A shut-down walker may still be on its way out; never run two. */
