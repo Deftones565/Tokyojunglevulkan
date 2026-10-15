@@ -1,0 +1,73 @@
+SPU helpers: powers of two from their bits, no ldexp/ldexpf/exp2 calls
+
+Applies on top of 0061. spu__xf_in, spu_fi and the RI8 scale of
+spu_cflts/cfltu/csflt/cuflt computed exact powers of two through libm (an
+ldexp per lane; libm was 6.9% of the image-9 threads, spu_fi 7.4%). The
+same values are built from their IEEE bits. Checked against verbatim copies
+of the old code by tools/spu-bisect/xf-harness/cvt_harness.c: spu__xf_in on
+all 2^32 inputs, spu_fi on every exponent/step/sign, the conversions on every
+i8; gcc and clang: 0 mismatches.
+
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -176,6 +176,13 @@
+ #else
+ static inline u128 spu_sfx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=b._u32[i]+~a._u32[i]+(t._u32[i]&1u); return r; }
+ #endif
++/* 2^k as a double, built from its bits: exact, and no libm call (ldexp/exp2
++ * were most of the libm time in Tokyo Jungle's SPU jobs). Every caller keeps
++ * k well inside the normal range, -1022..1023. */
++static inline double spu__pow2(int k) {
++    const uint64_t u = (uint64_t)(k + 1023) << 52;
++    double d; memcpy(&d, &u, sizeof d); return d;
++}
+ /* FI decodes the base and step fields produced by the hardware estimate
+  * instructions; its second operand is not an ordinary reciprocal float. */
+ static inline u128 spu_fi(u128 a, u128 b) {
+@@ -187,9 +194,12 @@
+         uint32_t base_bits = rb & 0xFFFFFC00u;
+         float base; memcpy(&base, &base_bits, sizeof base);
+         uint32_t step_frac = rb & 0x3FFu;
+-        float step = ldexpf((float)step_frac, (int)exp - 127 - 13);
++        /* Same values as ldexpf((float)step_frac, exp - 140) and
++         * ldexpf(ra & 0x7FFFF, -19): both are exact (a 10-bit integer times
++         * 2^-140..2^115, a 19-bit one times 2^-19), so no rounding to differ. */
++        float step = (float)((double)step_frac * spu__pow2((int)exp - 127 - 13));
+         if (base < 0.0f) step = -step;
+-        float y = ldexpf((float)(ra & 0x7FFFFu), -19);
++        float y = (float)(ra & 0x7FFFFu) * (1.0f / 524288.0f);
+         r._f32[i] = base - step * y;
+     }
+     return r;
+@@ -396,8 +406,11 @@
+ static inline double spu__xf_in(uint32_t b) {
+     const uint32_t e = (b >> 23) & 0xFFu;
+     if (e == 0u) return (b & 0x80000000u) ? -0.0 : 0.0;
+-    const double v = ldexp(1.0 + (double)(b & 0x7FFFFFu) / 8388608.0, (int)e - 127);
+-    return (b & 0x80000000u) ? -v : v;
++    /* (1 + m/2^23) * 2^(e-127), sign applied: the same double the ldexp form
++     * gave, built from its bits (exponent e - 127 + 1023, mantissa m << 29). */
++    const uint64_t u = ((uint64_t)(b & 0x80000000u) << 32) | ((uint64_t)(e + 896u) << 52) |
++                       ((uint64_t)(b & 0x7FFFFFu) << 29);
++    double v; memcpy(&v, &u, sizeof v); return v;
+ }
+ static inline uint32_t spu__xf_out(double v) {
+     const uint32_t s = signbit(v) ? 0x80000000u : 0u;
+@@ -563,13 +576,13 @@
+  * The canonical immediates 173 and 155 are identity conversions.
+  * The float side reads SPU semantics (spu__xf_in): an exponent-255 operand
+  * is a huge finite value that saturates, not a host NaN cast to int (UB). */
+-static inline u128 spu_cflts(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
++static inline u128 spu_cflts(u128 a, int i8){ u128 r; double f=spu__pow2(173-i8);
+     for(int i=0;i<4;i++){ double v=spu__xf_in(a._u32[i])*f; if(v>2147483647.0)v=2147483647.0; if(v<-2147483648.0)v=-2147483648.0; r._s32[i]=(int32_t)v; } return r; }
+-static inline u128 spu_cfltu(u128 a, int i8){ u128 r; double f=exp2((double)(173-i8));
++static inline u128 spu_cfltu(u128 a, int i8){ u128 r; double f=spu__pow2(173-i8);
+     for(int i=0;i<4;i++){ double v=spu__xf_in(a._u32[i])*f; if(v<0)v=0; if(v>4294967295.0)v=4294967295.0; r._u32[i]=(uint32_t)v; } return r; }
+-static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
++static inline u128 spu_csflt(u128 a, int i8){ u128 r; double f=spu__pow2(i8-155);
+     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._s32[i]*f); return r; }
+-static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=exp2((double)(i8-155));
++static inline u128 spu_cuflt(u128 a, int i8){ u128 r; double f=spu__pow2(i8-155);
+     for(int i=0;i<4;i++) r._f32[i]=(float)((double)a._u32[i]*f); return r; }
+ 
+ /* ---- SPU double-precision (2 doubles/reg; dword i = words 2i(high),2i+1(low)).
