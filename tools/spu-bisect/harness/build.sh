@@ -3,7 +3,7 @@
 # image: <outdir>/new.so (pshufb spu_shufb), <outdir>/ref.so (byte-loop
 # spu_shufb_ref everywhere), <outdir>/harness. Same flags as the game build of
 # that image under PORT_SPU_EXTRA_FLAGS="-msse4.1;-ffp-contract=off".
-# Run: <outdir>/harness <function symbol> [iters] [loop-counter gpr|-1] <outdir>/new.so <outdir>/ref.so
+# Run: <outdir>/harness <symbol> [iters] [loop-counter gpr, or -1] <outdir>/new.so <outdir>/ref.so [counter step, default 4]
 set -e
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 IMG=${1:?image id, e.g. j8D485835BE6E8738}; OUT=${2:-$ROOT/build-runs/spu-harness-$IMG}
