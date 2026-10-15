@@ -1,5 +1,5 @@
 diff --git a/scripts/check_no_emulation.py b/scripts/check_no_emulation.py
-index cb5b520..bcb003c 100644
+index cb5b520..563ddc2 100644
 --- a/scripts/check_no_emulation.py
 +++ b/scripts/check_no_emulation.py
 @@ -12,11 +12,15 @@ still true, so the rule doesn't depend on reviewers remembering it:
@@ -30,7 +30,7 @@ index cb5b520..bcb003c 100644
 +# PAGE_EXECUTE_WRITECOPY = 0x80.
 +PROT_CALLS = {
 +    "mmap": (2, 0x4), "mmap64": (2, 0x4), "mprotect": (2, 0x4), "pkey_mprotect": (2, 0x4),
-+    "VirtualAlloc": (3, 0xF0), "VirtualAllocEx": (4, 0xF0), "VirtualAlloc2": (5, 0xF0),
++    "VirtualAlloc": (3, 0xF0), "VirtualAllocEx": (4, 0xF0), "VirtualAlloc2": (4, 0xF0),
 +    "VirtualProtect": (2, 0xF0), "VirtualProtectEx": (3, 0xF0),
 +    "MapViewOfFile3": (6, 0xF0), "CreateFileMappingA": (2, 0xF0),
 +    "CreateFileMappingW": (2, 0xF0),

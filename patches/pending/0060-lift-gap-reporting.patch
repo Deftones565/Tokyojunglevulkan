@@ -97,7 +97,7 @@ diff --color -ruN base/runtime/diag/lift_gap.c ps3recomp-magi4/runtime/diag/lift
 +        fprintf(stderr, "[LIFT-GAP] FATAL: PS3_STRICT_LIFT=1 -- add 0x%08X as an entry point and "
 +                        "re-lift (never interpret it)\n", addr);
 +        fflush(stderr);
-+        exit(4);
++        _Exit(4);   /* no atexit/static dtors: other guest threads are still running */
 +    }
 +}
 diff --color -ruN base/runtime/diag/lift_gap.h ps3recomp-magi4/runtime/diag/lift_gap.h
