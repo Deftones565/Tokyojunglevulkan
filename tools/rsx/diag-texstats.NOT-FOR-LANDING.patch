@@ -1,0 +1,71 @@
+# Private diagnostic, NOT FOR LANDING: M1_TEXSTATS=1 prints texture-cache hash/upload counts every 300 frames.
+# Applies on top of 0053 (patch -p1 in a private ps3recomp copy).
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -1144,9 +1144,40 @@
+  * cache full evicts the least recently used entry rather than returning
+  * nothing: returning white "made the recovered orphanage render as flat
+  * green/black geometry" (rsx_live_draw.c:2326-2334). */
++/* DIAGNOSTIC (MELCHIOR-1, private, not for landing): M1_TEXSTATS=1 prints,
++ * every 300 frames, why textures were hashed and uploaded. */
++static struct { u64 hashes, hash_bytes, changed, changed_bytes, miss, miss_bytes, evict, same; u64 frame0;
++                struct { u32 off, fmt, w, h, n; } top[16]; } s_m1ts;
++static void m1_ts_note_changed(u32 off, u32 fmt, u32 w, u32 h)
++{
++    for (int i = 0; i < 16; i++)
++        if (s_m1ts.top[i].n && s_m1ts.top[i].off == off && s_m1ts.top[i].fmt == fmt) { s_m1ts.top[i].n++; return; }
++    int m = 0;
++    for (int i = 1; i < 16; i++) if (s_m1ts.top[i].n < s_m1ts.top[m].n) m = i;
++    if (s_m1ts.top[m].n <= 1) { s_m1ts.top[m].off = off; s_m1ts.top[m].fmt = fmt; s_m1ts.top[m].w = w; s_m1ts.top[m].h = h; s_m1ts.top[m].n = 1; }
++}
++static void m1_ts_tick(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("M1_TEXSTATS"); on = e && e[0] == '1'; }
++    if (!on || g.frames - s_m1ts.frame0 < 300) return;
++    const double f = (double)(g.frames - s_m1ts.frame0);
++    fprintf(stderr, "[m1-tex] per frame: hashes %.1f (%.0f KB), unchanged %.1f, changed->upload %.1f (%.0f KB), miss->upload %.1f (%.0f KB), evictions %.2f; textures %u\n",
++            s_m1ts.hashes / f, s_m1ts.hash_bytes / f / 1024, s_m1ts.same / f, s_m1ts.changed / f,
++            s_m1ts.changed_bytes / f / 1024, s_m1ts.miss / f, s_m1ts.miss_bytes / f / 1024, s_m1ts.evict / f, g.n_textures);
++    for (int i = 0; i < 16; i++)
++        if (s_m1ts.top[i].n > 30)
++            fprintf(stderr, "[m1-tex]   changed often: off 0x%08X fmt 0x%02X %ux%u: %u times\n",
++                    s_m1ts.top[i].off, s_m1ts.top[i].fmt, s_m1ts.top[i].w, s_m1ts.top[i].h, s_m1ts.top[i].n);
++    const u64 fr = g.frames;
++    memset(&s_m1ts, 0, sizeof s_m1ts);
++    s_m1ts.frame0 = fr;
++}
++
+ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                             u32 levels, u32 pitch, int cube, u32 remap)
+ {
++    m1_ts_tick();
+     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
+     const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+     if (!span) return 0;
+@@ -1163,6 +1194,9 @@
+             const u64 hash = eng_texture_content_hash(location, offset, span,
+                                                       &readable);
+             e->last_hash_frame = g.frames;
++            s_m1ts.hashes++; s_m1ts.hash_bytes += span;
++            if (!(readable && hash != e->content_hash)) s_m1ts.same++;
++            else { s_m1ts.changed++; s_m1ts.changed_bytes += span; m1_ts_note_changed(offset, fmt, w, h); }
+             if (readable && hash != e->content_hash) {
+                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
+                                                      levels, pitch, cube, remap);
+@@ -1177,6 +1211,7 @@
+         return e->handle;
+     }
+ 
++    s_m1ts.miss++; s_m1ts.miss_bytes += span;
+     u32 index;
+     u32 evicted = 0;
+     if (g.n_textures < ENG_MAX_TEXTURES) {
+@@ -1187,6 +1222,7 @@
+             if (g.textures[i].last_use_serial < g.textures[index].last_use_serial)
+                 index = i;
+         evicted = g.textures[index].handle;
++        s_m1ts.evict++;
+     }
+ 
+     eng_texture e;
