@@ -1,0 +1,234 @@
+diff --color -ru a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+--- a/runtime/spu/spu_channels.c	2026-10-15 20:54:30.554709007 +0400
++++ b/runtime/spu/spu_channels.c	2026-10-15 20:54:30.616265312 +0400
+@@ -21,9 +21,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <setjmp.h>
+-#ifndef _WIN32
+-#include <sched.h>   /* sched_yield */
+-#endif
++#ifndef _WIN32
++#include <sched.h>   /* sched_yield */
++#endif
+ #include <time.h>
+ #include "../platform/win32_compat.h"
+ 
+@@ -65,48 +65,48 @@
+ #else
+ #  define SPU_TLS __thread
+ #endif
+-/* Called after an SPU atomic commits a 128-byte line, with the lock-line lock
+- * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
+- * when a task sets the flag, instead of on its next 2 ms poll. */
+-void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+-/* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
+-void spu_taskset_line_committed(uint32_t line);
+-/* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
+- * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
+-#define SPU_WATCH_MAX 4
+-int g_spu_ls_watch_n = -1;
+-static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
+-unsigned* spu_ls_watch_list(int* out_n)
+-{
+-    if (g_spu_ls_watch_n < 0) {
+-        int n = 0; const char* e = getenv("SPU_LS_WATCH");
+-        while (e && *e && n < SPU_WATCH_MAX) {
+-            s_spu_ls_watch[n++] = (unsigned)strtoul(e, (char**)&e, 0) & ~0xFu;
+-            while (*e == ',' || *e == ' ') e++;
+-        }
+-        g_spu_ls_watch_n = n;
+-    }
+-    *out_n = g_spu_ls_watch_n;
+-    return s_spu_ls_watch;
+-}
+-void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
+-{
+-    int n; spu_ls_watch_list(&n);
+-    if (!n) return;
+-    uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
+-    for (int i = 0; i < g_spu_ls_watch_n; i++) {
+-        if (s_spu_ls_watch[i] == a) {
+-            fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X] "
+-                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+-                is_write ? "WR" : "rd", a, pc, lr,
+-                p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+-                p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
+-            fflush(stderr);
+-            break;
+-        }
+-    }
+-}
+-
++/* Called after an SPU atomic commits a 128-byte line, with the lock-line lock
++ * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
++ * when a task sets the flag, instead of on its next 2 ms poll. */
++void (*g_spu_line_commit_hook)(uint32_t line) = 0;
++/* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
++void spu_taskset_line_committed(uint32_t line);
++/* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
++ * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
++#define SPU_WATCH_MAX 4
++int g_spu_ls_watch_n = -1;
++static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
++unsigned* spu_ls_watch_list(int* out_n)
++{
++    if (g_spu_ls_watch_n < 0) {
++        int n = 0; const char* e = getenv("SPU_LS_WATCH");
++        while (e && *e && n < SPU_WATCH_MAX) {
++            s_spu_ls_watch[n++] = (unsigned)strtoul(e, (char**)&e, 0) & ~0xFu;
++            while (*e == ',' || *e == ' ') e++;
++        }
++        g_spu_ls_watch_n = n;
++    }
++    *out_n = g_spu_ls_watch_n;
++    return s_spu_ls_watch;
++}
++void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
++{
++    int n; spu_ls_watch_list(&n);
++    if (!n) return;
++    uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
++    for (int i = 0; i < g_spu_ls_watch_n; i++) {
++        if (s_spu_ls_watch[i] == a) {
++            fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X] "
++                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
++                is_write ? "WR" : "rd", a, pc, lr,
++                p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
++                p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
++            fflush(stderr);
++            break;
++        }
++    }
++}
++
+ static SPU_TLS jmp_buf s_spu_halt_env;
+ static SPU_TLS int     s_spu_halt_armed = 0;
+ 
+@@ -224,7 +224,7 @@
+      * recursion guard halted the SPU at 2000 after a few minutes of idling. */
+     ctx->host_depth = 0;
+     ctx->irq_frame = 0;
+-    ctx->drain_ret_pc = 0;
++    ctx->drain_ret_pc = 0;
+     /* Nest-safe: a job run synchronously from inside another SPU's execution
+      * re-enters here on the same host thread. The halt target is per-thread,
+      * so save the outer one and put it back on the way out -- otherwise the
+@@ -745,10 +745,10 @@
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
+         ctx->resv_valid = 0;                           /* reservation consumed */
+         spu_lockline_unlock();
+-        if (ctx->atomic_stat == 0) {
+-            spu_taskset_line_committed(ea & ~127u);
+-            if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+-        }
++        if (ctx->atomic_stat == 0) {
++            spu_taskset_line_committed(ea & ~127u);
++            if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
++        }
+         return 1;
+ 
+     case MFC_PUTLLUC_CMD:
+@@ -766,7 +766,7 @@
+         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+         spu_lockline_unlock();
+         spu_taskset_line_committed(ea & ~127u);
+-        if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
++        if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+         return 1;
+ 
+     default:
+@@ -1740,6 +1740,44 @@
+                 (unsigned)bits, wobj); }
+ }
+ 
++/* BAL experiment (private, never lands): busy-wait BAL_IMG9_SPIN_NS after every
++ * WAIT_SIGNAL return of image 9's tasks, to slow each work cycle. Timing test. */
++static void bal_img9_wake_spin(spu_context* ctx)
++{
++    static long ns = -1; static long n = 0;
++    if (ns < 0) { const char* e = getenv("BAL_IMG9_SPIN_NS"); ns = e ? atol(e) : 0; }
++    if (ctx->image_id != 9) return;
++    { /* which wait site, and was a PPU kick pending when it woke */
++      extern volatile uint32_t g_bal_kick[128]; extern uint8_t* vm_base;
++      static long nb, nbk, nk, nk0; static long tot;
++      const uint32_t link = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
++      const uint32_t tid = ((uint32_t)ctx->ls[0x27D6] << 8) | ctx->ls[0x27D7];
++      const uint32_t kicks = tid < 128 ? __atomic_exchange_n(&g_bal_kick[tid], 0, __ATOMIC_SEQ_CST) : 0;
++      const uint8_t* b = vm_base + 0x441D2400u;
++      if (link == 0x0A868) {                 /* barrier wait */
++          __atomic_add_fetch(&nb, 1, __ATOMIC_RELAXED);
++          if (kicks) { long m = __atomic_add_fetch(&nbk, 1, __ATOMIC_RELAXED);
++              if (m <= 20 || (m & (m - 1)) == 0)
++                  fprintf(stderr, "[bal-bar] task %u passed BARRIER wait with %u PPU kick(s) pending (#%ld); barrier:"
++                          " %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n", tid, kicks, m,
++                          b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]); }
++      } else if (link == 0x0A230) {          /* PPU kick wait */
++          __atomic_add_fetch(&nk, 1, __ATOMIC_RELAXED);
++          if (!kicks) __atomic_add_fetch(&nk0, 1, __ATOMIC_RELAXED);
++      }
++      long tt = __atomic_add_fetch(&tot, 1, __ATOMIC_RELAXED);
++      if ((tt & 1023) == 0)
++          fprintf(stderr, "[bal-bar] summary: %ld wakes; barrier waits %ld (with PPU kick pending %ld); kick waits %ld (no kick seen %ld)\n",
++                  tt, nb, nbk, nk, nk0);
++    }
++    long k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
++    if ((k & (k - 1)) == 0) fprintf(stderr, "[bal] img9 wake #%ld spin %ld ns\n", k, ns);
++    if (!ns) return;
++    struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
++    do clock_gettime(CLOCK_MONOTONIC, &b);
++    while ((b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec) < ns);
++}
++
+ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by the pure interpreter (spu_interp.c) */
+ {
+     uint32_t raw = ctx->gpr[3]._u32[0];
+@@ -1860,6 +1898,7 @@
+             extern int spu_taskset_consume_wake(uint32_t);
+             if (spu_taskset_consume_wake(ts)) {   /* a Set beat us to the park */
+                 spu_ef_deliver_owed(ctx, wobj);
++                bal_img9_wake_spin(ctx);
+                 ctx->gpr[3]._u32[0] = 0;
+                 return;
+             }
+@@ -1869,6 +1908,7 @@
+             spu_taskset_parked_del(ts, tid);
+             yz_lockstep_block_end(ctx);
+             spu_ef_deliver_owed(ctx, wobj);
++            bal_img9_wake_spin(ctx);
+         }
+         ctx->gpr[3]._u32[0] = 0;
+         return;
+@@ -2041,10 +2081,10 @@
+                       " microstep set -- handing to the interpreter (steps=%d)\n",
+                       ctx->image_id, pc, w, steps); }
+         ctx->pc = pc;
+-        /* Stop at the drain's return point too: it sits mid-function, so it is
+-         * no lifted entry, and a job's return would otherwise run on through
+-         * the caller's code (GH3's song-freeze; see drain_ret_pc). */
+-        return spu_interp_run_until(ctx, pc, ctx->drain_ret_pc) ? 1 : 0;
++        /* Stop at the drain's return point too: it sits mid-function, so it is
++         * no lifted entry, and a job's return would otherwise run on through
++         * the caller's code (GH3's song-freeze; see drain_ret_pc). */
++        return spu_interp_run_until(ctx, pc, ctx->drain_ret_pc) ? 1 : 0;
+     }
+     { static int _n = 0; if (_n++ < 4)
+         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
+diff --color -ru a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+--- a/runtime/spu/spu_workload.c	2026-10-15 20:54:30.556667953 +0400
++++ b/runtime/spu/spu_workload.c	2026-10-15 20:54:30.616621693 +0400
+@@ -999,9 +999,14 @@
+ }
+ 
+ /* Deliver a signal to a task (callable from any PPU/host thread). */
++/* BAL experiment (private, never lands): count PPU-side signals per task of
++ * the img9 taskset, so the WAIT_SIGNAL hook can tell a PPU kick from a barrier
++ * release. */
++volatile uint32_t g_bal_kick[128];
+ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
+ {
+     if (!taskset_ea || taskId >= 128) return;
++    if (taskset_ea == 0x441D0B00u) __atomic_add_fetch(&g_bal_kick[taskId], 1, __ATOMIC_SEQ_CST);
+ #ifdef _WIN32
+     AcquireSRWLockExclusive(&s_sig_lock);
+     spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
