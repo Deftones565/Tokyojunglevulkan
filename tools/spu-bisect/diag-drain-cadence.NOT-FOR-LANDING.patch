@@ -1,0 +1,20 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -329,8 +329,16 @@
+     bool quitting = false;
+     vclock::time_point quit_deadline;
+ 
++    /* DIAGNOSTIC (NOT FOR LANDING): TJ_WAKE_MS=<ms> sets the frame-clock
++     * thread's sleep between wakes (default 4). Each wake presents a pending
++     * flip and drains the FIFO, so a smaller value makes the RSX consume the
++     * guest's commands (vertex data, label releases) sooner after the PPU
++     * queues them; 0 drains back to back (Sleep(0) only yields). */
++    static int wake_ms = -1;
++    if (wake_ms < 0) { const char* e = getenv("TJ_WAKE_MS"); wake_ms = e ? atoi(e) : 4; if (wake_ms < 0) wake_ms = 0;
++                       fprintf(stderr, "[diag] TJ_WAKE_MS=%d\n", wake_ms); }
+     for (;;) {
+-        Sleep(4);
++        Sleep(wake_ms);
+         vclock::time_point now = vclock::now();
+ 
+         if (quitting && now >= quit_deadline) {
