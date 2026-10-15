@@ -21,3 +21,13 @@ fsplit's output over `<private SPU_DIR>/<image>/spu_recomp.c`, `ninja -C <dir> -
 Verdict: broken = the Pomeranian close-up at the start of the tutorial shows shards. It is
 intermittent (1-2 shard frames out of ~5-20 close-up frames), so CLEAN needs zero shard frames
 over >= 15 close-up frames.
+
+## Differential harness (`harness/`)
+
+`harness/build.sh <image id>` compiles one lifted SPU image twice as shared objects, with the
+pshufb `spu_shufb` (`new.so`) and with the byte-loop `spu_shufb_ref` everywhere (`ref.so`, via a
+wrapper TU), using the game's flags (clang -O2 -msse4.1 -ffp-contract=off -fno-strict-aliasing).
+`harness <symbol> [iters] [counter gpr] new.so ref.so` runs that one function from both on the
+same random gpr + LS state and compares every gpr, all of LS and the rest of the context. Give
+the gpr a loop counts down by 4 as `counter` (else such a loop runs ~forever: use `timeout`).
+Offline only: it runs lifted native code on a fake context, nothing is interpreted.
