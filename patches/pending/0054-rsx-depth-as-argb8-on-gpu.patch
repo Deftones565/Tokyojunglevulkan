@@ -1,0 +1,269 @@
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -118,6 +118,9 @@
+     int guest_dirty;       /* written since guest memory last got a copy     */
+     u32 zfmt, pitch;       /* SURFACE_FORMAT depth field and zeta pitch then */
+     u32 used_w, used_h;    /* the clip that write went through              */
++    u32 argb;              /* colour target: the depth as A8R8G8B8 bytes      */
++    u32 argb_w, argb_h;
++    u64 argb_serial;       /* depth_serial it was converted from             */
+ } eng_zdepth;
+ 
+ typedef struct {
+@@ -193,6 +196,9 @@
+     u32 index_cap;
+ 
+     rsx_fp_constant_block fp_constants;
++
++    u32 argb_pipe;          /* depth -> A8R8G8B8 bytes pass; 0 = not built   */
++    int argb_pipe_failed;
+ } g;
+ 
+ /* The decompilers' HLSL. The VP decompiler builds bodies up to 192 KB. */
+@@ -962,6 +968,8 @@
+ 
+     eng_zdepth* z = &g.zdepths[slot];
+     if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
++    if (z->argb) g.be->color_target_release(g.be->user, z->argb);
++    z->argb = 0; z->argb_w = z->argb_h = 0; z->argb_serial = 0;
+     z->location = location; z->offset = offset;
+     z->w = want_w; z->h = want_h;
+     z->handle = handle;
+@@ -1311,6 +1319,212 @@
+     return 1;
+ }
+ 
++/* ---- a depth buffer read as A8R8G8B8, converted on the GPU --------------
++ * Tokyo Jungle samples its D24S8 depth buffers as A8R8G8B8 (the shadow map
++ * in the scene pass, the main zeta in the DOF compose) every frame. Through
++ * guest memory that is a readback, a CPU store, a content hash, a decode and
++ * an upload of the whole buffer per sample: in gameplay ~7 MB a frame and a
++ * large share of the FIFO thread. Instead the depth is snapshotted on the GPU
++ * and a full-screen pass writes, per texel, exactly the bytes
++ * eng_zdepth_to_guest would store (D24 = (u32)(d * 16777215 + 0.5) after
++ * clamping to [0,1], stencil byte 0) in the host order rsx_texture_decode
++ * gives A8R8G8B8 (R,G,B,A = guest bytes 1,2,3,0). `precise` stops the
++ * multiply-add being fused, which would round differently from the CPU.
++ * RSX_ENGINE_DEPTH_ARGB_GPU=0 turns it off; RSX_ENGINE_DEPTH_ARGB_VERIFY=1
++ * also runs the CPU path and compares every byte (a debug mode: it does the
++ * readback this exists to avoid).
++ *
++ * Only used while the depth has been rendered since guest memory last got a
++ * copy: the guest copy is then left stale until something on the guest side
++ * reads it (an NV3089 transfer stores it as before). */
++static const char s_argb_vs[] =
++    "struct VSInput { float4 a0:ATTR0; };\n"
++    "struct VSOutput { float4 pos:SV_Position; };\n"
++    "VSOutput main(VSInput input) { VSOutput o; o.pos = input.a0; return o; }\n";
++static const char s_argb_ps[] =
++    "Texture2D    rsx_tex[16] : register(t0);\n"
++    "SamplerState rsx_samp[16] : register(s0);\n"
++    "float4 main(float4 pos : SV_Position) : SV_TARGET {\n"
++    "    float d = rsx_tex[0].Load(int3(int2(pos.xy), 0)).x;\n"
++    "    d = (d > 0.0) ? d : 0.0;\n"
++    "    d = (d > 1.0) ? 1.0 : d;\n"
++    "    precise float v = d * 16777215.0 + 0.5;\n"
++    "    uint u = (uint)v;\n"
++    "    return float4((float)((u >> 8) & 255u), (float)(u & 255u), 0.0,\n"
++    "                  (float)((u >> 16) & 255u)) / 255.0;\n"
++    "}\n";
++
++static int eng_argb_pipeline(void)
++{
++    if (g.argb_pipe) return 1;
++    if (g.argb_pipe_failed || !g.be->pipeline_create) return 0;
++    rsx_be_render_state rs;
++    memset(&rs, 0, sizeof rs);
++    rs.color_mask = 0x01010101u;            /* A, R, G, B all written */
++    rsx_vertex_layout_plan layout;
++    rsx_vertex_layout_plan_init(&layout, 1u);  /* ATTR0 only */
++    g.argb_pipe = g.be->pipeline_create(g.be->user, s_argb_vs, s_argb_ps, &rs, &layout,
++                                        16u, RSX_BE_FMT_R8G8B8A8, 1u);
++    if (!g.argb_pipe) {
++        g.argb_pipe_failed = 1;
++        fprintf(stderr, "[rsx engine] depth->A8R8G8B8 pass could not be built; using guest memory\n");
++        return 0;
++    }
++    return 1;
++}
++
++/* Run the pass from R32F texture `src` into colour target `dst` (w x h). */
++static void eng_argb_convert(u32 src, u32 dst, u32 w, u32 h)
++{
++    static const float tri[12] = { -1.0f, -1.0f, 0.0f, 1.0f,   3.0f, -1.0f, 0.0f, 1.0f,
++                                   -1.0f,  3.0f, 0.0f, 1.0f };
++    u32 tex[RSX_BE_MAX_TEXTURES];
++    rsx_be_sampler_desc smp[RSX_BE_MAX_TEXTURES];
++    u32 vtex[RSX_BE_MAX_VERTEX_TEXTURES];
++    rsx_be_sampler_desc vsmp[RSX_BE_MAX_VERTEX_TEXTURES];
++    memset(tex, 0, sizeof tex); memset(smp, 0, sizeof smp);
++    memset(vtex, 0, sizeof vtex); memset(vsmp, 0, sizeof vsmp);
++    tex[0] = src;
++    g.be->bind_targets(g.be->user, &dst, 1u, 0u);
++    g.be->bind_pipeline(g.be->user, g.argb_pipe);
++    g.be->bind_vs_constants(g.be->user, NULL, 0u);
++    g.be->bind_ps_constants(g.be->user, NULL, 0u);
++    g.be->bind_textures(g.be->user, tex, smp, 1u);
++    g.be->bind_vertex_textures(g.be->user, vtex, vsmp, 0u);
++    g.be->set_viewport(g.be->user, 0.0f, 0.0f, (float)w, (float)h);
++    g.be->set_scissor(g.be->user, 0u, 0u, w, h);
++    g.be->set_stencil_ref(g.be->user, 0u);
++    g.be->draw(g.be->user, RSX_TOPOLOGY_TRIANGLES, tri, 3u, 16u, NULL, 0u);
++}
++
++/* The CPU path's bytes for one depth value, as host R,G,B,A. */
++static void eng_argb_expect(float d, u8 out[4])
++{
++    if (!(d > 0.0f)) d = 0.0f;
++    if (d > 1.0f) d = 1.0f;
++    const u32 v = (u32)(d * 16777215.0f + 0.5f);
++    out[0] = (u8)(v >> 8); out[1] = (u8)v; out[2] = 0; out[3] = (u8)(v >> 16);
++}
++
++static int eng_argb_verify_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_ENGINE_DEPTH_ARGB_VERIFY"); on = e && e[0] == '1'; }
++    return on;
++}
++
++/* Verify mode, once: the pass over chosen float values against the formula
++ * (0, +-inf, NaN, negatives, > 1, denormals, every rounding boundary
++ * (k + 0.5) / 16777215 and its neighbours, near-1 values, random ones). */
++static void eng_argb_selftest(void)
++{
++    enum { TW = 256, TH = 16 };
++    static float vals[TW * TH];
++    u32 n = 0;
++    const float special[] = { 0.0f, -0.0f, 1.0f, -1.0f, 2.0f, 0.5f, 1e-38f, 1e-45f,
++                              __builtin_inff(), -__builtin_inff(), __builtin_nanf(""),
++                              0.99999994f, 0.9999999f, 0.94f, 0.96082234f, 0.994206786f };
++    for (u32 i = 0; i < sizeof special / sizeof special[0]; i++) vals[n++] = special[i];
++    u32 seed = 12345u;
++    while (n + 3 <= TW * TH) {
++        seed = seed * 1664525u + 1013904223u;
++        const u32 k = seed % 16777215u;
++        const float b = ((float)k + 0.5f) / 16777215.0f;   /* a rounding boundary */
++        u32 bits; memcpy(&bits, &b, 4);
++        const u32 lo = bits - 1u, hi = bits + 1u;
++        memcpy(&vals[n++], &lo, 4); vals[n++] = b; memcpy(&vals[n++], &hi, 4);
++    }
++    while (n < TW * TH) { seed = seed * 1664525u + 1013904223u; vals[n++] = (float)(seed >> 8) / 16777216.0f; }
++
++    const u32 src = g.be->texture_create(g.be->user, RSX_BE_FMT_R32F, TW, TH, 1u, 1u, 0u, 0u);
++    const u32 dst = g.be->color_target_create(g.be->user, RSX_BE_FMT_R8G8B8A8, TW, TH, NULL, 0u);
++    static u8 got[TW * TH * 4];
++    u32 bad = 0;
++    if (src && dst) {
++        g.be->texture_upload(g.be->user, src, 0u, 0u, TW, TH, vals, TW * 4u, TH);
++        eng_argb_convert(src, dst, TW, TH);
++        g.be->readback(g.be->user, dst, 0u, 0u, TW, TH, got, TW * 4u);
++        for (u32 i = 0; i < TW * TH; i++) {
++            u8 e[4]; eng_argb_expect(vals[i], e);
++            if (memcmp(e, got + i * 4u, 4u)) {
++                if (bad++ < 8) {
++                    u32 b; memcpy(&b, &vals[i], 4);
++                    fprintf(stderr, "[rsx engine] depth->A8R8G8B8 selftest MISMATCH d=%.9g (0x%08X): want %02X%02X%02X%02X got %02X%02X%02X%02X\n",
++                            vals[i], b, e[0], e[1], e[2], e[3], got[i*4], got[i*4+1], got[i*4+2], got[i*4+3]);
++                }
++            }
++        }
++        fprintf(stderr, "[rsx engine] depth->A8R8G8B8 selftest: %u values, %u mismatches\n", TW * TH, bad);
++    } else {
++        fprintf(stderr, "[rsx engine] depth->A8R8G8B8 selftest: could not create test images\n");
++    }
++    if (src) g.be->texture_release(g.be->user, src);
++    if (dst) g.be->color_target_release(g.be->user, dst);
++}
++
++/* A texture naming depth slot `slot` as A8R8G8B8: the converted image wearing
++ * the unit's crossbar, or 0 to take the guest-memory path. */
++static u32 eng_zdepth_argb8(u32 slot, const rsx_dsp_texture* t)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_ENGINE_DEPTH_ARGB_GPU"); on = !(e && e[0] == '0'); }
++    eng_zdepth* z = &g.zdepths[slot];
++    if (!on || !z->guest_dirty || z->zfmt != 2u || !z->handle) return 0;   /* Z24S8 only */
++    if (!g.be->depth_snapshot || !g.be->surface_view) return 0;
++    if (!(t->format & 0x20u) || t->cubemap || t->mipmaps > 1u) return 0;   /* linear 2D */
++    const u32 uw = z->used_w < z->w ? z->used_w : z->w;
++    const u32 uh = z->used_h < z->h ? z->used_h : z->h;
++    if (!t->width || !t->height || t->width > uw || t->height > uh || t->pitch != z->pitch)
++        return 0;
++    if (!eng_argb_pipeline()) return 0;
++    { static int st = 0; if (!st && eng_argb_verify_on()) { st = 1; eng_argb_selftest(); } }
++
++    if (!z->argb || z->argb_serial != z->depth_serial ||
++        z->argb_w != t->width || z->argb_h != t->height) {
++        const u32 snap = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
++        if (!snap) return 0;
++        if (z->argb && (z->argb_w != t->width || z->argb_h != t->height)) {
++            g.be->color_target_release(g.be->user, z->argb);
++            z->argb = 0;
++        }
++        if (!z->argb) {
++            z->argb = g.be->color_target_create(g.be->user, RSX_BE_FMT_R8G8B8A8,
++                                                t->width, t->height, NULL, 0u);
++            if (!z->argb) return 0;
++            z->argb_w = t->width; z->argb_h = t->height;
++        }
++        eng_argb_convert(snap, z->argb, t->width, t->height);
++        z->argb_serial = z->depth_serial;
++
++        if (eng_argb_verify_on()) {
++            /* The CPU path, then every byte of the two compared. */
++            const u32 w = t->width, h = t->height;
++            u8* gpu = (u8*)malloc((size_t)w * h * 4u);
++            if (gpu && eng_zdepth_to_guest(slot)) {
++                g.be->readback(g.be->user, z->argb, 0u, 0u, w, h, gpu, w * 4u);
++                u32 bad = 0;
++                for (u32 r = 0; r < h; r++) {
++                    const u8* gr = eng_guest_ptr(NULL, z->location, z->offset + r * z->pitch, w * 4u);
++                    if (!gr) { bad = ~0u; break; }
++                    for (u32 c = 0; c < w; c++) {
++                        const u8* p = gpu + ((size_t)r * w + c) * 4u;
++                        if (p[0] != gr[c*4+1] || p[1] != gr[c*4+2] || p[2] != gr[c*4+3] || p[3] != gr[c*4+0])
++                            bad++;
++                    }
++                }
++                static u32 nlog;
++                if (bad || nlog < 4)
++                    fprintf(stderr, "[rsx engine] depth->A8R8G8B8 verify 0x%08X %ux%u: %u mismatching texels\n",
++                            z->offset, w, h, bad);
++                nlog++;
++                z->guest_dirty = 1;         /* keep taking the GPU path */
++            }
++            free(gpu);
++        }
++    }
++    return g.be->surface_view(g.be->user, z->argb, t->remap & 0xFFFFu, t->format);
++}
++
+ /* A depth write or clear through the current zeta, recorded with what the
+  * guest-memory copy needs to lay it out. */
+ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
+@@ -1975,6 +2189,10 @@
+                 const u32 snap = eng_zdepth_snapshot((u32)zsrc);
+                 if (snap) { textures[u] = snap; continue; }
+             }
++            if (base_fmt == RSX_TEX_FMT_A8R8G8B8) {
++                const u32 view = eng_zdepth_argb8((u32)zsrc, &t);
++                if (view) { textures[u] = view; continue; }
++            }
+             if (eng_zdepth_to_guest((u32)zsrc)) {
+                 textures[u] = eng_texture_slot(t.location, t.offset, t.format,
+                                                t.width, t.height, t.mipmaps, t.pitch,
+@@ -2768,8 +2986,12 @@
+         if (g.pipelines[i].handle) g.be->pipeline_release(g.be->user, g.pipelines[i].handle);
+     for (u32 i = 0; i < g.n_surfaces; i++)
+         if (g.surfaces[i].handle) g.be->color_target_release(g.be->user, g.surfaces[i].handle);
+-    for (u32 i = 0; i < g.n_zdepths; i++)
++    for (u32 i = 0; i < g.n_zdepths; i++) {
++        if (g.zdepths[i].argb) g.be->color_target_release(g.be->user, g.zdepths[i].argb);
+         if (g.zdepths[i].handle) g.be->depth_target_release(g.be->user, g.zdepths[i].handle);
++    }
++    if (g.argb_pipe) g.be->pipeline_release(g.be->user, g.argb_pipe);
++    g.argb_pipe = 0; g.argb_pipe_failed = 0;
+     if (g.ready && g.be->shutdown) g.be->shutdown(g.be->user);
+ 
+     rsx_draw_engine_set_guest_memory(NULL, NULL);
