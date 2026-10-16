@@ -1,0 +1,445 @@
+Vulkan transfers recorded into the draw batch; NV3089 readback skipped when guest memory already holds the bytes (MAGI-5)
+
+USER: gameplay laggy. With 0072 the main PPU thread waits on the RSX drain
+(0065's RunJobChain wait) for the drain's own work, so drain time is frame
+time. Three exact changes (same commands, same order, same guest bytes):
+
+1. rsx_vulkan_backend.c: uploads (color_target_write, texture uploads,
+   target seeds), clears, surface -> texture region copies, depth
+   snapshots and new images' layout moves are recorded into the open draw
+   batch behind the same global barrier a draw uses (vk_rec_begin /
+   vk_rec_end), instead of each flushing the batch and doing its own
+   submit-and-wait. Upload staging comes from a ring that lives as long as
+   the batch (vk_bstage; rewound by vk_batch_reset, a full ring flushes
+   first). Readbacks, presents and object destruction still flush and wait.
+   The scratch depth image grows to cover both dimensions instead of being
+   recreated whenever a draw alternates between 1024x1024 and 1280x720.
+   PS3RECOMP_VK_BATCH=0 keeps one submit-and-wait per operation.
+2. rsx_draw_engine.c: guest_read skips its readback when the rectangle lies
+   inside the one guest_wrote last pushed, nothing has drawn or cleared
+   into the surface since (color_serial), and the guest bytes still equal
+   the copy kept then (memcmp): the readback would store the same bytes.
+   Tokyo Jungle copies a main-memory buffer into its scene target and
+   straight back out every frame. RSX_ENGINE_CLEAN_SKIP=0 reads back anyway.
+3. The A,R,G,B <-> R,G,B,A swizzles of guest_read/guest_wrote are 32-bit
+   rotates the compiler vectorises (were byte loops, ~10% of the drain
+   each way).
+
+A/B (tools/prof/drive_gameplay.py, both runs at the same time, 60 s of
+Survival tutorial gameplay): mg5-bb1 22.80 flips/s vs mg5-bb0 (build/
+0001-0073) 20.35, +12%; 0 FATAL, 0 LIFT-GAP both. Street frames match
+(mean |diff| 0.3-0.6, wolf positions / hunger counter); the Pomeranian
+close-up matches (flip 5400 vs 5468, mean |diff| 0.1 at 160x90).
+check_no_emulation OK.
+
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -578,6 +578,71 @@
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+ }
+ 
++/* Recording into the open batch. Transfers and clears the CPU needs nothing
++ * back from -- uploads, clears, surface -> texture copies, depth snapshots,
++ * new images' layout moves -- used to go through vk_begin() and end in their
++ * own vk_submit_and_wait(): one GPU round trip each, dozens a frame, with the
++ * CPU and GPU taking turns (Tokyo Jungle gameplay: ~16% of the FIFO thread's
++ * wall time waiting, mg5-g1). They are now recorded into the open batch like
++ * a draw, behind the same global barrier, so the GPU still sees every
++ * operation in exactly the order the engine issued it; only what the CPU
++ * reads back (readbacks, presents) and object destruction still flush and
++ * wait. PS3RECOMP_VK_BATCH=0 keeps the old one-submit-per-operation path. */
++static int vk_batching_off(void)
++{
++    static int off = -1;
++    if (off < 0) { const char* e = getenv("PS3RECOMP_VK_BATCH"); off = e && e[0] == '0'; }
++    return off;
++}
++
++static int vk_rec_begin(void)
++{
++    if (vk_batching_off()) return vk_begin();
++    if (!s_batch.open) {
++        if (vk_begin()) return -1;
++        s_batch.open = 1;
++    }
++    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                           .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++                           .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
++    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
++    return 0;
++}
++
++static int vk_rec_end(void)
++{
++    return vk_batching_off() ? vk_submit_and_wait() : 0;
++}
++
++/* Upload staging that lives as long as the open batch: the CPU fills a slice
++ * when the upload is recorded and the GPU reads it when the batch runs, so a
++ * slice is free again only after the batch's submit-and-wait. Taking a slice
++ * that does not fit flushes the batch first (vk_batch_reset rewinds it). */
++static vk_buffer s_bst;
++static VkDeviceSize s_bst_off;
++
++static int vk_bstage(VkDeviceSize bytes, VkDeviceSize* off)
++{
++    bytes = (bytes + 15u) & ~(VkDeviceSize)15u;
++    if (!s_bst.buf || s_bst_off + bytes > s_bst.size) {
++        if (s_batch.open && vk_batch_flush()) return -1;
++        s_bst_off = 0;
++        if (!s_bst.buf || bytes > s_bst.size) {
++            VkDeviceSize size = s_bst.size ? s_bst.size : (VkDeviceSize)64u << 20;
++            while (size < bytes) size *= 2u;
++            vk_destroy_buffer(&s_bst);
++            if (vk_create_host_buffer(&s_bst, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
++                !s_bst.coherent) {
++                vk_destroy_buffer(&s_bst); return -1;
++            }
++        }
++    }
++    *off = s_bst_off;
++    s_bst_off += bytes;
++    return 0;
++}
++
+ /* ---------------------------------------------------------------------------
+  * Texture unit 0
+  * -------------------------------------------------------------------------*/
+@@ -2033,21 +2098,23 @@
+                                 const void* src, u32 row_bytes)
+ {
+     if (tight > row_bytes) tight = row_bytes;
+-    if (vk_stage(&s_stage_up, (VkDeviceSize)tight * rows, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
+-        !s_stage_up.coherent) { vk_destroy_buffer(&s_stage_up); return -1; }
+-    const vk_buffer st = s_stage_up;
+-    for (u32 y = 0; y < rows; y++)
+-        memcpy((u8*)st.ptr + (size_t)y * tight, (const u8*)src + (size_t)y * row_bytes, tight);
+-    int rc = vk_begin();
++    VkDeviceSize off;
++    if (vk_bstage((VkDeviceSize)tight * rows, &off)) return -1;
++    u8* dst = (u8*)s_bst.ptr + off;
++    if (tight == row_bytes) memcpy(dst, src, tight * rows);
++    else
++        for (u32 r = 0; r < rows; r++)
++            memcpy(dst + (size_t)r * tight, (const u8*)src + (size_t)r * row_bytes, tight);
++    int rc = vk_rec_begin();
+     if (!rc) {
+-        vk_barrier_image(img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+         VkBufferImageCopy region = {
++            .bufferOffset = off,
+             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 },
+             .imageOffset = { (int32_t)x, (int32_t)y, 0 },
+             .imageExtent = { w, h, 1 },
+         };
+-        pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+-        rc = vk_submit_and_wait();
++        pvkCmdCopyBufferToImage(s_vk.cmd, s_bst.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
++        rc = vk_rec_end();
+     }
+     return rc;
+ }
+@@ -2165,12 +2232,12 @@
+     o->kind = VK_ENG_COLOR; o->fmt = vf; o->bpp = bpp; o->w = w; o->h = h;
+     /* UNDEFINED -> GENERAL, then the guest's own bytes when the engine could
+      * resolve them, else transparent black so the contents are defined. */
+-    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
++    if (vk_rec_begin()) { vk_eng_release(user, hd); return 0; }
+     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+     VkClearColorValue zero = { .float32 = { 0.0f, 0.0f, 0.0f, 0.0f } };
+     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+     pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &r);
+-    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
++    if (vk_rec_end()) { vk_eng_release(user, hd); return 0; }
+     if (seed && seed_row_bytes)
+         vk_eng_upload(o->im.img, 0, 0, w, h, bpp, seed, seed_row_bytes);
+     return hd;
+@@ -2191,12 +2258,12 @@
+     }
+     o->kind = VK_ENG_DEPTH; o->fmt = s_vk.depth_format; o->w = w; o->h = h;
+     /* Far plane, for the reason the display depth starts there. */
+-    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
++    if (vk_rec_begin()) { vk_eng_release(user, hd); return 0; }
+     vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_UNDEFINED);
+     VkClearDepthStencilValue far_plane = { 1.0f, 0 };
+     VkImageSubresourceRange r = { s_vk.depth_aspect, 0, 1, 0, 1 };
+     pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &r);
+-    if (vk_submit_and_wait()) { vk_eng_release(user, hd); return 0; }
++    if (vk_rec_end()) { vk_eng_release(user, hd); return 0; }
+     return hd;
+ }
+ 
+@@ -2219,13 +2286,12 @@
+                       ((u32)(rgba[1] * 255.0f + 0.5f) <<  8) |
+                        (u32)(rgba[2] * 255.0f + 0.5f);
+     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+-    if (!o || vk_begin()) return;
++    if (!o || vk_rec_begin()) return;
+     VkClearColorValue v;
+     memcpy(v.float32, rgba, sizeof v.float32);
+     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+-    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+     pvkCmdClearColorImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
+-    vk_submit_and_wait();
++    vk_rec_end();
+ }
+ 
+ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+@@ -2236,12 +2302,11 @@
+     VkImageAspectFlags aspect = 0;
+     if (flags & RSX_BE_CLEAR_DEPTH) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
+     if (flags & RSX_BE_CLEAR_STENCIL) aspect |= s_vk.depth_aspect & VK_IMAGE_ASPECT_STENCIL_BIT;
+-    if (!o || !aspect || vk_begin()) return;
++    if (!o || !aspect || vk_rec_begin()) return;
+     VkClearDepthStencilValue d = { depth_value, stencil };
+     VkImageSubresourceRange r = { aspect, 0, 1, 0, 1 };
+-    vk_barrier_image(o->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
+     pvkCmdClearDepthStencilImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, &d, 1, &r);
+-    vk_submit_and_wait();
++    vk_rec_end();
+ }
+ 
+ /* The named surface becomes the frame: blit it onto the display image, then
+@@ -2359,9 +2424,9 @@
+     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->cube = (u8)cube;
+     o->bpp = bc ? 0 : bpp; o->block = bc ? bpp : 0;
+     /* UNDEFINED -> GENERAL for every level and face before the uploads arrive. */
+-    if (vk_begin()) goto fail;
++    if (vk_rec_begin()) goto fail;
+     vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+-    if (vk_submit_and_wait()) goto fail;
++    if (vk_rec_end()) goto fail;
+     return hd;
+ fail:
+     vk_destroy_image(&o->im);
+@@ -2413,9 +2478,7 @@
+     if (!src || !dst || !w || !h || src->fmt != dst->fmt || dst->cube ||
+         x + w > src->w || y + h > src->h || w > dst->w || h > dst->h)
+         return -1;
+-    if (vk_begin()) return -1;
+-    vk_barrier_image(src->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+-    vk_barrier_image(dst->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
++    if (vk_rec_begin()) return -1;
+     VkImageCopy region = {
+         .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+         .srcOffset = { (int32_t)x, (int32_t)y, 0 },
+@@ -2425,7 +2488,7 @@
+     };
+     pvkCmdCopyImage(s_vk.cmd, src->im.img, VK_IMAGE_LAYOUT_GENERAL,
+                     dst->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+-    return vk_submit_and_wait() ? -1 : 0;
++    return vk_rec_end() ? -1 : 0;
+ }
+ 
+ /* ---- E4: depth snapshots --------------------------------------------------
+@@ -2469,20 +2532,21 @@
+         t->kind = VK_ENG_TEXTURE; t->fmt = VK_FORMAT_R32_SFLOAT; t->bpp = 4; t->w = w; t->h = h;
+         z = vk_eng_get(depth, VK_ENG_DEPTH);          /* same slot; reload for clarity */
+         z->surface = snap;
+-        if (vk_begin()) return 0;
++        if (vk_rec_begin()) return 0;
+         vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+-        if (vk_submit_and_wait()) return 0;
++        if (vk_rec_end()) return 0;
+     }
+ 
+     if (vk_stage(&s_stage_zz, (VkDeviceSize)w * h * 4u,
+                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+         vk_destroy_buffer(&s_stage_zz); return 0;
+     }
++    /* Recorded into the batch: s_stage_zz is only ever touched by the GPU,
++     * and every use sits behind vk_rec_begin's full barrier, so the next
++     * snapshot's copy-in cannot overtake this one's copy-out. */
+     const vk_buffer st = s_stage_zz;
+-    int rc = vk_begin();
++    int rc = vk_rec_begin();
+     if (!rc) {
+-        vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
+-        vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+         VkBufferImageCopy out = { .imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 },
+                                   .imageExtent = { w, h, 1 } };
+         pvkCmdCopyImageToBuffer(s_vk.cmd, z->im.img, VK_IMAGE_LAYOUT_GENERAL, st.buf, 1, &out);
+@@ -2496,7 +2560,7 @@
+         VkBufferImageCopy in = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                  .imageExtent = { w, h, 1 } };
+         pvkCmdCopyBufferToImage(s_vk.cmd, st.buf, t->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+-        rc = vk_submit_and_wait();
++        rc = vk_rec_end();
+     }
+     return rc ? 0 : snap;
+ }
+@@ -2974,6 +3038,7 @@
+ static void vk_batch_reset(void)
+ {
+     s_bs.vo = s_bs.io = s_bs.uo = 0;
++    s_bst_off = 0;
+     if (s_bs.pool && s_bs.sets) pvkResetDescriptorPool(s_vk.device, s_bs.pool, 0);
+     s_bs.sets = 0;
+ }
+@@ -2983,6 +3048,7 @@
+     vk_destroy_buffer(&s_bs.v);
+     vk_destroy_buffer(&s_bs.i);
+     vk_destroy_buffer(&s_bs.u);
++    vk_destroy_buffer(&s_bst); s_bst_off = 0;
+     if (s_bs.pool) pvkDestroyDescriptorPool(s_vk.device, s_bs.pool, NULL);
+     free(s_bs.vsc); free(s_bs.psc);
+     memset(&s_bs, 0, sizeof s_bs);
+@@ -3124,6 +3190,13 @@
+ {
+     if (s_e2.scratch_depth.view && s_e2.scratch_w >= w && s_e2.scratch_h >= h)
+         return s_e2.scratch_depth.view;
++    /* Grow to cover both the old size and this one: draws alternating between
++     * a 1024x1024 and a 1280x720 target (Tokyo Jungle's shadow map and scene)
++     * otherwise recreated it on every switch, each a batch flush and a wait. */
++    if (s_e2.scratch_depth.view) {
++        if (w < s_e2.scratch_w) w = s_e2.scratch_w;
++        if (h < s_e2.scratch_h) h = s_e2.scratch_h;
++    }
+     vk_eng_drop_framebuffers();
+     vk_destroy_image(&s_e2.scratch_depth);
+     if (vk_create_image(&s_e2.scratch_depth, s_vk.depth_format, w, h,
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -104,6 +104,14 @@
+     u32 handle;
+     u64 color_serial;       /* g.write_serial of the last colour write, or 0 */
+     int guest_dirty;        /* rendered since guest memory last got a copy   */
++    /* The rectangle guest_wrote last pushed from guest memory, while nothing
++     * has drawn into the surface since (color_serial unchanged): there the
++     * surface holds exactly the guest bytes it was given, kept in
++     * clean_bytes so guest_read can tell whether the guest still does. */
++    u32 clean_x, clean_y, clean_w, clean_h;
++    u64 clean_serial;
++    u8* clean_bytes;
++    u32 clean_cap;
+ } eng_surface;
+ 
+ typedef struct {
+@@ -670,6 +678,7 @@
+      * so a region copied before the growth is recopied (the handle changed). */
+     s->color_serial = kept_serial;
+     s->guest_dirty = kept_dirty;
++    s->clean_w = 0;          /* a new image: nothing known to match guest memory */
+     if (slot == g.n_surfaces) g.n_surfaces++;
+     { static u32 logs = 0; if (logs++ < 32)
+         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
+@@ -858,6 +867,52 @@
+     return s_coherence_rows;
+ }
+ 
++/* Host R,G,B,A rows <-> guest A,R,G,B pixels: per 32-bit little-endian
++ * word that is a rotate by 8 (identity when the host keeps A,R,G,B order).
++ * Word loops the compiler vectorises; the byte loops were ~10% of the FIFO
++ * thread each way in Tokyo Jungle gameplay (six full-screen 2D copies a
++ * frame). */
++static void eng_rgba_to_guest(u8* dst, const u8* src, u32 n, int rgba)
++{
++    if (rgba) { memcpy(dst, src, (size_t)n * 4u); return; }
++    for (u32 c = 0; c < n; c++) {
++        u32 v; memcpy(&v, src + 4u * c, 4);
++        v = (v << 8) | (v >> 24);
++        memcpy(dst + 4u * c, &v, 4);
++    }
++}
++
++static void eng_guest_to_rgba(u8* dst, const u8* src, u32 n, int rgba)
++{
++    if (rgba) { memcpy(dst, src, (size_t)n * 4u); return; }
++    for (u32 c = 0; c < n; c++) {
++        u32 v; memcpy(&v, src + 4u * c, 4);
++        v = (v >> 8) | (v << 24);
++        memcpy(dst + 4u * c, &v, 4);
++    }
++}
++
++/* Whether the guest bytes of [x, y, w, h] in `s` are known to equal the
++ * surface's: inside the rectangle guest_wrote last pushed, nothing drawn since,
++ * and the guest bytes unchanged since (compared against the copy taken then).
++ * A readback there would store the very bytes already in guest memory. */
++static int eng_guest_clean(const eng_surface* s, u32 location, u32 offset, u32 pitch,
++                           u32 x, u32 y, u32 w, u32 h)
++{
++    if (!s->clean_bytes || s->clean_serial != s->color_serial || s->guest_dirty ||
++        x < s->clean_x || y < s->clean_y ||
++        x + w > s->clean_x + s->clean_w || y + h > s->clean_y + s->clean_h)
++        return 0;
++    for (u32 r = 0; r < h; r++) {
++        const u8* g8 = eng_guest_ptr(NULL, location, offset + r * pitch, w * 4u);
++        if (!g8) return 0;
++        const u8* c8 = s->clean_bytes +
++                       ((size_t)(y - s->clean_y + r) * s->clean_w + (x - s->clean_x)) * 4u;
++        if (memcmp(g8, c8, (size_t)w * 4u)) return 0;
++    }
++    return 1;
++}
++
+ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
+ {
+     if (!g.ready || !g.be->readback || !pitch || !w || !h) return;
+@@ -872,6 +927,13 @@
+     const eng_surface* s = &g.surfaces[slot];
+     if (x + w > s->w) w = s->w - x;
+     if (y + h > s->h) h = s->h - y;
++    /* Tokyo Jungle copies a buffer into its scene target and straight back
++     * out again every frame: the second copy's readback (a GPU flush and
++     * wait) would only store what is already there. RSX_ENGINE_CLEAN_SKIP=0
++     * reads back anyway. */
++    { static int on = -1;
++      if (on < 0) { const char* e = getenv("RSX_ENGINE_CLEAN_SKIP"); on = e ? atoi(e) : 1; }
++      if (on && eng_guest_clean(s, location, offset, pitch, x, y, w, h)) return; }
+     u8* rows = eng_coherence_buffer(w * 4u * h);
+     if (!rows) return;
+     g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+@@ -884,11 +946,7 @@
+     for (u32 r = 0; r < h; r++) {
+         u8* dst = (u8*)eng_guest_ptr(NULL, location, offset + r * pitch, w * 4u);
+         if (!dst) return;
+-        const u8* src = rows + (size_t)r * w * 4u;
+-        for (u32 c = 0; c < w; c++, src += 4, dst += 4) {
+-            if (rgba) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3]; }
+-            else      { dst[0] = src[3]; dst[1] = src[0]; dst[2] = src[1]; dst[3] = src[2]; }
+-        }
++        eng_rgba_to_guest(dst, rows + (size_t)r * w * 4u, w, rgba);
+     }
+ }
+ 
+@@ -903,20 +961,32 @@
+                     location, offset, w, h);
+         return;
+     }
+-    const eng_surface* s = &g.surfaces[slot];
++    eng_surface* s = &g.surfaces[slot];
+     if (x + w > s->w) w = s->w - x;
+     if (y + h > s->h) h = s->h - y;
+     u8* rows = eng_coherence_buffer(w * 4u * h);
+     if (!rows) return;
+     const int rgba = rsx_texture_argb_is_rgba();
++    /* Keep the guest bytes pushed here: until something draws into the
++     * surface, guest_read of this rectangle can be skipped while the guest
++     * still holds them (eng_guest_clean). */
++    const u32 cbytes = w * 4u * h;
++    if (s->clean_cap < cbytes) {
++        u8* n = (u8*)realloc(s->clean_bytes, cbytes);
++        if (n) { s->clean_bytes = n; s->clean_cap = cbytes; }
++    }
++    const int keep = s->clean_cap >= cbytes;
+     for (u32 r = 0; r < h; r++) {
+         const u8* src = eng_guest_ptr(NULL, location, offset + r * pitch, w * 4u);
+-        if (!src) return;
+-        u8* dst = rows + (size_t)r * w * 4u;
+-        for (u32 c = 0; c < w; c++, src += 4, dst += 4) {
+-            if (rgba) { dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3]; }
+-            else      { dst[0] = src[1]; dst[1] = src[2]; dst[2] = src[3]; dst[3] = src[0]; }
+-        }
++        if (!src) { s->clean_w = 0; return; }
++        if (keep) memcpy(s->clean_bytes + (size_t)r * w * 4u, src, (size_t)w * 4u);
++        eng_guest_to_rgba(rows + (size_t)r * w * 4u, src, w, rgba);
++    }
++    if (keep) {
++        s->clean_x = x; s->clean_y = y; s->clean_w = w; s->clean_h = h;
++        s->clean_serial = s->color_serial;
++    } else {
++        s->clean_w = 0;
+     }
+     if (eng_coherence_log())
+         fprintf(stderr, "[rsx engine] guest_wrote %u:0x%08X %ux%u -> surface 0x%08X at %u,%u:"
