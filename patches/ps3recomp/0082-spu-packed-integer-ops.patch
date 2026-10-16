@@ -1,6 +1,20 @@
-SPU packed high-half multiplies and whole-vector bit shifts (candidate)
+SPU packed high-half multiplies and whole-vector bit shifts (Codex)
 
-Exact integer SIMD paths; requires review, op/function tests and gameplay visual A/B.
+Three high-half multiplies and six quadword bit shifts/rotates use exact
+SSE4.1 integer operations; scalar paths and feature gates remain unchanged.
+No runtime decoding, interpreter, JIT or instruction stepping is added.
+
+Independent review: review_spu. Clang and GCC each passed 2M vectors per
+helper (18M each), including signed edge cases and all immediate counts.
+Image 9 differential harness: 743 functions + 23 counted loops identical;
+four functions remain outside the harness coverage. No-emulation guard OK.
+
+Gameplay: image9-only 32.63 -> 34.27 flips/s (+5.0%, sequential; candidate
+partly overlapped compilation). All-18-image matched concurrent comparison:
+26.57 -> 26.90 (+1.2%). These indicate a modest, load-dependent improvement,
+not a guaranteed 5% gain. Both comparisons: 0 FATAL / LIFT-GAP. Full street
+and enlarged Pomeranian comparisons reviewed with no visible regression.
+Archives: codex-base82-gpu, codex-int82, codex-base82-repeat, codex-all82.
 
 --- a/runtime/spu/spu_helpers.h
 +++ b/runtime/spu/spu_helpers.h
