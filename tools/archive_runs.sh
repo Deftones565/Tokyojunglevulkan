@@ -50,7 +50,7 @@ for n in "${runs[@]}"; do
     if [ -n "$why" ]; then echo "skip     $n ($why)"; skip_n=$((skip_n + 1)); continue; fi
 
     tmp="$A/.$n.tar.zst.part"
-    if ! tar -cf - "${members[@]}" | zstd -q -T0 -6 --long=27 -o "$tmp"; then
+    if ! tar -cf - "${members[@]}" | nice -n 19 zstd -q -T0 -6 --long=27 -o "$tmp"; then
         echo "FAILED   $n (tar/zstd); originals kept" >&2; rm -f "$tmp"; continue
     fi
     want=$(find "${members[@]}" | wc -l)
