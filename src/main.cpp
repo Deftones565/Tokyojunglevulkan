@@ -336,6 +336,25 @@ static void fps_overlay_update(void)
 static void fps_overlay_update(void) {}
 #endif
 
+/* Diagnostic telemetry, independent of screenshots and the FPS overlay.
+ * One record per second; the benchmark uses these exact monotonic timestamps
+ * and completed guest flip counts, never screenshot filenames. */
+static void perf_telemetry(void)
+{
+    static const char* path = getenv("TJ_PERF_FILE");
+    if (!path || !*path) return;
+    using clock = std::chrono::steady_clock;
+    static auto last = clock::now() - std::chrono::seconds(1);
+    const auto now = clock::now();
+    if (now - last < std::chrono::seconds(1)) return;
+    last = now;
+    static FILE* out = fopen(path, "w");
+    if (!out) return;
+    const double seconds = std::chrono::duration<double>(now.time_since_epoch()).count();
+    fprintf(out, "%.9f %u\n", seconds, cellGcm_flip_request_count());
+    fflush(out);
+}
+
 static DWORD WINAPI frame_clock(LPVOID)
 {
     const char* title = getenv("PS3_TITLE");
@@ -507,6 +526,7 @@ static DWORD WINAPI frame_clock(LPVOID)
             }
         }
         frame_dump_collect();
+        perf_telemetry();
     }
     return 0;
 }

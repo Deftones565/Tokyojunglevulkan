@@ -69,9 +69,13 @@ def main():
     ap.add_argument('--settle', type=float, default=15)
     ap.add_argument('--timeout', type=float, default=420, help='give up if no HUD by then')
     ap.add_argument('--no-prof', action='store_true')
+    ap.add_argument('--clean-timing', action='store_true',
+                    help='use native flip telemetry; pause dumps and disable sampling during timing')
     ap.add_argument('--keep-frames', action='store_true')
     ap.add_argument('env', nargs='*')
     a = ap.parse_args()
+    if a.clean_timing:
+        a.no_prof = True
     # SLOTS=<n> (default 2): how many game instances may already be running.
     slots = int(os.environ.get('SLOTS', '2'))
     if int(subprocess.run('pgrep -x tokyojungle | wc -l', shell=True, capture_output=True, text=True).stdout) >= slots:
@@ -79,6 +83,7 @@ def main():
     out = f'{R}/build-runs/{a.name}'; log = out + '.txt'
     shutil.rmtree(out, ignore_errors=True)
     fd, cwd, pad, gate = out + '/frames', out + '/cwd', out + '/pad.txt', out + '/gate'
+    telemetry, dump_pause = out + '/flips.txt', out + '/pause-dumps'
     os.makedirs(fd); os.makedirs(cwd); open(pad, 'w').close()
     so = R + '/build-runs/sigprof.so'
     if not os.path.exists(so) or os.path.getmtime(so) < os.path.getmtime(R + '/tools/prof/sigprof.c'):
@@ -86,20 +91,41 @@ def main():
     env = dict(os.environ, PS3_VERBOSE='0', TJ_HEADLESS='1', SDL_AUDIODRIVER='dummy', TJ_TICK_STATS='1',
                GCM_WAIT_STATS='1', TJ_RUN_DIR=out + '/vfs', PAD_FILE=pad, TJ_FRAME_DUMP=fd,
                TJ_FRAME_DUMP_EVERY='15', TJ_FRAME_DUMP_MAX='100000')
+    if a.no_prof:
+        env.pop('LD_PRELOAD', None)
+        for k in list(env):
+            if k.startswith('PROF_'): del env[k]
+    if a.clean_timing:
+        env.update(TJ_PERF_FILE=telemetry, TJ_FRAME_DUMP_PAUSE_FILE=dump_pause)
     if not a.no_prof:
         env.update(PROF_OUT=out + '/prof.bin', PROF_WALL_HZ='200', PROF_GATE=gate, LD_PRELOAD=so)
     for kv in a.env:
         k, v = kv.split('=', 1); env[k] = v
+    if a.clean_timing:
+        # Explicit VAR=value arguments must not silently undo clean timing.
+        env.pop('LD_PRELOAD', None)
+        for k in list(env):
+            if k.startswith('PROF_'): del env[k]
+        env.update(TJ_PERF_FILE=telemetry, TJ_FRAME_DUMP_PAUSE_FILE=dump_pause)
     # The profile is symbolised against the binary: keep the exact one that ran
     # (a rebuilt build dir would otherwise give wrong names).
-    if not a.no_prof:
-        shutil.copy2(os.path.realpath(a.binary), out + '/tokyojungle')
+    shutil.copy2(os.path.realpath(a.binary), out + '/tokyojungle')
     say(f'RUN start: {a.name} ({a.binary}, closed-loop gameplay perf, scratch CWD) {" ".join(a.env)}')
     logf = open(log, 'wb')
     p = subprocess.Popen([os.path.realpath(a.binary), R + '/input/EBOOT.ELF'], cwd=cwd, env=env,
                          stdout=logf, stderr=subprocess.STDOUT)
     t0 = time.time(); last_press = 0; n_press = 0; loading_t = None; hud_t = None; hud_frame = None
     started_skip = False; result = 'no HUD'
+    clean_started = None; clean_first = None
+
+    def latest_flip():
+        try:
+            data = open(telemetry).read()
+            lines = data[:data.rfind('\n')].splitlines()
+            t, f = lines[-1].split()
+            return float(t), int(f)
+        except (OSError, ValueError, IndexError):
+            return None
 
     def press(m):
         nonlocal last_press, n_press
@@ -135,6 +161,31 @@ def main():
                     press(CROSS)
                 continue
             if now - hud_t < a.settle: continue
+            if a.clean_timing:
+                if now - hud_t > a.settle + a.measure + 30:
+                    raise RuntimeError('clean measurement stalled after reaching gameplay')
+                if clean_started is None:
+                    open(dump_pause, 'w').close()
+                    clean_started = time.monotonic()
+                sample = latest_flip()
+                # Allow any in-progress screenshot to finish before timing.
+                if sample is None or sample[0] < clean_started + 2:
+                    if time.monotonic() - clean_started > 10:
+                        raise RuntimeError('native flip telemetry missing: use a build with TJ_PERF_FILE support')
+                    continue
+                if clean_first is None:
+                    clean_first = sample
+                    clean_frame_count = len(fs)
+                if sample[0] - clean_first[0] >= a.measure:
+                    if len(fs) != clean_frame_count:
+                        raise RuntimeError('screenshots were dumped during the clean timing window')
+                    dt = sample[0] - clean_first[0]
+                    result = f'{(sample[1] - clean_first[1]) / dt:.2f} flips/s over flips {clean_first[1]}..{sample[1]} ({dt:.3f} s; native telemetry, no dumps/profiler)'
+                    os.unlink(dump_pause)
+                    # Capture a post-window validation frame, outside timing.
+                    time.sleep(2)
+                    break
+                continue
             if not os.path.exists(gate):
                 open(gate, 'w').close(); w0 = (now, fs[-1][0] if fs else 0)
             if now - w0[0] >= a.measure:
