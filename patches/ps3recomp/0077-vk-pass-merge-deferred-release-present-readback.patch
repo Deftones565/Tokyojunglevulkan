@@ -12,6 +12,7 @@ Drain profile mg5-p2/mg5-vw1 (Survival tutorial street): the FIFO thread waited 
    are dumped (nothing else reads them; rsx_vulkan_backend_readback_center asks the engine). This one was
    waiting for every frame's whole render: fence wait 380 -> 127 ms/s (mg5-st1).
 4. VK_WAIT_STATS=1 (diag): fence-wait ms, submits, draws, passes per second and a wait-length histogram.
+Reviewed by MAGI-6 (graveyard emptied at shutdown, per review).
 
 --- a/libs/video/rsx_vulkan_backend.c
 +++ b/libs/video/rsx_vulkan_backend.c
@@ -206,7 +207,16 @@ Drain profile mg5-p2/mg5-vw1 (Survival tutorial street): the FIFO thread waited 
      memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
  }
  
-@@ -4181,18 +4282,25 @@
+@@ -3799,6 +3900,8 @@
+     vk_destroy_buffer(&s_bs.i);
+     vk_destroy_buffer(&s_bs.u);
+     vk_destroy_buffer(&s_bst); s_bst_off = 0;
++    vk_batch_flush();
++    vk_graveyard_empty();            /* images released since the last flush */
+     if (s_bs.pool) pvkDestroyDescriptorPool(s_vk.device, s_bs.pool, NULL);
+     free(s_bs.vsc); free(s_bs.psc);
+     memset(&s_bs, 0, sizeof s_bs);
+@@ -4181,18 +4284,25 @@
          if (vk_begin()) return;
          s_batch.open = 1;
      }
@@ -244,7 +254,7 @@ Drain profile mg5-p2/mg5-vw1 (Survival tutorial street): the FIFO thread waited 
      pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
      VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
      if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
-@@ -4225,8 +4333,9 @@
+@@ -4225,8 +4335,9 @@
      } else {
          pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
      }

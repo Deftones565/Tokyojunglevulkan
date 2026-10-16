@@ -15,10 +15,12 @@ SPURS: a JOBLIST's jobs run on a pool of host threads; a job's local store is bu
 A/B with 0077 (mg5-r1 vs mg5-r0 = build/ 0001-0074+0076, simultaneous, 60 s gameplay via
 tools/prof/drive_gameplay.py): 27.28 vs 24.06 flips/s (+13%); 0 FATAL, 0 LIFT-GAP; street frames
 match (mean |diff| 0.6, wolf positions/HUD counters); close-up matches.
+Review fix (MAGI-6): a batch counts the pool workers inside it (b->active, under s_jl_lock); the walker
+unlinks it from its stack only when done == n and active == 0.
 
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -2656,6 +2656,137 @@
+@@ -2656,6 +2656,147 @@
      }
  }
  
@@ -48,6 +50,12 @@ match (mean |diff| 0.6, wolf positions/HUD counters); close-up matches.
 +    int idx0;
 +    volatile long next;        /* next job index to claim   */
 +    volatile long done;        /* jobs finished             */
++    long active;               /* pool workers inside jl_drain(b); s_jl_lock.
++                                * The batch lives on the walker's stack: it is
++                                * unlinked only when done == n AND active == 0,
++                                * so no worker can touch it afterwards (a
++                                * worker's last claim attempt, or one that
++                                * picked it just as the others finished). */
 +    jl_result* res;
 +    struct jl_batch* link;
 +} jl_batch;
@@ -93,9 +101,12 @@ match (mean |diff| 0.6, wolf positions/HUD counters); close-up matches.
 +        jl_batch* b = s_jl_head;
 +        while (b && b->next >= (long)b->n) b = b->link;
 +        if (!b) { SleepConditionVariableSRW(&s_jl_work, &s_jl_lock, INFINITE, 0); continue; }
++        b->active++;
 +        ReleaseSRWLockExclusive(&s_jl_lock);
 +        jl_drain(b);
 +        AcquireSRWLockExclusive(&s_jl_lock);
++        if (--b->active == 0 && b->done >= (long)b->n)
++            WakeAllConditionVariable(&s_jl_fin);
 +    }
 +    return 0;
 +}
@@ -138,7 +149,8 @@ match (mean |diff| 0.6, wolf positions/HUD counters); close-up matches.
 +    ReleaseSRWLockExclusive(&s_jl_lock);
 +    jl_drain(&b);
 +    AcquireSRWLockExclusive(&s_jl_lock);
-+    while (b.done < (long)n) SleepConditionVariableSRW(&s_jl_fin, &s_jl_lock, INFINITE, 0);
++    while (b.done < (long)n || b.active > 0)
++        SleepConditionVariableSRW(&s_jl_fin, &s_jl_lock, INFINITE, 0);
 +    jl_batch** pp = &s_jl_head;
 +    while (*pp != &b) pp = &(*pp)->link;
 +    *pp = b.link;
@@ -156,7 +168,7 @@ match (mean |diff| 0.6, wolf positions/HUD counters); close-up matches.
  static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
  {
      u32 pc = entry_ea, ret_pc = 0;
-@@ -2708,7 +2839,17 @@
+@@ -2708,7 +2849,17 @@
                if (t) fprintf(stderr, "[jc-trace] chain 0x%08X JOBLIST @0x%08X n=%u size=%u list=0x%08X\n",
                               jc_ea, jl, n, size, list); }
              if (n == 0) { pc += 8; continue; }    /* an empty list is valid: nothing to run */
