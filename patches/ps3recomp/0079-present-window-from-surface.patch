@@ -1,4 +1,4 @@
-Engine present: the display image is filled only for a dumped present; the window takes the frame from the surface (MAGI-6)
+Engine present: the display image is filled only for a dumped present; the window takes the frame from the surface (MAGI-6; reviewed by MAGI-5)
 
 0077 made vk_cb_present skip its full-frame readback unless the present is
 dumped, which left the copy feeding that readback -- vk_eng_present's blit of
