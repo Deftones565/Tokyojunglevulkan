@@ -163,6 +163,8 @@ extern "C" void rsx_vulkan_backend_present(void);
 extern "C" int  rsx_vulkan_backend_pump_messages(void);
 extern "C" void rsx_vulkan_backend_set_overlay(const char* text);
 #  define RSX_BACKEND_OVERLAY rsx_vulkan_backend_set_overlay
+extern "C" void rsx_vulkan_backend_kick(void);
+#  define RSX_BACKEND_KICK    rsx_vulkan_backend_kick
 #  define rsx_backend_init    rsx_vulkan_backend_init
 #  define rsx_backend_present rsx_vulkan_backend_present
 #  define rsx_backend_pump    rsx_vulkan_backend_pump_messages
@@ -185,6 +187,9 @@ extern "C" int  rsx_null_backend_pump_messages(void);
  * smaller arena makes every spawned thread's stack access out of bounds. */
 #define VM_SIZE       0x100010000ull   /* the full 32-bit guest space + a 64K guard */
 #define STACK_TOP     0x0FF00000u      /* main-thread stack, below the 0x10000000 segment */
+#ifndef RSX_BACKEND_KICK
+#  define RSX_BACKEND_KICK() ((void)0)
+#endif
 #define WINDOW_WIDTH  1280
 #define WINDOW_HEIGHT 720
 
@@ -455,6 +460,7 @@ static DWORD WINAPI frame_clock(LPVOID)
             }
             vclock::time_point t1 = tick_stats ? vclock::now() : vclock::time_point();
             cellGcm_rsx_process_fifo();
+            RSX_BACKEND_KICK();      /* the GPU starts on this pass's draws now */
             if (vm_base) { drained_put = ctrl_word(0); drained_get = ctrl_word(4); }
             if (tick_stats) {
                 static double pmax, fmax, psum, fsum; static unsigned long n, slow;
