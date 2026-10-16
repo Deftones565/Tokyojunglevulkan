@@ -41,7 +41,7 @@ chunk_lines = 300000
 
 [graphics]
 # Chosen at build time: Vulkan on Linux (TJ_VULKAN, on by default), D3D12 on
-# Windows. Native output is 1280x720 at a 30 fps target.
+# Windows. Native output is 1280x720; gameplay runs at 60 fps on a real PS3 (USER checked, 2026-10-16).
 backend = "vulkan"
 width = 1280
 height = 720

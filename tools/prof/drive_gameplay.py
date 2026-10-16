@@ -21,7 +21,8 @@ This drives the game with PAD_FILE instead and looks at what is on screen:
 The Pomeranian stands on the tutorial street with wolves walking about: the
 same scene the 11-press script measured, reached reliably.
 
-Output: build-runs/<run>.txt (log), build-runs/<run>/prof.bin, and
+Output: build-runs/<run>.txt (log), build-runs/<run>/prof.bin (+ the binary that ran,
+build-runs/<run>/tokyojungle, to symbolise it with), and
 build-runs/<run>/result.txt (flips/s in the window, waits, FATAL count). Frame
 dumps are deleted at the end except the first HUD frame and the last frame,
 unless --keep-frames. Extra VAR=value arguments go into the game's environment.
@@ -83,6 +84,10 @@ def main():
         env.update(PROF_OUT=out + '/prof.bin', PROF_WALL_HZ='200', PROF_GATE=gate, LD_PRELOAD=so)
     for kv in a.env:
         k, v = kv.split('=', 1); env[k] = v
+    # The profile is symbolised against the binary: keep the exact one that ran
+    # (a rebuilt build dir would otherwise give wrong names).
+    if not a.no_prof:
+        shutil.copy2(os.path.realpath(a.binary), out + '/tokyojungle')
     say(f'RUN start: {a.name} ({a.binary}, closed-loop gameplay perf, scratch CWD) {" ".join(a.env)}')
     logf = open(log, 'wb')
     p = subprocess.Popen([os.path.realpath(a.binary), R + '/input/EBOOT.ELF'], cwd=cwd, env=env,
