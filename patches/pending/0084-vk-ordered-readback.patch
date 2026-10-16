@@ -1,0 +1,134 @@
+Ordered synchronous Vulkan readback: combine draws and copy into one wait (candidate).
+Reviewed by review_spu; private build and no-emulation guard pass.
+Clean sequential tests: baseline 43.98 and repeat 39.27 vs candidate 42.94 FPS.
+Candidate lies inside baseline spread; neither gain nor regression established.
+Street/character comparison is in archive/codex-rb84-b.tar.zst. DO NOT LAND
+without a repeatable clean benefit. PS3RECOMP_VK_READBACK_BATCH=0 restores
+the original Vulkan readback batching path for same-binary comparisons.
+
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -233,6 +233,10 @@
+      * DEPTH16); left NULL, such a texture reads guest memory as it is. */
+     int  (*depth_readback)(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+                            float* out, u32 out_pitch);
++    /* Optional capability: color/depth readbacks order all previously queued
++     * draws and synchronously finish their CPU copy. The engine can omit its
++     * separate pre-readback flush; other backends retain the old contract. */
++    int readback_orders_draws;
+ } rsx_draw_backend;
+ 
+ /* ---- the engine --------------------------------------------------------- */
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -936,7 +936,8 @@
+       if (on && eng_guest_clean(s, location, offset, pitch, x, y, w, h)) return; }
+     u8* rows = eng_coherence_buffer(w * 4u * h);
+     if (!rows) return;
+-    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
++    if (!g.be->readback_orders_draws)
++        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+     g.be->readback(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+     if (eng_coherence_log())
+         fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X at %u,%u:"
+@@ -1359,7 +1360,8 @@
+         s_depth_rows = n;
+         s_depth_cap = w * h;
+     }
+-    g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
++    if (!g.be->readback_orders_draws)
++        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+     if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, s_depth_rows,
+                              w * (u32)sizeof(float)) != 0)
+         return 0;
+@@ -2465,7 +2467,8 @@
+     FILE* f = (raw && rgb) ? fopen(path, "wb") : NULL;
+     if (f) {
+         memset(raw, 0, (size_t)s->w * s->h * bpp);
+-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
++        if (!g.be->readback_orders_draws)
++            g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+         g.be->readback(g.be->user, s->handle, 0, 0, s->w, s->h, raw, s->w * bpp);
+         for (size_t i = 0; i < (size_t)s->w * s->h; i++) {
+             const u8* p = raw + i * bpp;
+@@ -2508,7 +2511,8 @@
+     u8* px = (u8*)malloc((size_t)w * h);
+     FILE* f = (d && px) ? fopen(path, "wb") : NULL;
+     if (f) {
+-        g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
++        if (!g.be->readback_orders_draws)
++            g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
+         if (g.be->depth_readback(g.be->user, z->handle, 0, 0, w, h, d, w * 4u) == 0) {
+             float lo = 1.0f, hi = 0.0f;
+             for (size_t i = 0; i < (size_t)w * h; i++) {
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -3174,6 +3174,24 @@
+     vk_eng_obj_write(o, x, y, w, h, rows, row_bytes);
+ }
+ 
++/* Append the transfer after queued draws, then wait ONCE for both. This
++ * retains CPU-visible ordering while avoiding a separate draw-only wait.
++ * PS3RECOMP_VK_READBACK_BATCH=0 restores the old two-submission sequence. */
++static int vk_readback_batched(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_READBACK_BATCH"); on = !e || *e != '0'; }
++    return on;
++}
++static int vk_readback_begin(void)
++{
++    return vk_readback_batched() ? vk_rec_begin() : vk_begin();
++}
++static int vk_readback_finish(void)
++{
++    return vk_readback_batched() && !vk_batching_off() ? vk_batch_flush() : vk_submit_and_wait();
++}
++
+ static void vk_eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                             void* out, u32 out_pitch)
+ {
+@@ -3196,7 +3214,7 @@
+         if (!t || vk_rs_blit(o->im.img, sr, t->img, dr, VK_FILTER_LINEAR)) return;
+         from = t->img; fx = fy = 0;
+     }
+-    if (!vk_begin()) {
++    if (!vk_readback_begin()) {
+         vk_barrier_image(from, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+         VkBufferImageCopy region = {
+             .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+@@ -3211,7 +3229,7 @@
+         };
+         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                               0, 0, NULL, 1, &hb, 0, NULL);
+-        if (!vk_submit_and_wait()) {
++        if (!vk_readback_finish()) {
+             vk_invalidate(&st);
+             for (u32 row = 0; row < h; row++)
+                 memcpy((u8*)out + (size_t)row * out_pitch, (const u8*)st.ptr + (size_t)row * tight, tight);
+@@ -3481,7 +3499,7 @@
+         vk_destroy_buffer(&s_stage_dn); return -1;
+     }
+     vk_buffer st = s_stage_dn;
+-    int rc = vk_begin();
++    int rc = vk_readback_begin();
+     if (!rc) {
+         vk_barrier_image(z->im.img, s_vk.depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
+         VkBufferImageCopy region = {
+@@ -3497,7 +3515,7 @@
+         };
+         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                               0, 0, NULL, 1, &hb, 0, NULL);
+-        rc = vk_submit_and_wait();
++        rc = vk_readback_finish();
+         if (!rc && !scaled) {
+             vk_invalidate(&st);
+             for (u32 row = 0; row < h; row++)
+@@ -4475,6 +4493,7 @@
+     .present              = vk_eng_present,
+     .readback             = vk_eng_readback,
+     .depth_readback       = vk_eng_depth_readback,
++    .readback_orders_draws = 1,
+     .color_target_write   = vk_eng_color_target_write,
+ };
+ 
