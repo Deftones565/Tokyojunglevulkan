@@ -33,9 +33,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('prof'); ap.add_argument('binary')
     ap.add_argument('--thread-has'); ap.add_argument('--under'); ap.add_argument('--top', type=int, default=40)
+    ap.add_argument('--as', dest='as_path', help='path the profiled binary ran from (when BINARY is a copy)')
     a = ap.parse_args()
     maps, recs = load(a.prof)
-    binreal = os.path.realpath(a.binary)
+    # --as: the path the profiled process ran the binary from, when `binary`
+    # is a saved copy of it (drive_gameplay.py keeps one per run).
+    binreal = os.path.realpath(a.as_path or a.binary)
     def to_off(pc):
         for lo, hi, off, path in maps:
             if lo <= pc < hi:

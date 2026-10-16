@@ -19,9 +19,12 @@ def main():
     ap.add_argument('--depth', type=int, default=3)
     ap.add_argument('--min-pct', type=float, default=2.0)
     ap.add_argument('--filter')
+    ap.add_argument('--as', dest='as_path', help='path the profiled binary ran from (when BINARY is a copy)')
     a = ap.parse_args()
     maps, recs = report.load(a.prof)
-    binreal = os.path.realpath(a.binary)
+    # --as: the path the profiled process ran the binary from, when `binary`
+    # is a saved copy of it (drive_gameplay.py keeps one per run).
+    binreal = os.path.realpath(a.as_path or a.binary)
 
     def to_off(pc):
         for lo, hi, off, path in maps:
