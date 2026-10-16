@@ -1,4 +1,4 @@
-Vulkan window text overlay: rsx_vulkan_backend_set_overlay (CASPER-3)
+Vulkan window text overlay: rsx_vulkan_backend_set_overlay (CASPER-3; landed unreviewed on the user's order)
 
 USER asked for an on-screen frame-rate readout. rsx_vulkan_backend_set_overlay(text)
 draws a short line (digits . - F P S) in the window's top-right corner: white
