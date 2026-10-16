@@ -12,7 +12,8 @@ This drives the game with PAD_FILE instead and looks at what is on screen:
      START alternately every 3 s (logos, title "press START", main menu with
      SURVIVAL highlighted);
   2. then CROSS every 3 s (intro movie, ~13 tutorial prompts); START once if
-     the HUD has not shown 60 s later (skips the movie);
+     the HUD has not shown 60 s later (skips the movie; if it opened the
+     tutorial's pause dialog instead, a CROSS once the HUD shows picks No);
   3. once the HUD shows (LIFE bar blue, STAMINA bar red at their screen
      positions): no more input. After --settle s the window opens: the
      wall-clock profile gate (tools/prof/sigprof.c PROF_WALL_HZ=200,
@@ -113,6 +114,12 @@ def main():
                 if fs and len(fs) > 1 and is_hud(os.path.join(fd, fs[-2][1])):
                     hud_t = now; hud_frame = fs[-2]
                     print(f'HUD at t={now - t0:.0f}s flip {hud_frame[0]}', flush=True)
+                    # A START that skipped the movie may instead have opened the
+                    # tutorial's pause dialog ("Exit the tutorial?", No
+                    # highlighted) over the HUD (mg5-post77 measured a paused
+                    # game). CROSS picks No; in plain gameplay it is harmless.
+                    if started_skip:
+                        time.sleep(1.0); press(CROSS)
                     continue
                 if now - t0 < 20 or now - last_press < 3: continue
                 if loading_t is None:
