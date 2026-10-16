@@ -1,0 +1,51 @@
+Engine present: the display image is filled only for a dumped present; the window takes the frame from the surface (MAGI-6)
+
+0077 made vk_cb_present skip its full-frame readback unless the present is
+dumped, which left the copy feeding that readback -- vk_eng_present's blit of
+the presented surface into the guest-sized display image, a vk_begin (batch
+flush) plus a submit-and-wait of its own -- running every frame for nothing
+(MAGI-6's review nit on 0077). Now the blit runs only for a present that will
+be dumped (same test as vk_cb_present: dump_path and (presented + 1) %
+dump_every == 0), and vk_present_window always blits the window from the
+surface itself (s_disp.src, already used at render scales != 1/1 since 0076).
+At 1/1 the window gets the same pixels: the display image was a NEAREST copy
+of the same-size surface. The early-boot presents before the first flip and
+the PS3RECOMP_VK_HOLD loop still show the display image.
+
+Checked: build-runs/mg6-pres1 (windowed XWayland, TJ_FRAME_DUMP_EVERY=200):
+the window shot and the dumped frame both show the correct gameplay frame;
+0 FATAL, 0 LIFT-GAP; check_no_emulation OK. Perf not measured yet.
+
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index c83847c..8136166 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -3039,7 +3039,12 @@ static void vk_eng_present(void* user, u32 surface)
+ {
+     (void)user;
+     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+-    if (o && !vk_begin()) {
++    /* The display image is read only by a frame dump (vk_cb_present reads
++     * back nothing else on the engine path), so the surface is copied into it
++     * only for a present that will be dumped; the window takes the frame
++     * straight from the surface. That copy was a submit-and-wait per frame. */
++    const int dump = s_vk.dump_path && ((s_vk.presented + 1u) % s_vk.dump_every) == 0;
++    if (o && dump && !vk_begin()) {
+         vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+         vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+         VkImageBlit blit = {
+@@ -3054,10 +3059,10 @@ static void vk_eng_present(void* user, u32 surface)
+                                                                       : VK_FILTER_LINEAR);
+         vk_submit_and_wait();
+     }
+-    /* Scaled: the window takes the frame from the surface itself, at its full
+-     * size; the guest-sized display image above stays what the readback and
+-     * frame dumps see. */
+-    if (o && rs_on()) {
++    /* The window takes the frame from the surface itself, at its full size
++     * (the render scale's); the guest-sized display image stays what frame
++     * dumps see. */
++    if (o) {
+         s_disp.src = o->im.img; s_disp.src_w = o->iw; s_disp.src_h = o->ih;
+     }
+     vk_cb_present(&s_vk, 0);
