@@ -1,0 +1,135 @@
+SPU packed high-half multiplies and whole-vector bit shifts (candidate)
+
+Exact integer SIMD paths; requires review, op/function tests and gameplay visual A/B.
+
+--- a/runtime/spu/spu_helpers.h
++++ b/runtime/spu/spu_helpers.h
+@@ -480,14 +480,37 @@
+  * word1<<32, but SPU's MS half is word0<<32 | word1), so native shifts on them
+  * corrupt any bits crossing a 32-bit boundary. Assemble the logical hi/lo halves
+  * with _u32[0] as most-significant, shift, then disassemble. */
++#ifdef SPU_SIMD_X86
++/* Carry bits across guest words, not host uint64 halves. SSE shifts by 32
++ * produce zero, which also makes count zero an exact identity. */
++SPU_HOT u128 spu__qbit_left(u128 a, unsigned sh, int rotate) {
++    const __m128i v=spu__mi(a);
++    const __m128i next=rotate ? _mm_shuffle_epi32(v, _MM_SHUFFLE(0,3,2,1)) : _mm_srli_si128(v,4);
++    return spu__um(_mm_or_si128(_mm_sll_epi32(v,_mm_cvtsi32_si128(sh)),
++                               _mm_srl_epi32(next,_mm_cvtsi32_si128(32-sh))));
++}
++SPU_HOT u128 spu__qbit_right(u128 a, unsigned sh) {
++    const __m128i v=spu__mi(a);
++    return spu__um(_mm_or_si128(_mm_srl_epi32(v,_mm_cvtsi32_si128(sh)),
++                               _mm_sll_epi32(_mm_slli_si128(v,4),_mm_cvtsi32_si128(32-sh))));
++}
++#endif
++#ifdef SPU_SIMD_X86
++SPU_HOT u128 spu_shlqbii(u128 a, int sh) { return spu__qbit_left(a,(unsigned)sh&7,0); }
++#else
+ static inline u128 spu_shlqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
+     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh);
+     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
++#endif
++#ifdef SPU_SIMD_X86
++SPU_HOT u128 spu_rotqbii(u128 a, int sh) { return spu__qbit_left(a,(unsigned)sh&7,1); }
++#else
+ static inline u128 spu_rotqbii(u128 a, int sh) { sh&=7; if(!sh) return a;
+     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
+     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
++#endif
+ 
+ /* ---- single-precision float (4 lanes) ---- */
+ /* ---- single-precision float: SPU semantics ----
+@@ -720,7 +743,13 @@
+ static inline u128 spu_fesd(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) spu__dset(&r,i,(double)a._f32[i*2]); return r; }
+ static inline u128 spu_frds(u128 a) { u128 r; memset(&r,0,sizeof r); for(int i=0;i<2;i++) r._f32[i*2]=(float)spu__dget(a,i); return r; }
+ /* mpyhhu: high-16 x high-16 of each word, unsigned, full 32-bit product. */
++#ifdef SPU_SIMD_X86
++SPU_HOT u128 spu_mpyhhu(u128 a, u128 b) {
++    return spu__um(_mm_mullo_epi32(_mm_srli_epi32(spu__mi(a),16), _mm_srli_epi32(spu__mi(b),16)));
++}
++#else
+ static inline u128 spu_mpyhhu(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i+1]*(uint32_t)b._u16[2*i+1]; return r; }
++#endif
+ /* cgx: extended carry-generate, carry-in = low bit of old rt (RPCS3 CGX). */
+ static inline u128 spu_cgx(u128 a, u128 b, u128 t){ u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)(((uint64_t)(t._u32[i]&1u)+a._u32[i]+b._u32[i])>>32); return r; }
+ 
+@@ -750,14 +779,22 @@
+ static inline u128 spu_shlh(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=b._u16[i]&0x1F; r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]<<sh); } return r; }
+ static inline u128 spu_rot(u128 a, u128 b)   { u128 r; for(int i=0;i<4;i++){ uint32_t sh=b._u32[i]&31; r._u32[i]= sh ? ((a._u32[i]<<sh)|(a._u32[i]>>(32-sh))) : a._u32[i]; } return r; }
+ static inline u128 spu_roth(u128 a, u128 b)  { u128 r; for(int i=0;i<8;i++){ uint32_t sh=b._u16[i]&15; r._u16[i]= sh ? (uint16_t)((a._u16[i]<<sh)|(a._u16[i]>>(16-sh))) : a._u16[i]; } return r; }
++#ifdef SPU_SIMD_X86
++SPU_HOT u128 spu_shlqbi(u128 a, u128 b) { return spu__qbit_left(a,b._u32[0]&7,0); }
++#else
+ static inline u128 spu_shlqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) return a;
+     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh);
+     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
++#endif
++#ifdef SPU_SIMD_X86
++SPU_HOT u128 spu_rotqbi(u128 a, u128 b) { return spu__qbit_left(a,b._u32[0]&7,1); }
++#else
+ static inline u128 spu_rotqbi(u128 a, u128 b){ int sh=b._u32[0]&7; if(!sh) return a;
+     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+     uint64_t nhi=(hi<<sh)|(lo>>(64-sh)), nlo=(lo<<sh)|(hi>>(64-sh));
+     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
++#endif
+ #ifdef SPU_SIMD_X86
+ SPU_HOT u128 spu_shlqby(u128 a, u128 b){ return spu__qshl(a, b._u32[0]&0x1F); }
+ SPU_HOT u128 spu_rotqby(u128 a, u128 b){ return spu__qrot(a, b._u32[0]&0x0F); }
+@@ -853,8 +890,23 @@
+ static inline u128 spu_addx(u128 a, u128 b, u128 t) { u128 r; for(int i=0;i<4;i++) r._u32[i]=a._u32[i]+b._u32[i]+(t._u32[i]&1); return r; }
+ #endif
+ /* LE host: high half of word i = _s16[2i+1], low half = _s16[2i]. */
++#ifdef SPU_SIMD_X86
++/* Only the low 16 product bits survive the left shift, so signedness
++ * does not affect the result. Keep the wrapping behavior of the scalar path. */
++SPU_HOT u128 spu_mpyh(u128 a, u128 b) {
++    return spu__um(_mm_slli_epi32(_mm_mullo_epi16(_mm_srli_epi32(spu__mi(a),16), spu__mi(b)),16));
++}
++#else
+ static inline u128 spu_mpyh(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)((int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i]) << 16; return r; }
++#endif
++#ifdef SPU_SIMD_X86
++SPU_HOT u128 spu_mpyhh(u128 a, u128 b) {
++    /* Each shifted dword contains one signed halfword and one zero. */
++    return spu__um(_mm_madd_epi16(_mm_srli_epi32(spu__mi(a),16), _mm_srli_epi32(spu__mi(b),16)));
++}
++#else
+ static inline u128 spu_mpyhh(u128 a, u128 b){ u128 r; for(int i=0;i<4;i++) r._s32[i]=(int32_t)a._s16[2*i+1] * (int32_t)b._s16[2*i+1]; return r; }
++#endif
+ static inline u128 spu_mpys(u128 a, u128 b) { u128 r; for(int i=0;i<4;i++){ int32_t p=(int32_t)a._s16[2*i]*(int32_t)b._s16[2*i]; r._s32[i]=(int16_t)(p>>16); } return r; }
+ static inline u128 spu_mpyui(u128 a, int32_t imm) { u128 r; for(int i=0;i<4;i++) r._u32[i]=(uint32_t)a._u16[2*i]*(uint32_t)(uint16_t)imm; return r; }
+ static const uint32_t spu_frest_fraction_lut[32] = {
+@@ -1042,10 +1094,14 @@
+ #else
+ static inline u128 spu_rothmi(u128 a, int i7) { u128 r; int sh=(0-i7)&0x1F; for(int i=0;i<8;i++) r._u16[i]=(sh>15)?0:(uint16_t)(a._u16[i]>>sh); return r; }
+ #endif
++#ifdef SPU_SIMD_X86
++SPU_HOT u128 spu_rotqmbi(u128 a, u128 b) { return spu__qbit_right(a,(0u-b._u32[0])&7); }
++#else
+ static inline u128 spu_rotqmbi(u128 a, u128 b)   { int sh=(0-(int)b._u32[0])&7; if(!sh) return a;
+     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+     uint64_t nlo=(lo>>sh)|(hi<<(64-sh)), nhi=(hi>>sh);
+     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
++#endif
+ #ifdef SPU_SIMD_X86
+ SPU_HOT u128 spu_rotqmby(u128 a, u128 b)   { return spu__qshr(a, (0-(int)b._u32[0])&0x1F); }
+ SPU_HOT u128 spu_rotqmbybi(u128 a, u128 b) { return spu__qshr(a, (0-((int)b._u32[0]>>3))&0x1F); }
+@@ -1053,10 +1109,14 @@
+ static inline u128 spu_rotqmby(u128 a, u128 b)   { int sh=(0-(int)b._u32[0])&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i-sh; if(s>=0) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
+ static inline u128 spu_rotqmbybi(u128 a, u128 b) { int sh=(0-((int)b._u32[0]>>3))&0x1F; u128 r=spu_zero(); if(sh>=16) return r; for(int i=0;i<16;i++){ int s=i-sh; if(s>=0) r._u8[SPU_W(i)]=a._u8[SPU_W(s)]; } return r; }
+ #endif
++#ifdef SPU_SIMD_X86
++SPU_HOT u128 spu_rotqmbii(u128 a, int i7) { return spu__qbit_right(a,(0u-(unsigned)i7)&7); }
++#else
+ static inline u128 spu_rotqmbii(u128 a, int i7)  { int sh=(0-i7)&7; if(!sh) return a;
+     uint64_t hi=((uint64_t)a._u32[0]<<32)|a._u32[1], lo=((uint64_t)a._u32[2]<<32)|a._u32[3];
+     uint64_t nlo=(lo>>sh)|(hi<<(64-sh)), nhi=(hi>>sh);
+     u128 r; r._u32[0]=(uint32_t)(nhi>>32); r._u32[1]=(uint32_t)nhi; r._u32[2]=(uint32_t)(nlo>>32); r._u32[3]=(uint32_t)nlo; return r; }
++#endif
+ #ifdef SPU_SIMD_X86
+ SPU_HOT u128 spu_rotqmbyi(u128 a, int i7)  { return spu__qshr(a, (0-i7)&0x1F); }
+ #else

@@ -35,7 +35,10 @@ CROSS, START = '0x4000', '0x0008'
 
 
 def say(msg):
-    subprocess.run([R + '/.agents/talk', 'say', os.environ['POSTER'], msg], stdout=subprocess.DEVNULL)
+    if os.environ.get('POSTER'):
+        subprocess.run([R + '/.agents/talk', 'say', os.environ['POSTER'], msg], stdout=subprocess.DEVNULL)
+    else:
+        print(msg, flush=True)
 
 
 def frames(d):
