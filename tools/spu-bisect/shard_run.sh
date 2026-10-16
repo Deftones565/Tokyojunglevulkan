@@ -5,7 +5,7 @@
 # Deletes the dumps afterwards except the flagged frames and their neighbours. POSTER=<board name>.
 cd /opt/git/tokyoJungleRecomp
 B=$1; name=$2; shift 2
-if [ "$(pgrep -x tokyojungle | wc -l)" -ge 2 ]; then echo "2 slots busy"; exit 2; fi
+if [ "$(pgrep -x tokyojungle | wc -l)" -ge ${SLOTS:-2} ]; then echo "slots busy"; exit 2; fi
 fd=build-runs/$name/frames; vfs=$B/vfs-$name; rm -rf $vfs $fd; cp -a build/vfs $vfs; mkdir -p $fd
 .agents/talk say ${POSTER:?} "RUN start: $name ($B, shard count, $*)" >/dev/null
 env "$@" PS3RECOMP_VK_DUMP_FROM_FLIP=5500 TJ_FRAME_DUMP=$PWD/$fd TJ_FRAME_DUMP_EVERY=1 TJ_FRAME_DUMP_MAX=4000 \

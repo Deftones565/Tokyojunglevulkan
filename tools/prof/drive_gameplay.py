@@ -69,8 +69,10 @@ def main():
     ap.add_argument('--keep-frames', action='store_true')
     ap.add_argument('env', nargs='*')
     a = ap.parse_args()
-    if int(subprocess.run('pgrep -x tokyojungle | wc -l', shell=True, capture_output=True, text=True).stdout) >= 2:
-        sys.exit('2 slots busy')
+    # SLOTS=<n> (default 2): how many game instances may already be running.
+    slots = int(os.environ.get('SLOTS', '2'))
+    if int(subprocess.run('pgrep -x tokyojungle | wc -l', shell=True, capture_output=True, text=True).stdout) >= slots:
+        sys.exit('%d slots busy' % slots)
     out = f'{R}/build-runs/{a.name}'; log = out + '.txt'
     shutil.rmtree(out, ignore_errors=True)
     fd, cwd, pad, gate = out + '/frames', out + '/cwd', out + '/pad.txt', out + '/gate'
