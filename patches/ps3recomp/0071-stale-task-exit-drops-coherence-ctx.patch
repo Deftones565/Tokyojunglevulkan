@@ -1,4 +1,4 @@
-SPURS stale task exit drops its lock-line reservation context (CASPER-3)
+SPURS stale task exit drops its lock-line reservation context (CASPER-3; landed unreviewed on the user's order)
 
 USER: the game crashed at the end of Survival (and at 03:10 in user-play5):
 SIGSEGV in spu_coh_notify_write (spu_coherency.c:196) on the PPU loading
