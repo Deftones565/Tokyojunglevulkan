@@ -52,6 +52,8 @@
  * names over pthreads and mmap, so the call sites below are written once. */
 #include "win32_compat.h"
 
+#include "settings_menu.h"   /* settings.ini and the in-game settings menu */
+
 #include <chrono>
 #include <stdint.h>
 #include <stdio.h>
@@ -299,33 +301,19 @@ static void frame_dump_collect(void)
 /* ---------------------------------------------------------------------------
  * Frame-rate readout (user, 2026-10-16)
  * -----------------------------------------------------------------------*/
-/* F1 toggles it, TJ_SHOW_FPS=1 starts with it on: "23.4 FPS" in the window's
- * top-right corner, refreshed once a second. It counts GAME frames: flips the
- * guest finished (cellGcm_flip_request_count), the number that matters for how
- * the game plays, not presents. The backend draws it on the window only (not
- * in frame dumps). F1 is caught with SDL_AddEventWatch, which sees every event
- * the backend's pump takes off the queue on this thread, so the backend's own
- * event loop is untouched. Headless, or a backend without an overlay: no-op. */
-#if defined(RSX_BACKEND_OVERLAY) && __has_include(<SDL2/SDL.h>)
-#include <SDL2/SDL.h>
-static int s_show_fps = -1;                  /* -1: TJ_SHOW_FPS not read yet */
-static int SDLCALL fps_key_watch(void*, SDL_Event* e)
-{
-    if (e->type == SDL_KEYDOWN && !e->key.repeat && e->key.keysym.sym == SDLK_F1)
-        s_show_fps = !s_show_fps;
-    return 1;
-}
+/* F1 (or the settings menu) toggles it, TJ_SHOW_FPS=1 starts with it on:
+ * "23.4 FPS" in the window's top-right corner, refreshed once a second. It
+ * counts GAME frames: flips the guest finished (cellGcm_flip_request_count),
+ * the number that matters for how the game plays, not presents. The backend
+ * draws it on the window only (not in frame dumps). The setting and the F1 key
+ * live in settings_menu.cpp. Headless, or a backend without an overlay: no-op. */
+#if defined(RSX_BACKEND_OVERLAY)
 static void fps_overlay_update(void)
 {
-    static bool watching = false, shown = false;
+    static bool shown = false;
     static auto t0 = std::chrono::steady_clock::now();
     static unsigned f0 = 0;
-    if (s_show_fps < 0) {
-        const char* e = getenv("TJ_SHOW_FPS");
-        s_show_fps = (e && *e && *e != '0') ? 1 : 0;
-    }
-    if (!watching) { SDL_AddEventWatch(fps_key_watch, NULL); watching = true; }
-    if (!s_show_fps) {
+    if (!tj_settings_show_fps()) {
         if (shown) { RSX_BACKEND_OVERLAY(""); shown = false; }
         return;
     }
@@ -352,6 +340,7 @@ static DWORD WINAPI frame_clock(LPVOID)
     fprintf(stderr, "[rsx] %s backend init %s\n", RSX_BACKEND_NAME,
             !rsx_ok ? "FAILED"
             : getenv("PS3RECOMP_VK_WINDOW") ? "OK -- window open" : "OK");
+    if (rsx_ok) tj_settings_backend_ready();   /* window mode, vsync, internal resolution */
 
     unsigned  last_flip = 0;
     /* NTSC vblank, 60000/1001 Hz (59.94), on an absolute schedule: tick k is
@@ -488,7 +477,7 @@ static DWORD WINAPI frame_clock(LPVOID)
             static const char* quit_after = getenv("TJ_QUIT_AFTER_S");
             const bool quit_now = quit_after &&
                 now - loop_start >= std::chrono::seconds(atoi(quit_after));
-            if ((rsx_backend_pump() != 0 || quit_now) && !quitting) {
+            if ((rsx_backend_pump() != 0 || quit_now || tj_settings_quit_requested()) && !quitting) {
                 const char* g = getenv("TJ_QUIT_GRACE_MS");
                 const long grace_ms = g ? strtol(g, NULL, 0) : 3000;
                 quitting = true;
@@ -498,6 +487,7 @@ static DWORD WINAPI frame_clock(LPVOID)
                 fprintf(stderr, "[quit] window closed: REQUEST_EXITGAME sent, %ld ms to exit\n",
                         grace_ms);
             }
+            tj_settings_frame();    /* Esc / Guide: the settings menu */
             fps_overlay_update();   /* F1 / TJ_SHOW_FPS: fps in the top-right corner */
             /* Present on a guest flip. A present on a fixed clock can catch the
              * drain mid-frame and flash a partial one. Before the first flip
@@ -886,6 +876,7 @@ int main(int argc, char** argv)
     setenv("PS3RECOMP_VK_GUEST_PROGRAMS", "1", 0);
 #endif
     frame_dump_setup();
+    tj_settings_load();      /* settings.ini beside the executable (not headless) */
 
     /* Install the guest-callback hook, then start the frame clock. It no-ops
      * until the title registers its vblank and flip handlers during init. */

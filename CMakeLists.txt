@@ -208,6 +208,7 @@ endif()
 
 add_executable(${PROJECT_NAME}
     src/main.cpp
+    src/settings_menu.cpp
     src/stubs.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
@@ -328,6 +329,11 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ps3recomp_runtime
 )
+
+# The settings menu draws its text with the stb_truetype the runtime already
+# compiles for cellFont; only that TU gets libs/font on its include path.
+set_source_files_properties(src/settings_menu.cpp PROPERTIES
+    INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/libs/font")
 
 # TJ: where the runner looks for the game data when it is not told: the
 # extracted/ tree tools/extract/ fills (PARAM.SFO + USRDIR/).
