@@ -38,15 +38,14 @@ mg5-wake1 23.9 flips/s vs mg5-wake0 19.4; 0 FATAL, 0 LIFT-GAP.
  int cellGcm_rsx_wait_consumed(unsigned timeout_ms)
  {
      if (!s_gcm_context_ea && !s_gcm_syscall_mode) return 1;
-@@ -1780,15 +1795,34 @@
+@@ -1780,15 +1795,32 @@
      const u32 seq0 = __atomic_load_n(&s_drain_seq, __ATOMIC_ACQUIRE);
      extern unsigned long long ps3_ms_now(void);
      const unsigned long long t0 = ps3_ms_now();
 +    /* GCM_WAIT_STATS=1: calls and time spent waiting, every 1000 waits. */
 +    static int stats = -1;
 +    if (stats < 0) stats = getenv("GCM_WAIT_STATS") ? 1 : 0;
-+    struct timespec ts0;
-+    if (stats) clock_gettime(CLOCK_MONOTONIC, &ts0);
++    const u64 ns0 = stats ? get_timestamp_ns() : 0;
 +    __atomic_add_fetch(&s_rsx_waiters, 1, __ATOMIC_ACQ_REL);
 +    int ok;
      for (;;) {
@@ -63,8 +62,7 @@ mg5-wake1 23.9 flips/s vs mg5-wake0 19.4; 0 FATAL, 0 LIFT-GAP.
 +    __atomic_sub_fetch(&s_rsx_waiters, 1, __ATOMIC_ACQ_REL);
 +    if (stats) {
 +        static unsigned long n, slow; static double sum, mx;
-+        struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1);
-+        const double ms = (ts1.tv_sec - ts0.tv_sec) * 1e3 + (ts1.tv_nsec - ts0.tv_nsec) * 1e-6;
++        const double ms = (double)(get_timestamp_ns() - ns0) * 1e-6;
 +        sum += ms; n++; if (ms > mx) mx = ms; if (ms > 8.0) slow++;
 +        if (n % 1000 == 0) {
 +            fprintf(stderr, "[gcm-wait] %lu waits, avg %.2f ms, max %.1f, >8ms %lu\n", n, sum / n, mx, slow);

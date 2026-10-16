@@ -124,6 +124,7 @@ void     cellGcmTickFlip(void);
 int      cellGcm_take_flip_pending(void);
 extern "C" { extern uint8_t* vm_base; extern uint32_t ppu_hle_inject_base; }
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
+int      cellGcm_rsx_waiters(void);           /* guest threads waiting on the drain */
 unsigned cellGcm_flip_request_count(void);
 }
 
@@ -361,6 +362,7 @@ static DWORD WINAPI frame_clock(LPVOID)
                 if (t - w0 >= std::chrono::milliseconds(4) || t >= tick_due(vk)) break;
                 const uint32_t put = ctrl_word(0), get = ctrl_word(4);
                 if (put != get && !(put == drained_put && get == drained_get)) break;   /* new work */
+                if (cellGcm_rsx_waiters()) break;   /* a guest thread is blocked on the drain */
             }
         }
         vclock::time_point now = vclock::now();
