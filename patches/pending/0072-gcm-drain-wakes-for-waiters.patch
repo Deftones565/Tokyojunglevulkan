@@ -1,0 +1,77 @@
+GCM drain wakes at once while a guest thread waits for it (MAGI-5)
+
+USER: gameplay still laggy. Wall-clock profile mg5-w1 (build/ 0001-0070,
+Survival tutorial street): the main PPU thread spent 62% of gameplay in
+cellGcm_rsx_wait_consumed under cellSpursRunJobChain (0065's wait) while the
+frame-clock (drain) thread sat idle 42% of the time. The waiter only polls;
+the drain loop woke for a moved `put`, a vblank or its 4 ms beat, and a pass
+that stopped at a flip left the waiter sitting out that beat. Now
+wait_consumed counts its waiters and the frame clock (src/main.cpp, see
+0072-gcm-drain-wakes-for-waiters-src.patch) breaks its poll while there is
+one, so the next pass runs within ~250 us. GCM_RSX_WAKE=0 = old behaviour;
+GCM_WAIT_STATS=1 prints wait counts/time every 1000 waits.
+Ordering only gets stricter (the RSX catches up sooner), no change to what
+a pass does. Same binary A/B (tools/prof/run_gameplay.sh, flips >= 4200):
+mg5-wake1 23.9 flips/s vs mg5-wake0 19.4; 0 FATAL, 0 LIFT-GAP.
+
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1773,6 +1773,21 @@
+  * and stops at each flip). A title that kicks SPU work on the assumption that
+  * the GPU has already read the buffers that work rewrites needs this ordering:
+  * see cellSpurs.c's _cellSpursSendSignal. */
++/* Threads inside cellGcm_rsx_wait_consumed. The frame-clock thread polls this
++ * (cellGcm_rsx_waiters) and drains again at once while it is non-zero: a
++ * waiter blocks a guest thread until a pass catches up, but the drain loop
++ * otherwise only wakes for a moved `put`, a vblank or its 4 ms beat, and a pass
++ * that stopped at a flip left the waiter sitting out that whole beat (mg5-w1:
++ * the main PPU thread spent 62% of gameplay here while the drain thread idled
++ * 42%). GCM_RSX_WAKE=0 turns the early wake off. */
++static volatile int s_rsx_waiters;
++int cellGcm_rsx_waiters(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("GCM_RSX_WAKE"); on = (e && *e == '0') ? 0 : 1; }
++    return on ? __atomic_load_n(&s_rsx_waiters, __ATOMIC_ACQUIRE) : 0;
++}
++
+ int cellGcm_rsx_wait_consumed(unsigned timeout_ms)
+ {
+     if (!s_gcm_context_ea && !s_gcm_syscall_mode) return 1;
+@@ -1780,15 +1795,34 @@
+     const u32 seq0 = __atomic_load_n(&s_drain_seq, __ATOMIC_ACQUIRE);
+     extern unsigned long long ps3_ms_now(void);
+     const unsigned long long t0 = ps3_ms_now();
++    /* GCM_WAIT_STATS=1: calls and time spent waiting, every 1000 waits. */
++    static int stats = -1;
++    if (stats < 0) stats = getenv("GCM_WAIT_STATS") ? 1 : 0;
++    struct timespec ts0;
++    if (stats) clock_gettime(CLOCK_MONOTONIC, &ts0);
++    __atomic_add_fetch(&s_rsx_waiters, 1, __ATOMIC_ACQ_REL);
++    int ok;
+     for (;;) {
+-        if ((s32)(__atomic_load_n(&s_drain_caught_seq, __ATOMIC_ACQUIRE) - seq0) > 0) return 1;
+-        if (ps3_ms_now() - t0 >= timeout_ms) return 0;
++        if ((s32)(__atomic_load_n(&s_drain_caught_seq, __ATOMIC_ACQUIRE) - seq0) > 0) { ok = 1; break; }
++        if (ps3_ms_now() - t0 >= timeout_ms) { ok = 0; break; }
+ #ifdef _WIN32
+         Sleep(0);
+ #else
+         usleep(100);
+ #endif
+     }
++    __atomic_sub_fetch(&s_rsx_waiters, 1, __ATOMIC_ACQ_REL);
++    if (stats) {
++        static unsigned long n, slow; static double sum, mx;
++        struct timespec ts1; clock_gettime(CLOCK_MONOTONIC, &ts1);
++        const double ms = (ts1.tv_sec - ts0.tv_sec) * 1e3 + (ts1.tv_nsec - ts0.tv_nsec) * 1e-6;
++        sum += ms; n++; if (ms > mx) mx = ms; if (ms > 8.0) slow++;
++        if (n % 1000 == 0) {
++            fprintf(stderr, "[gcm-wait] %lu waits, avg %.2f ms, max %.1f, >8ms %lu\n", n, sum / n, mx, slow);
++            sum = 0; mx = 0; slow = 0; n = 0;
++        }
++    }
++    return ok;
+ }
+ 
+ static void gcm_rsx_process_fifo_unlocked(void)
