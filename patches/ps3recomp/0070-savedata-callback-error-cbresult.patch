@@ -1,4 +1,4 @@
-cellSaveData: a callback error returns CELL_SAVEDATA_ERROR_CBRESULT (CASPER-3)
+cellSaveData: a callback error returns CELL_SAVEDATA_ERROR_CBRESULT (CASPER-3; landed unreviewed on the user's order)
 
 USER report: the Pomeranian (every animal) locked in Survival. On first boot
 TJ's "is there a save?" AutoLoad2 funcStat answers ERR_NODATA. savedata_execute
