@@ -1,0 +1,257 @@
+Vulkan engine: consecutive draws share a render pass, released textures/views die after the batch, presents read back only when dumped (MAGI-5)
+
+Drain profile mg5-p2/mg5-vw1 (Survival tutorial street): the FIFO thread waited on GPU fences ~390 ms per second.
+1. vk_eng_draw continues the open render pass while the next draw targets the same framebuffer and area
+   (was: begin + end, i.e. LOAD/STORE of every attachment, plus a full barrier, per draw; ~4900 draws/s ->
+   ~460 passes/s). Anything else recorded (vk_rec_begin) and every flush ends the pass first.
+   PS3RECOMP_VK_PASS_MERGE=0 = one pass per draw.
+2. vk_eng_release: a texture or view released while the batch is open is destroyed after the batch's
+   submit-and-wait (graveyard emptied in vk_batch_flush) instead of flushing first (~20% of the drain:
+   texture-cache replacement mid-frame). Colour/depth targets unchanged.
+3. vk_cb_present: on the engine path the full-frame readback + submit-and-wait runs only on presents that
+   are dumped (nothing else reads them; rsx_vulkan_backend_readback_center asks the engine). This one was
+   waiting for every frame's whole render: fence wait 380 -> 127 ms/s (mg5-st1).
+4. VK_WAIT_STATS=1 (diag): fence-wait ms, submits, draws, passes per second and a wait-length histogram.
+
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -65,6 +65,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ 
+ /* ---------------------------------------------------------------------------
+  * Run-time loaded entry points (Vulkan 1.0 core only)
+@@ -428,15 +429,43 @@
+ 
+ static int vk_batch_flush(void);
+ 
+-static void vk_destroy_image(vk_image* im)
++static void vk_destroy_image_now(vk_image* im)
+ {
+-    vk_batch_flush();                /* a recorded draw may still use it */
+     if (im->view) pvkDestroyImageView(s_vk.device, im->view, NULL);
+     if (im->img)  pvkDestroyImage(s_vk.device, im->img, NULL);
+     if (im->mem)  pvkFreeMemory(s_vk.device, im->mem, NULL);
+     memset(im, 0, sizeof *im);
+ }
+ 
++static void vk_destroy_image(vk_image* im)
++{
++    vk_batch_flush();                /* a recorded draw may still use it */
++    vk_destroy_image_now(im);
++}
++
++/* Images released while the draw batch is open, destroyed once that batch has
++ * been submitted and waited on (vk_batch_flush). Destroying at once means
++ * flushing first, since a recorded draw or copy may still use the image: the
++ * texture cache replaces and evicts textures mid-frame, and those flushes were
++ * ~20% of the FIFO thread in Tokyo Jungle gameplay (mg5-p2). */
++#define VK_GRAVEYARD_MAX 256
++static vk_image s_graveyard[VK_GRAVEYARD_MAX];
++static u32      s_graveyard_n;
++
++static void vk_graveyard_empty(void)
++{
++    for (u32 i = 0; i < s_graveyard_n; i++) vk_destroy_image_now(&s_graveyard[i]);
++    s_graveyard_n = 0;
++}
++
++static void vk_destroy_image_later(vk_image* im)
++{
++    extern int vk_batch_is_open(void);
++    if (!vk_batch_is_open() || s_graveyard_n >= VK_GRAVEYARD_MAX) { vk_destroy_image(im); return; }
++    s_graveyard[s_graveyard_n++] = *im;
++    memset(im, 0, sizeof *im);
++}
++
+ static int vk_create_host_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageFlags usage)
+ {
+     VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+@@ -527,19 +556,47 @@
+     u32 draws;                       /* in the open batch                  */
+ } s_batch;
+ 
++unsigned long g_vk_draws_total, g_vk_passes_total;
+ static int  vk_submit_and_wait(void);
+ static void vk_batch_reset(void);    /* engine rings + descriptor pool     */
+ 
++/* The render pass the last engine draw left open. Consecutive draws into the
++ * same framebuffer continue it instead of each beginning and ending one:
++ * every pass loads and stores all of its attachments (LOAD/STORE, colour and
++ * depth), and with a full barrier in front of each, ~200 draws a frame cost
++ * Tokyo Jungle ~18 ms of GPU time a frame (VK_WAIT_STATS, mg5-vw1) -- the
++ * FIFO thread waited on that, and the main thread on it. Draw order inside a
++ * pass is rasterization order, as across passes. Anything else recorded into
++ * the batch (vk_rec_begin) and every flush ends the pass first.
++ * PS3RECOMP_VK_PASS_MERGE=0 gives every draw its own pass again. */
++static struct {
++    int open;
++    VkRenderPass rp;
++    VkFramebuffer fb;
++    u32 w, h;
++} s_pass;
++
++static void vk_pass_end(void)
++{
++    if (!s_pass.open) return;
++    pvkCmdEndRenderPass(s_vk.cmd);
++    s_pass.open = 0;
++}
++
+ static int vk_batch_flush(void)
+ {
+     if (!s_batch.open) return 0;
++    vk_pass_end();
+     s_batch.open = 0;
+     s_batch.draws = 0;
+     const int rc = vk_submit_and_wait();
+     vk_batch_reset();
++    vk_graveyard_empty();            /* nothing recorded uses them any more */
+     return rc;
+ }
+ 
++int vk_batch_is_open(void) { return s_batch.open; }
++
+ static int vk_begin(void)
+ {
+     if (vk_batch_flush()) return -1;
+@@ -557,7 +614,34 @@
+                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
+     VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
+     VK_CHECK(pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence), "vkQueueSubmit");
++    /* VK_WAIT_STATS=1 (diag): fence-wait time, submits and draws per second. */
++    static int st = -1;
++    if (st < 0) st = getenv("VK_WAIT_STATS") ? 1 : 0;
++    struct timespec t0, t1;
++    if (st) clock_gettime(CLOCK_MONOTONIC, &t0);
+     VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
++    if (st) {
++        static double wait_ms, t_last; static unsigned long subs, draws_at;
++        extern unsigned long g_vk_draws_total;
++        clock_gettime(CLOCK_MONOTONIC, &t1);
++        const double one = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) * 1e-6;
++        wait_ms += one;
++        subs++;
++        static unsigned long hist[4]; static double hms[4];
++        { const int k = one < 0.2 ? 0 : one < 1.0 ? 1 : one < 3.0 ? 2 : 3; hist[k]++; hms[k] += one; }
++        const double now = t1.tv_sec + t1.tv_nsec * 1e-9;
++        if (t_last == 0) t_last = now;
++        if (now - t_last >= 5.0) {
++            extern unsigned long g_vk_passes_total; static unsigned long passes_at;
++            const double dt = now - t_last;
++            fprintf(stderr, "[vk-wait] per s: fence wait %.1f ms, submits %.0f, draws %.0f, passes %.0f; "
++                            "waits <0.2ms %.0f (%.0f ms) <1ms %.0f (%.0f) <3ms %.0f (%.0f) >=3ms %.0f (%.0f)\n",
++                    wait_ms / dt, subs / dt, (g_vk_draws_total - draws_at) / dt, (g_vk_passes_total - passes_at) / dt,
++                    hist[0] / dt, hms[0] / dt, hist[1] / dt, hms[1] / dt, hist[2] / dt, hms[2] / dt, hist[3] / dt, hms[3] / dt);
++            wait_ms = 0; subs = 0; draws_at = g_vk_draws_total; passes_at = g_vk_passes_total; t_last = now;
++            memset(hist, 0, sizeof hist); memset(hms, 0, sizeof hms);
++        }
++    }
+     return 0;
+ }
+ 
+@@ -603,6 +687,7 @@
+         if (vk_begin()) return -1;
+         s_batch.open = 1;
+     }
++    vk_pass_end();
+     VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+@@ -2500,6 +2585,18 @@
+     (void)ud; (void)buffer_id;
+     if (!s_vk.device) return;
+ 
++    /* The whole frame came back to the CPU on every present, a submit-and-wait
++     * each, for the PPM dump and the non-engine path's centre-pixel probe. On
++     * the engine path nothing reads the pixels unless this present is dumped
++     * (rsx_vulkan_backend_readback_center asks the engine), so skip it. */
++    const int dump = s_vk.dump_path && ((s_vk.presented + 1u) % s_vk.dump_every) == 0;
++    if (s_vk.eng_active && !dump) {
++        s_vk.presented++;
++        s_g.last_draws = s_g.draws;
++        s_g.draws = 0;
++        vk_present_window();
++        return;
++    }
+     if (vk_begin()) return;
+     vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+     VkBufferImageCopy region = {
+@@ -2800,8 +2897,7 @@
+     if (s_eobj[handle].kind == VK_ENG_COLOR)
+         for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
+             if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == handle) {
+-                vk_batch_flush();
+-                vk_destroy_image(&s_eobj[i].im);
++                vk_destroy_image_later(&s_eobj[i].im);
+                 memset(&s_eobj[i], 0, sizeof s_eobj[i]);
+             }
+     if (s_eobj[handle].kind == VK_ENG_DEPTH && s_eobj[handle].surface) {
+@@ -2809,9 +2905,14 @@
+         s_eobj[handle].surface = 0;
+         if (vk_eng_get(snap, VK_ENG_TEXTURE)) vk_eng_release(user, snap);
+     }
+-    if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
++    if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH) {
+         vk_eng_drop_framebuffers();
+-    vk_destroy_image(&s_eobj[handle].im);      /* idle: submissions are waited on */
++        vk_destroy_image(&s_eobj[handle].im);  /* idle: submissions are waited on */
++    } else {
++        /* A texture or a view: nothing else refers to it, so it can wait for
++         * the batch that may still sample it to finish. */
++        vk_destroy_image_later(&s_eobj[handle].im);
++    }
+     memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
+ }
+ 
+@@ -4181,18 +4282,25 @@
+         if (vk_begin()) return;
+         s_batch.open = 1;
+     }
+-    /* Order this draw after everything recorded or submitted before it: one
+-     * global barrier covers its targets, its depth and any surface it samples
+-     * that an earlier draw in the batch rendered. */
+-    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+-                           .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+-                           .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+-    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+-                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+-    VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+-                                  .renderPass = rp, .framebuffer = fb,
+-                                  .renderArea = { { 0, 0 }, { w, h } } };
+-    pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
++    static int merge = -1;
++    if (merge < 0) { const char* e = getenv("PS3RECOMP_VK_PASS_MERGE"); merge = !(e && e[0] == '0'); }
++    if (!(merge && s_pass.open && s_pass.rp == rp && s_pass.fb == fb && s_pass.w == w && s_pass.h == h)) {
++        vk_pass_end();
++        /* Order this pass after everything recorded or submitted before it:
++         * one global barrier covers its targets, its depth and any surface it
++         * samples that an earlier pass in the batch rendered. */
++        VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                               .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++                               .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
++        pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
++        VkRenderPassBeginInfo rbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
++                                      .renderPass = rp, .framebuffer = fb,
++                                      .renderArea = { { 0, 0 }, { w, h } } };
++        pvkCmdBeginRenderPass(s_vk.cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
++        s_pass.open = 1; s_pass.rp = rp; s_pass.fb = fb; s_pass.w = w; s_pass.h = h;
++        g_vk_passes_total++;
++    }
+     pvkCmdBindPipeline(s_vk.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+     VkViewport vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
+     if (s_e2.have_vp && s_e2.vp[2] > 0.0f && s_e2.vp[3] > 0.0f) {
+@@ -4225,8 +4333,9 @@
+     } else {
+         pvkCmdDraw(s_vk.cmd, vertex_count, 1, 0, 0);
+     }
+-    pvkCmdEndRenderPass(s_vk.cmd);
++    if (!merge) vk_pass_end();
+     s_batch.draws++;
++    g_vk_draws_total++;
+     if (s_batch.off) vk_batch_flush();
+ }
+ 
