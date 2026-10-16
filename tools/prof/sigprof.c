@@ -12,6 +12,7 @@
  *   PROF_OUT=prof.bin PROF_START_S=160 PROF_END_S=220 \
  *     LD_PRELOAD=$PWD/build-runs/sigprof.so ./build/tokyojungle ...
  *   python3 tools/prof/report.py prof.bin build/tokyojungle
+ *   PROF_GATE=<file>: sample only while <file> exists (see below).
  *
  * File format: a text header "MAPS\n<copy of /proc/self/maps>\nEND\n", then
  * records: u32 tid, u32 depth, depth x u64 return addresses.
@@ -36,6 +37,18 @@
 
 static int s_fd = -1;
 static double s_t0, s_start, s_end;
+/* PROF_GATE=<file>: keep samples only while <file> exists (polled every
+ * 100 ms), so a driver can open the window when the game reaches the scene
+ * to measure (tools/prof/drive_gameplay.py) instead of guessing a time. */
+static const char* s_gate;
+static volatile int s_gate_open = 1;
+static void* gate_thread(void* arg)
+{
+    (void)arg;
+    const struct timespec ts = { 0, 100000000L };
+    for (;;) { s_gate_open = access(s_gate, F_OK) == 0; nanosleep(&ts, NULL); }
+    return NULL;
+}
 
 static double now_s(void)
 {
@@ -50,6 +63,7 @@ static void on_prof(int sig, siginfo_t* si, void* uc)
     if (s_fd < 0) return;
     const double t = now_s() - s_t0;
     if (t < s_start || t > s_end) return;
+    if (!s_gate_open) return;
     struct { uint32_t tid, depth; uint64_t pc[MAX_DEPTH]; } rec;
     void* buf[MAX_DEPTH];
     const int n = backtrace(buf, MAX_DEPTH);
@@ -112,6 +126,12 @@ __attribute__((constructor)) static void prof_init(void)
     const int hz = getenv("PROF_HZ") ? atoi(getenv("PROF_HZ")) : 997;
     s_fd = open(out, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
     if (s_fd < 0) return;
+    s_gate = getenv("PROF_GATE");
+    if (s_gate && *s_gate) {
+        s_gate_open = access(s_gate, F_OK) == 0;
+        pthread_t gt;
+        pthread_create(&gt, NULL, gate_thread, NULL);
+    }
     /* The mappings, so the report can turn PIE addresses into file offsets. */
     static const char hdr[] = "MAPS\n";
     (void)!write(s_fd, hdr, sizeof hdr - 1);
