@@ -1,0 +1,49 @@
+SPURS stale task exit drops its lock-line reservation context (CASPER-3)
+
+USER: the game crashed at the end of Survival (and at 03:10 in user-play5):
+SIGSEGV in spu_coh_notify_write (spu_coherency.c:196) on the PPU loading
+thread, right after "[spu_workload] task N of shut-down taskset ...: ending
+its thread". 0069's spu_task_exit_stale ends a stale task with pthread_exit /
+ExitThread from inside WAIT_SIGNAL, which skips spu_run_lifted_job_abi's
+spu_coh_unregister: the fur task's (image 9) stack-local spu_context stayed in
+s_coh_ctxs, and the next PPU store to a line it had reserved walked the freed
+stack. spu_async_run now records a stack mark, and spu_task_exit_stale drops
+every reserver context between its frame and that mark (spu_coh_forget_range,
+under the lock-line lock) before ending the thread.
+c3-stale1 (closed-loop, build-casper): tutorial -> quit to title -> tutorial
+-> quit, twice the exact log sequence of the crash; each time
+"[spu-coh] leaked ctx ... (img=9) dropped at thread exit" for both fur tasks,
+no crash, fur renders after the tasksets are re-created; 0 FATAL, 0 LIFT-GAP.
+
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -543,6 +543,7 @@
+ static struct { uint32_t ea; volatile uint32_t gen; } s_ts_gen[TS_GEN_MAX];
+ static _Thread_local uint32_t t_task_ts;   /* taskset this thread's task belongs to */
+ static _Thread_local uint32_t t_task_gen;  /* its generation when the task started */
++static _Thread_local uintptr_t t_task_stack_top; /* in spu_async_run's frame: the task's run lives below it */
+ 
+ uint32_t spu_taskset_generation(uint32_t taskset_ea)
+ {
+@@ -574,6 +575,7 @@
+ {
+     t_task_ts  = j->taskset_ea;
+     t_task_gen = spu_taskset_generation(j->taskset_ea);
++    { volatile char top; t_task_stack_top = (uintptr_t)&top; }
+     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
+      * back to a fresh per-dispatch LS when disabled / no taskset. */
+@@ -1215,6 +1217,13 @@
+     { static int _n = 0; if (_n++ < 16)
+         fprintf(stderr, "[spu_workload] task %u of shut-down taskset 0x%08X: ending its thread\n",
+                 taskId, taskset_ea); }
++    /* Ending the thread here skips spu_run_lifted_job_abi's spu_coh_unregister:
++     * its stack-local spu_context (the fur task reserves lock lines) stayed in
++     * the reserver set, and the next PPU store to such a line read the freed
++     * stack (USER: SIGSEGV in spu_coh_notify_write at the end of Survival,
++     * right after these threads ended). Drop whatever this run registered. */
++    { volatile char here; extern void spu_coh_forget_range(uintptr_t, uintptr_t);
++      if (t_task_stack_top) spu_coh_forget_range((uintptr_t)&here, t_task_stack_top); }
+ #ifdef _WIN32
+     ExitThread(0);
+ #else
