@@ -1,0 +1,42 @@
+Diagnostic only. Apply to a PRIVATE SDK. Timing is not a performance result.
+
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -57,8 +57,37 @@
+     return k;
+ }
+ 
++/* Diagnostic destination census; no guest instructions are decoded or executed. */
++#include <time.h>
++static void tj_handoff_census(spu_context* ctx)
++{
++    static _Thread_local uint32_t counts[65536];
++    static _Thread_local uint64_t total;
++    static _Thread_local double last;
++    if (ctx->image_id != 9) return;
++    ++counts[(ctx->pc & SPU_LS_MASK) >> 2];
++    if ((++total & 65535) != 0) return;
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
++    double now = ts.tv_sec + ts.tv_nsec * 1e-9;
++    if (now - last < 1.0) return;
++    uint32_t pcs[24] = {0}, ns[24] = {0};
++    for (unsigned pc = 0; pc < 65536; ++pc) {
++        uint32_t n = counts[pc];
++        if (n <= ns[23]) continue;
++        unsigned j = 23;
++        while (j && n > ns[j-1]) { ns[j] = ns[j-1]; pcs[j] = pcs[j-1]; --j; }
++        ns[j] = n; pcs[j] = pc * 4;
++    }
++    char line[1024]; int len = snprintf(line, sizeof line, "[handoff-census] t=%.6f ctx=%p total=%llu", now, (void*)ctx, (unsigned long long)total);
++    for (unsigned j = 0; j < 24 && ns[j]; ++j)
++        len += snprintf(line+len, sizeof(line)-len, " %05x:%u", pcs[j], ns[j]);
++    fprintf(stderr, "%s\n", line);
++    memset(counts, 0, sizeof counts); total = 0; last = now;
++}
++
+ void spu_task_launch_check(spu_context* ctx, void* fn)
+ {
++    tj_handoff_census(ctx);
+     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);

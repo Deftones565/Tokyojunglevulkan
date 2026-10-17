@@ -15,7 +15,9 @@ from concurrent.futures import ThreadPoolExecutor
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('out'); p.add_argument('image')
 p.add_argument('--all', action='store_true', help='recompile every lifted SPU image, two at a time')
+p.add_argument('--source', help='private replacement C source for one image')
 a = p.parse_args()
+if a.source and a.all: p.error('--source requires a single image')
 root = Path.cwd(); out = Path(a.out).resolve(); base = root / 'build'
 if out == base.resolve() or not (out/'ps3recomp/runtime/spu/spu_helpers.h').is_file():
     p.error('use a private output directory containing a ps3recomp copy')
@@ -32,6 +34,10 @@ def compile_image(compile_cmd):
     for flag, value in [('-o', str(obj)), ('-MF', str(out/(stem+'.d'))), ('-MT', str(obj))]:
         compile_cmd[compile_cmd.index(flag)+1] = value
     compile_cmd = [c.replace(str(root/'third_party/ps3recomp'),str(out/'ps3recomp')) for c in compile_cmd]
+    if a.source:
+        original_source = Path(compile_cmd[-1])
+        compile_cmd[-1] = str(Path(a.source).resolve())
+        compile_cmd.insert(1, '-I'+str(original_source.parent))
     subprocess.run(compile_cmd, cwd=base, check=True)
     return original_obj, str(obj)
 with ThreadPoolExecutor(max_workers=2) as pool:
@@ -43,5 +49,5 @@ link = [replacements.get(c,c) for c in link]
 link[link.index('-o')+1] = str(out/'tokyojungle.next')
 link = [c.replace('--dependency-file=CMakeFiles/tokyojungle.dir/link.d', '--dependency-file='+str(out/'link.d')) for c in link]
 subprocess.run(link, cwd=base, check=True)
+subprocess.run(['python3', 'scripts/check_no_emulation.py', '--ps3recomp', str(out/'ps3recomp'), '--binary', str(out/'tokyojungle.next')],check=True)
 (out/'tokyojungle.next').replace(out/'tokyojungle')
-subprocess.run(['python3', 'scripts/check_no_emulation.py', '--ps3recomp', str(out/'ps3recomp'), '--binary', str(out/'tokyojungle')],check=True)

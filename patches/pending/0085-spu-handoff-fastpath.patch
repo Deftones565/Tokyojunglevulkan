@@ -1,0 +1,57 @@
+Candidate: preserve mandatory handoff semantics, avoid inactive diagnostic checks.
+Independent review, runtime boundary tests, visual A/B and repeatable FPS gain required.
+
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -7,6 +7,8 @@
+  * place -- later milestones only replace the bodies. */
+ #include "spu_context.h"
+ #include <setjmp.h>
++#include <stdatomic.h>
++#include "spu_lockstep.h"
+ 
+ /* See spu_context.h `irq_frame`. */
+ typedef struct spu_irq_frame {
+@@ -62,6 +64,23 @@
+     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
++    /* Most lifted hops have no diagnostics enabled and do not target the
++     * LS-zero completion entry. Preserve the mandatory history, stack-reset
++     * check (above) and step accounting, without re-testing each cold probe.
++     * Diagnostic configuration, like the individual probes below, is cached
++     * at first use. The policy flow recorder can be armed later at runtime. */
++    static atomic_int ordinary = ATOMIC_VAR_INIT(-1);
++    int fast = atomic_load_explicit(&ordinary, memory_order_relaxed);
++    if (fast < 0) {
++        fast = !getenv("SPU_NO_LS0_END") && !getenv("SPU_EXITTRACE") &&
++               !getenv("SPU_STEPTRACE") && !getenv("SPU_STEPTRACE_FROM") &&
++               !getenv("SPU_JOBDRAIN");
++        atomic_store_explicit(&ordinary, fast, memory_order_relaxed);
++    }
++    if (fast && !g_pm_flow_ctx && (ctx->pc & SPU_LS_MASK) != 0) {
++        ++ctx->steps;
++        return;
++    }
+     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
+      * resident job manager, and with the job loaded at 0 that lands on its own
+      * entry. Planting a return address in r0 catches the jobs that get there
+@@ -416,7 +435,7 @@
+             void (*fn)(spu_context*) = g_spu_trampoline_fn;
+             g_spu_trampoline_fn = 0;
+             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
+-            yz_lockstep_tick(ctx);
++            if (g_yz_lockstep_on != 0) yz_lockstep_tick(ctx);
+             spu_task_launch_check(ctx, (void*)fn);
+             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
+                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1514,6 +1514,7 @@
+  * a stack-switching routine without going through spu_indirect_branch. */
+ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
+ {
++    if (!s_stack_reset_count) return;
+     if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
+     for (unsigned i = 0; i < s_stack_reset_count; ++i)
+         if (ctx->pc == s_stack_reset[i].entry &&
