@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('out'); p.add_argument('image')
 p.add_argument('--all', action='store_true', help='recompile every lifted SPU image, two at a time')
+p.add_argument('--runtime-archive', help='private runtime archive with matching region bridge')
 p.add_argument('--source', help='private replacement C source for one image')
 a = p.parse_args()
 if a.source and a.all: p.error('--source requires a single image')
@@ -45,7 +46,7 @@ with ThreadPoolExecutor(max_workers=2) as pool:
 # CMake's final shell command includes guard checks after linking. Invoke the
 # link argv directly, then run the no-emulation guard explicitly on the result.
 link = shlex.split(commands[-1].split(' && ')[1])
-link = [replacements.get(c,c) for c in link]
+link = [str(Path(a.runtime_archive).resolve()) if a.runtime_archive and c.endswith('/libps3recomp_runtime.a') else replacements.get(c,c) for c in link]
 link[link.index('-o')+1] = str(out/'tokyojungle.next')
 link = [c.replace('--dependency-file=CMakeFiles/tokyojungle.dir/link.d', '--dependency-file='+str(out/'link.d')) for c in link]
 subprocess.run(link, cwd=base, check=True)
