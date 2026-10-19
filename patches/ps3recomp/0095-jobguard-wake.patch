@@ -1,0 +1,62 @@
+# Job guard notify wakes the chain walker (condition variable) instead of the
+# walker finding it on its next 1 ms nap; still re-checks every 1 ms. In busy
+# areas the geometry chain walker spent ~70% of its time in those naps and the
+# main thread waited on each lap. User 2026-10-19: "works VERY well".
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index d69ca37..da0d66d 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2503,6 +2503,15 @@ s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
+ }
+ 
+ /* cellSpursJobGuardNotify(CellSpursJobGuard* jobGuard) -- one argument. */
++/* Waking the chain walker when a guard opens. jg_wait slept 1 ms at a time
++ * (more on Linux), so each guard notify reached the walker up to a millisecond
++ * late, every lap: Tokyo Jungle notifies its geometry chain's guard several
++ * times a frame and its main thread waits on each lap, and in busy areas the
++ * walker spent ~70% of its time in those naps (mg5-waits-user). Notify now
++ * signals s_jg_cv; the walker still re-checks every 1 ms as before. */
++static SRWLOCK            s_jg_lock = SRWLOCK_INIT;
++static CONDITION_VARIABLE s_jg_cv   = CONDITION_VARIABLE_INIT;
++
+ s32 cellSpursJobGuardNotify(u64 guard_ea)
+ {
+     u32 ea = (u32)guard_ea;
+@@ -2516,7 +2525,10 @@ s32 cellSpursJobGuardNotify(u64 guard_ea)
+      * OBSERVED zero, which threw away any notify that arrived while the job
+      * was still running -- the title notified 6 times and the chain completed
+      * 2 laps, so the thread waiting on the other 4 completions never woke. */
++    AcquireSRWLockExclusive(&s_jg_lock);
+     s_jobguards[i].pending++;
++    ReleaseSRWLockExclusive(&s_jg_lock);
++    WakeAllConditionVariable(&s_jg_cv);
+     { static int t = -1; if (t < 0) t = getenv("SPURS_JC_TRACE") ? 1 : 0;
+       if (t) fprintf(stderr, "[jc-trace] notify guard=0x%08X pending=%u\n", ea, s_jobguards[i].pending); }
+     { u32 remaining = (s_jobguards[i].pending >= s_jobguards[i].reset)
+@@ -2551,20 +2563,21 @@ static int jg_wait(u32 ea)
+     if (i < 0) return 1;
+     for (int spin = 0; spin < 20000; spin++) {     /* ~20 s at 1 ms */
+         if (jc_stopping()) return 0;               /* Shutdown: leave, take nothing */
++        AcquireSRWLockExclusive(&s_jg_lock);
+         if (s_jobguards[i].pending >= s_jobguards[i].reset) {
+             /* Consume exactly one release worth of credits, so notifies that
+              * arrived during the previous lap still count. */
+             s_jobguards[i].pending -= s_jobguards[i].reset;
+             if (!s_jobguards[i].auto_reset) s_jobguards[i].reset = 0;
+             s_jobguards[i].count = s_jobguards[i].reset;
++            ReleaseSRWLockExclusive(&s_jg_lock);
+             vm_write32(ea, s_jobguards[i].count);
+             return 1;
+         }
+-#ifdef _WIN32
+-        Sleep(1);
+-#else
+-        usleep(1000);
+-#endif
++        /* Until a notify wakes us, or 1 ms as before (Shutdown's stop flag is
++         * only polled). */
++        SleepConditionVariableSRW(&s_jg_cv, &s_jg_lock, 1, 0);
++        ReleaseSRWLockExclusive(&s_jg_lock);
+     }
+     printf("[cellSpurs] guard 0x%08X still closed after 20 s -- chain gives up\n", ea);
+     return 0;
