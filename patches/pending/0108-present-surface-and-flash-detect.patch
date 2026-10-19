@@ -1,0 +1,203 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 7a194fe..f10935a 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -3168,11 +3168,56 @@ static u32 eng_present_surface(u32 buffer_id)
+ {
+     if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
+         const eng_display_buffer* d = &g.display_buffers[buffer_id];
+-        for (u32 i = 0; i < g.n_surfaces; i++)
+-            if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
+-                g.surfaces[i].offset == d->offset)
+-                return i;
+-    }
++        { static int on = -1; static unsigned n;            /* RSX_PRESENT_DIAG */
++          if (on < 0) on = getenv("RSX_PRESENT_DIAG") ? 1 : 0;
++          if (on && n < 400) {
++              u32 m = 0;
++              for (u32 i = 0; i < g.n_surfaces; i++)
++                  if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
++                      g.surfaces[i].offset == d->offset) m++;
++              if (m != 1) {
++                  n++;
++                  fprintf(stderr, "[present] frame %u buf %u loc %u off 0x%08X %ux%u: %u matches, current %u\n",
++                          g.frames, buffer_id, d->location, d->offset, d->width, d->height, m,
++                          eng_current_surface());
++                  for (u32 i = 0; i < g.n_surfaces; i++)
++                      fprintf(stderr, "[present]   surface %u loc %u off 0x%08X %ux%u handle %u\n",
++                              i, g.surfaces[i].location, g.surfaces[i].offset,
++                              g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
++              }
++          } }
++        /* Several surfaces can share the display buffer's address (Tokyo
++         * Jungle aliases a 1280x720 offscreen target and a 32x720 strip onto
++         * its display buffers). Taking the first match presented one of those
++         * for a frame -- the world vanished to a bright image, sometimes every
++         * other frame for seconds. On hardware the buffer holds whatever was
++         * written to that memory last, so take the most recently drawn match,
++         * preferring one that covers the whole display buffer. */
++        u32 best = ENG_INVALID; int best_cover = -1; u64 best_serial = 0;
++        for (u32 i = 0; i < g.n_surfaces; i++) {
++            const eng_surface* sf = &g.surfaces[i];
++            if (!sf->handle || sf->location != d->location || sf->offset != d->offset) continue;
++            const int cover = sf->w >= d->width && sf->h >= d->height;
++            if (cover > best_cover || (cover == best_cover && sf->color_serial > best_serial)) {
++                best = i; best_cover = cover; best_serial = sf->color_serial;
++            }
++        }
++        if (best != ENG_INVALID) return best;
++    }
++    /* RSX_PRESENT_DIAG=1: a flip whose display buffer has no surface falls
++     * back to whatever surface is bound -- log those, with the candidates. */
++    { static int on = -1; static unsigned n;
++      if (on < 0) on = getenv("RSX_PRESENT_DIAG") ? 1 : 0;
++      if (on && n++ < 200) {
++          const int v = buffer_id < 8 && g.display_buffers[buffer_id].valid;
++          fprintf(stderr, "[present-fallback] buf %u valid %d loc %u off 0x%08X -> current %u (frame %u)\n",
++                  buffer_id, v, v ? g.display_buffers[buffer_id].location : 0,
++                  v ? g.display_buffers[buffer_id].offset : 0, eng_current_surface(), g.frames);
++          for (u32 i = 0; i < g.n_surfaces; i++)
++              fprintf(stderr, "[present-fallback]   surface %u loc %u off 0x%08X %ux%u handle %u\n",
++                      i, g.surfaces[i].location, g.surfaces[i].offset,
++                      g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
++      } }
+     return eng_current_surface();
+ }
+ 
+@@ -3190,6 +3235,24 @@ static void eng_present(u32 buffer_id)
+                     i, g.surfaces[i].location, g.surfaces[i].offset,
+                     g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
+     }
++    { static int on = -1; static unsigned n; static u32 last_t[8] = {ENG_INVALID,ENG_INVALID,ENG_INVALID,ENG_INVALID,ENG_INVALID,ENG_INVALID,ENG_INVALID,ENG_INVALID};
++      if (on < 0) on = getenv("RSX_PRESENT_DIAG") ? 1 : 0;   /* a buffer's surface changed */
++      if (on && g.guest_draws && buffer_id < 8 && target != last_t[buffer_id]) {
++          if (n++ < 300) {
++              const eng_display_buffer* d = &g.display_buffers[buffer_id];
++              fprintf(stderr, "[present] frame %u flip-buf %u (loc %u off 0x%08X %ux%u) -> surface %u (was %u), current %u, draws %u, serial now %llu\n",
++                      g.frames, buffer_id, d->location, d->offset, d->width, d->height, target,
++                      last_t[buffer_id], eng_current_surface(), g.guest_draws,
++                      (unsigned long long)g.write_serial);
++              for (u32 k = 0; k < g.n_surfaces; k++)
++                  fprintf(stderr, "[present]   surface %u loc %u off 0x%08X %ux%u pitch %u fmt %d serial %llu%s\n",
++                          k, g.surfaces[k].location, g.surfaces[k].offset, g.surfaces[k].w,
++                          g.surfaces[k].h, g.surfaces[k].pitch, (int)g.surfaces[k].fmt,
++                          (unsigned long long)g.surfaces[k].color_serial,
++                          g.surfaces[k].handle ? "" : " (no handle)");
++          }
++          last_t[buffer_id] = target;
++      } }
+     pd_present(target);
+     g.last_present_surface = target;
+     g.be->present(g.be->user, g.surfaces[target].handle);
+@@ -3364,6 +3427,9 @@ void rsx_draw_engine_note_flip(u32 buffer_id)
+     g.last_flip_buffer = buffer_id & 7u;
+ }
+ 
++/* Draws of the frame being presented (valid inside the backend's present). */
++u32 rsx_draw_engine_frame_draws(void) { return g.guest_draws; }
++
+ u32 rsx_draw_engine_guest_draws(void)
+ {
+     return g.last_guest_draws;
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index e222ac7..d95df66 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -3423,10 +3423,97 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
+     vk_rec_end();
+ }
+ 
++/* RSX_FLASH_DETECT=1 (diag): a 64x36 luminance thumbnail of every presented
++ * frame, compared with its neighbours. A frame unlike both the one before and
++ * the one after, while those two match each other (A-B-A), is a one-frame
++ * flash -- the user's "world vanishes to the skybox" -- and is logged with
++ * its render stats next to its neighbours'. One small blit + readback per
++ * present. */
++extern unsigned cellGcm_flip_request_count(void);
++extern u32 rsx_draw_engine_frame_draws(void);
++static void vk_flash_probe(const vk_eng_obj* o, u32 surface)
++{
++    enum { TW = 64, TH = 36, N = TW * TH };
++    static int on = -1;
++    if (on < 0) on = getenv("RSX_FLASH_DETECT") ? 1 : 0;
++    if (!on || !o || o->fmt != VK_FORMAT_R8G8B8A8_UNORM) return;
++    if (!rsx_draw_engine_frame_draws()) return;    /* a re-present: not a new frame */
++    static vk_image im; static vk_buffer buf; static int ready;
++    if (!ready) {
++        if (vk_create_image(&im, VK_FORMAT_R8G8B8A8_UNORM, TW, TH,
++                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++                            VK_IMAGE_ASPECT_COLOR_BIT) ||
++            vk_stage(&buf, (VkDeviceSize)N * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) { on = 0; return; }
++        if (vk_begin()) { on = 0; return; }
++        vk_barrier_image(im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
++        if (vk_submit_and_wait()) { on = 0; return; }
++        ready = 1;
++    }
++    if (vk_begin()) return;
++    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
++    VkImageBlit b = {
++        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .srcOffsets = { { 0, 0, 0 }, { (int32_t)o->iw, (int32_t)o->ih, 1 } },
++        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .dstOffsets = { { 0, 0, 0 }, { TW, TH, 1 } },
++    };
++    pvkCmdBlitImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, im.img, VK_IMAGE_LAYOUT_GENERAL,
++                    1, &b, VK_FILTER_LINEAR);
++    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                           .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++                           .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT };
++    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                          VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
++                          0, 1, &mb, 0, NULL, 0, NULL);
++    VkBufferImageCopy region = {
++        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .imageExtent = { TW, TH, 1 },
++    };
++    pvkCmdCopyImageToBuffer(s_vk.cmd, im.img, VK_IMAGE_LAYOUT_GENERAL, buf.buf, 1, &region);
++    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
++                          0, 1, &mb, 0, NULL, 0, NULL);
++    if (vk_submit_and_wait()) return;
++    vk_invalidate(&buf);
++
++    /* History of three: [0] oldest. */
++    typedef struct { u8 y[N]; u32 frame, flip, draws, surface, w, h; u32 mean; } shot;
++    static shot h[3]; static u32 nh, frame;
++    memmove(&h[0], &h[1], sizeof(shot) * 2);
++    shot* c = &h[2];
++    const u8* px = (const u8*)buf.ptr;
++    u32 sum = 0;
++    for (u32 i = 0; i < N; i++) {
++        c->y[i] = (u8)((px[i * 4] * 54u + px[i * 4 + 1] * 183u + px[i * 4 + 2] * 19u) >> 8);
++        sum += c->y[i];
++    }
++    c->mean = sum / N; c->frame = frame++; c->flip = cellGcm_flip_request_count();
++    c->draws = rsx_draw_engine_frame_draws(); c->surface = surface; c->w = o->iw; c->h = o->ih;
++    if (++nh < 3) return;
++    u32 d01 = 0, d12 = 0, d02 = 0;
++    for (u32 i = 0; i < N; i++) {
++        d01 += (u32)abs((int)h[0].y[i] - (int)h[1].y[i]);
++        d12 += (u32)abs((int)h[1].y[i] - (int)h[2].y[i]);
++        d02 += (u32)abs((int)h[0].y[i] - (int)h[2].y[i]);
++    }
++    d01 /= N; d12 /= N; d02 /= N;
++    if (d01 >= 12 && d12 >= 12 && d02 * 3 <= (d01 < d12 ? d01 : d12)) {
++        static u32 logged;
++        if (logged++ < 500) {
++            fprintf(stderr, "[flash] frame %u flip %u: diff %u/%u vs neighbours (they differ by %u)\n",
++                    h[1].frame, h[1].flip, d01, d12, d02);
++            for (int k = 0; k < 3; k++)
++                fprintf(stderr, "[flash]   %s frame %u flip %u surface %u %ux%u draws %u mean %u\n",
++                        k == 1 ? "FLASH" : "     ", h[k].frame, h[k].flip, h[k].surface,
++                        h[k].w, h[k].h, h[k].draws, h[k].mean);
++        }
++    }
++}
++
+ /* The named surface becomes the frame: blit it onto the display image, then
+  * the existing present does the readback, the PPM dump and the window. */
+ static void vk_eng_present(void* user, u32 surface)
+ {
++    vk_flash_probe(vk_eng_get(surface, VK_ENG_COLOR), surface);
+     (void)user;
+     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+     /* The display image is read only by a frame dump (vk_cb_present reads
