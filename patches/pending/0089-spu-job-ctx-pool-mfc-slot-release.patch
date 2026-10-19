@@ -6,6 +6,11 @@
 # User test 2026-10-19 with tj_vm_fast: 29-33 -> 40-49 FPS (forced 60 mode).
 # Also: fingerprint-cache hits share the slot lock (try-lock fallback re-hashed
 # whole images); opt-in SPURS_EF_SPIN_US event-flag spin (user test +2 FPS at 200).
+# Also: 1:1 NV3089 copies between two engine colour targets stay on the GPU
+# (rsx_draw_engine_gpu_copy, Vulkan copy_surface_to_surface): TJ copies its scene
+# target and display buffer both ways every frame, each a flush + full-frame
+# readback + upload. Headless A/B (MLAA off, forced 60): 48.6 -> 58.6 flips/s.
+# Visual A/B: docs/ab/2026-10-19-gpu-copy-ab.png. RSX_ENGINE_GPU_COPY=0 = old path.
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
 index b9e9088..d69ca37 100644
 --- a/libs/spurs/cellSpurs.c
@@ -41,6 +46,160 @@ index b9e9088..d69ca37 100644
      ef_lock(sync);
  
      /* Block until the requested bit pattern is satisfied in the GUEST struct
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 085e764..3ffea52 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1125,6 +1125,24 @@ static void nv3089_blit(void)
+     u32 dbpp = (s_gcm2d.color_fmt == 4u /* R5G6B5 */) ? 2u
+              : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
+     u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
++    /* A 1:1 copy between two engine colour targets stays on the GPU
++     * (rsx_draw_engine_gpu_copy): no readback, software copy or upload. */
++    if (bpp == 4 && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
++        rsx_draw_engine_enabled()) {
++        const u32 xa = out_x > cx0 ? out_x : cx0;
++        const u32 xb = (cx1 - out_x > out_w) ? out_x + out_w : cx1;
++        const u32 ya = out_y > cy0 ? out_y : cy0;
++        const u32 yb = (cy1 - out_y > out_h) ? out_y + out_h : cy1;
++        if (cx1 > out_x && cy1 > out_y && xb > xa && yb > ya) {
++            const u32 sx0 = (u0 >> 4) + (xa - out_x), sy0 = (v0 >> 4) + (ya - out_y);
++            const u32 sl = src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
++            const u32 dl = dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
++            if (rsx_draw_engine_gpu_copy(sl, s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u, in_pitch,
++                                         dl, s_gcm2d.dst_offset + ya * dst_pitch + xa * 4u, dst_pitch,
++                                         xb - xa, yb - ya))
++                return;
++        }
++    }
+     if (bpp == 4) nv3089_engine_read(in_pitch, out_w, out_h);
+     /* An unscaled blit copies whole row spans: the same bytes the per-pixel
+      * loop below stores (its read and write byte swaps cancel), with the SPU
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 0706654..5674b02 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -913,6 +913,38 @@ static int eng_guest_clean(const eng_surface* s, u32 location, u32 offset, u32 p
+     return 1;
+ }
+ 
++/* Tokyo Jungle copies its scene target into a display buffer and back with
++ * NV3089 every frame (1280x720, both ways). Through guest memory that is a GPU
++ * flush and a full-frame readback, a software copy and an upload, each way:
++ * the frame-clock thread's largest wait, which the main PPU thread then waits
++ * on in turn (0065). When both rectangles lie in engine colour targets the
++ * copy stays on the GPU. RSX_ENGINE_GPU_COPY=0 copies through memory. */
++int rsx_draw_engine_gpu_copy(u32 src_location, u32 src_offset, u32 src_pitch,
++                             u32 dst_location, u32 dst_offset, u32 dst_pitch,
++                             u32 w, u32 h)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("RSX_ENGINE_GPU_COPY"); on = e ? atoi(e) : 1; }
++    if (!on || !g.ready || !g.be->copy_surface_to_surface || !w || !h) return 0;
++    u32 sx = 0, sy = 0, dx = 0, dy = 0;
++    const u32 ss = eng_surface_at(src_location, src_offset, src_pitch, &sx, &sy);
++    const u32 ds = eng_surface_at(dst_location, dst_offset, dst_pitch, &dx, &dy);
++    if (ss == ENG_INVALID || ds == ENG_INVALID || ss == ds) return 0;
++    eng_surface* S = &g.surfaces[ss];
++    eng_surface* D = &g.surfaces[ds];
++    if (sx + w > S->w || sy + h > S->h || dx + w > D->w || dy + h > D->h) return 0;
++    if (g.be->copy_surface_to_surface(g.be->user, S->handle, sx, sy,
++                                      D->handle, dx, dy, w, h))
++        return 0;
++    /* As after a draw into it: the target holds the pixels, guest memory not. */
++    D->color_serial = ++g.write_serial;
++    D->guest_dirty = 1;
++    if (eng_coherence_log())
++        fprintf(stderr, "[rsx engine] gpu_copy %ux%u surface 0x%08X at %u,%u -> 0x%08X at %u,%u\n",
++                w, h, S->offset, sx, sy, D->offset, dx, dy);
++    return 1;
++}
++
+ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
+ {
+     if (!g.ready || !g.be->readback || !pitch || !w || !h) return;
+diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
+index a341205..5b7ef36 100644
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -161,6 +161,13 @@ typedef struct rsx_draw_backend {
+     int  (*copy_surface_region)(void* user, u32 surface, u32 x, u32 y,
+                                 u32 w, u32 h, u32 texture);
+ 
++    /* Optional. Copy the w x h rectangle at (sx, sy) of colour target `src`
++     * to (dx, dy) of colour target `dst` (same format, different targets), on
++     * the GPU and in order with the draws around it. Returns 0 on success.
++     * NULL: the engine's caller copies through guest memory instead. */
++    int  (*copy_surface_to_surface)(void* user, u32 src, u32 sx, u32 sy,
++                                    u32 dst, u32 dx, u32 dy, u32 w, u32 h);
++
+     /* One depth target per guest zeta address. */
+     u32  (*depth_target_create)(void* user, u32 w, u32 h);
+     void (*depth_target_release)(void* user, u32 depth);
+@@ -297,6 +304,12 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
+  * pitch, `w` and `h` in 32-bit pixels. Only 8-bit-per-channel surfaces laid
+  * out with the same pitch take part; anything else is left alone. */
+ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
++/* A 1:1 32-bit 2D copy between two engine colour targets, done on the GPU.
++ * Returns 1 when done (the destination's guest memory is then stale and the
++ * engine owns it, as after a draw), 0 when the caller must copy as before. */
++int  rsx_draw_engine_gpu_copy(u32 src_location, u32 src_offset, u32 src_pitch,
++                              u32 dst_location, u32 dst_offset, u32 dst_pitch,
++                              u32 w, u32 h);
+ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h);
+ 
+ /* --- test hooks ---------------------------------------------------------- */
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index c89280d..585e21b 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -3376,6 +3376,38 @@ static int vk_eng_copy_surface_region(void* user, u32 surface, u32 x, u32 y,
+     return vk_rec_end() ? -1 : 0;
+ }
+ 
++/* A rectangle of one colour target copied into another (same format), on
++ * the GPU: the engine's 1:1 NV3089 copies between targets. At a render scale
++ * both rectangles are mapped to image pixels; a copy that would not land 1:1
++ * there is refused and goes through guest memory as before. */
++static int vk_eng_copy_surface_to_surface(void* user, u32 src_surface, u32 sx, u32 sy,
++                                          u32 dst_surface, u32 dx, u32 dy, u32 w, u32 h)
++{
++    (void)user;
++    vk_eng_obj* src = vk_eng_get(src_surface, VK_ENG_COLOR);
++    vk_eng_obj* dst = vk_eng_get(dst_surface, VK_ENG_COLOR);
++    if (!src || !dst || src == dst || !w || !h || src->fmt != dst->fmt ||
++        sx + w > src->w || sy + h > src->h || dx + w > dst->w || dy + h > dst->h)
++        return -1;
++    int32_t rs[4], rd[4];
++    vk_rs_rect(src, sx, sy, w, h, rs);
++    vk_rs_rect(dst, dx, dy, w, h, rd);
++    const u32 ew = (u32)(rs[2] - rs[0]), eh = (u32)(rs[3] - rs[1]);
++    if (!ew || !eh || ew != (u32)(rd[2] - rd[0]) || eh != (u32)(rd[3] - rd[1]))
++        return -1;
++    if (vk_rec_begin()) return -1;
++    VkImageCopy region = {
++        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .srcOffset = { rs[0], rs[1], 0 },
++        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .dstOffset = { rd[0], rd[1], 0 },
++        .extent = { ew, eh, 1 },
++    };
++    pvkCmdCopyImage(s_vk.cmd, src->im.img, VK_IMAGE_LAYOUT_GENERAL,
++                    dst->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
++    return vk_rec_end() ? -1 : 0;
++}
++
+ /* ---- E4: depth snapshots --------------------------------------------------
+  * A depth target read as a texture, which the engine asks for only after a
+  * depth-writing draw. Metal resolves it with a fullscreen pass into R32Float;
+@@ -4455,6 +4487,7 @@ static const rsx_draw_backend s_vk_engine_backend = {
+     .color_target_release = vk_eng_release,
+     .surface_view         = vk_eng_surface_view,
+     .copy_surface_region  = vk_eng_copy_surface_region,
++    .copy_surface_to_surface = vk_eng_copy_surface_to_surface,
+     .depth_target_create  = vk_eng_depth_target_create,
+     .depth_target_release = vk_eng_release,
+     .depth_snapshot       = vk_eng_depth_snapshot,
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
 index 2a13d6e..08f5b10 100644
 --- a/runtime/spu/spu_channels.c
