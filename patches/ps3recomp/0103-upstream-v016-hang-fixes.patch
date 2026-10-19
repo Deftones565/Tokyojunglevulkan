@@ -1,0 +1,680 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index e4ba0f9..e431fad 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -74,6 +74,21 @@ static u64 get_timestamp_ns(void)
+ static int  s_gcm_initialized = 0;
+ static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
+ static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
++/* Flip requests (each puts the status back to WAITING) and the request a
++ * pending flip completion was marked for: a completion delivered late must not
++ * mark DONE a flip requested after it (see ppu_gcm_pump; upstream #354). The
++ * status's read-modify-write transitions run on different threads, hence the
++ * lock. */
++static volatile u32 s_flip_req_seq, s_flip_tick_seq;
++#ifdef _WIN32
++static volatile LONG s_flip_lock;
++#define FLIP_LOCK()   do { while (InterlockedCompareExchange(&s_flip_lock, 1, 0)) YieldProcessor(); } while (0)
++#define FLIP_UNLOCK() InterlockedExchange(&s_flip_lock, 0)
++#else
++static volatile int s_flip_lock;
++#define FLIP_LOCK()   do { while (__atomic_exchange_n(&s_flip_lock, 1, __ATOMIC_ACQUIRE)) {} } while (0)
++#define FLIP_UNLOCK() __atomic_store_n(&s_flip_lock, 0, __ATOMIC_RELEASE)
++#endif
+ 
+ /* Count of guest flip requests (SetFlipCommand / SetPrepareFlip). The present
+  * loop uses this as the frame boundary: presenting only when a flip arrived
+@@ -100,6 +115,29 @@ static u32 s_current_display_buffer_id = 0;
+ static volatile int s_flip_pending = 0;
+ /* A flip _cellGcmSetFlipCommand queued in the FIFO: | bufferId, bit 8 = ours. */
+ #define GCM_FLIP_MARKER 0xFEAD0100u
++/* Flips queued into the command stream by gcm_flip_into_fifo, and how many of
++ * those markers the drain has reached. The RSX completes a flip when it
++ * executes it; until the drain reaches the marker, the flip has not happened,
++ * however many vblanks go by (upstream #343). */
++static volatile u32 s_fifo_flips_queued = 0, s_fifo_flips_reached = 0;
++static u32 s_fifo_flips_completed = 0;   /* reached count at the last completion */
++/* A flip requested outside the command stream (cellGcmSetFlipCommand, or a
++ * 0xFEAD word the drain met), not completed yet. */
++static volatile int s_flip_direct_pending = 0;
++
++/* May this beat complete a flip? Yes if the drain has executed a flip marker
++ * since the last completion, or if a flip that never went through the stream
++ * is waiting. A flip still queued ahead of the drain does not hold back the
++ * completion of one already executed; with none executed there is nothing to
++ * complete. Completing on the beat regardless told Twisted Metal the RSX had
++ * finished frames it had not reached. */
++static int gcm_flip_executed_take(void)
++{
++    const u32 r = s_fifo_flips_reached;
++    if (r != s_fifo_flips_completed) { s_fifo_flips_completed = r; return 1; }
++    if (s_flip_direct_pending) { s_flip_direct_pending = 0; return 1; }
++    return 0;
++}
+ /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
+  * derive it from the observed per-frame volume if a title outgrows it. */
+ #define GCM_FLIP_WRAP_BYTES 0x40000u
+@@ -645,7 +683,10 @@ void cellGcmSetWaitFlip(void)
+ #endif  /* elsewhere: runtime/platform/win32_compat.h */
+     for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+         Sleep(1);
+-    s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
++    /* A flip still WAITING after the bound is left to the tick. Forcing DONE
++     * here skipped its completion: the tick only completes WAITING flips, so
++     * the flip handler never ran for it (inFAMOUS 2 hung with get == put;
++     * upstream #354). */
+ }
+ 
+ /* NID: 0xDF6476BD. The same wait without libgcm's command-buffer space check;
+@@ -659,7 +700,10 @@ void cellGcmResetFlipStatus(void)
+     { static int n = 0;
+       if (getenv("FLIP_DBG") && n++ < 12)
+           fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
++    FLIP_LOCK();
+     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
++    s_flip_req_seq++;
++    FLIP_UNLOCK();
+ }
+ 
+ /* When the title last polled cellGcmGetFlipStatus and was told WAITING, i.e.
+@@ -752,11 +796,20 @@ void cellGcm_request_tick(void)
+       if (need) {
+           u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+           VBLANK_PEND_ADD();
+-          if (s_fifo_getoff == put) GCM_PENDING_SET(2);
++          if (s_fifo_getoff == put) {
++              FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK();
++              GCM_PENDING_SET(2);
++          }
+           return;
+       } }
+     VBLANK_PEND_ADD();
+-    GCM_PENDING_SET(2);
++    /* A flip queued in the command stream completes when the drain reaches
++     * its marker, as on the RSX; until then this beat is a vblank only. The
++     * completion is stamped with the flip requested last (see ppu_gcm_pump). */
++    if (gcm_flip_executed_take()) {
++        FLIP_LOCK(); s_flip_tick_seq = s_flip_req_seq; FLIP_UNLOCK();
++        GCM_PENDING_SET(2);
++    }
+ }
+ 
+ /* Deliver pending handlers on the calling host thread. Serialize the entire
+@@ -801,7 +854,16 @@ void ppu_gcm_pump(void)
+         }
+     }
+     if (p & 2) {
+-        s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
++        /* Delivery waits for a guest thread to reach an HLE call or a timer
++         * sleep, so a newer flip may have been requested (status WAITING
++         * again) since this completion was marked. Marking DONE then would
++         * erase that request: the ticker only completes WAITING flips, so its
++         * completion would never come (upstream #354). Leave the newer flip
++         * WAITING for the next tick. */
++        FLIP_LOCK();
++        if (s_flip_tick_seq == s_flip_req_seq)
++            s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
++        FLIP_UNLOCK();
+         if (s_flip_handler_opd && g_ps3_guest_caller) {
+             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
+             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
+@@ -831,8 +893,13 @@ void cellGcmTickVBlank(void) { s_vblank_count++; VBLANK_PEND_ADD(); }
+  * the callback IS the flip interrupt -- no flip, no callback. */
+ void cellGcmTickFlip(void)
+ {
+-    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
+-        GCM_PENDING_SET(2);
++    /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
++     * not happened yet (upstream #343, #354). */
++    FLIP_LOCK();
++    const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
++    if (waiting) s_flip_tick_seq = s_flip_req_seq;
++    FLIP_UNLOCK();
++    if (waiting) GCM_PENDING_SET(2);
+ }
+ 
+ /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
+@@ -870,6 +937,7 @@ unsigned long long ps3_ms_now(void)
+ }
+ 
+ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
++static int s_sema_blocked_pass = 0;   /* this drain stopped on a semaphore acquire */
+ /* Backlog past which the drain stops honouring one-flip-per-tick and
+  * catches up instead. Sized well above a frame's command list so a
+  * title that keeps up never sees this path. */
+@@ -960,13 +1028,17 @@ static u32 nv309e_swz(u32 x, u32 y, u32 l2w, u32 l2h)
+  * engine's surfaces. Around the guest-memory copy below: write the source
+  * rectangle back from any engine surface first, and push the written
+  * rectangle into any engine surface after. 32-bit pixels only. */
++/* IMAGE_IN_POINT is 12.4 fixed point per axis; DS_DX / DT_DY step the source in 20 fractional bits (1.0 = 0x100000).
++ * The origin in the steps' scale is therefore origin << 16: an origin of one texel (0x10) is 0x100000. */
++static inline u64 nv3089_origin(u32 p) { return (u64)p << 16; }
++
+ static void nv3089_engine_read(u32 in_pitch, u32 out_w, u32 out_h)
+ {
+     if (!rsx_draw_engine_enabled() || !out_w || !out_h) return;
+     const u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 */
+-    const u32 sx0 = u0 >> 4, sy0 = v0 >> 4;
+-    const u32 sx1 = (u32)((((u64)u0 << 8) + (u64)(out_w - 1) * s_nv3089.ds_dx) >> 20);
+-    const u32 sy1 = (u32)((((u64)v0 << 8) + (u64)(out_h - 1) * s_nv3089.dt_dy) >> 20);
++    const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
++    const u32 sx1 = (u32)((nv3089_origin(u0) + (u64)(out_w - 1) * s_nv3089.ds_dx) >> 20);
++    const u32 sy1 = (u32)((nv3089_origin(v0) + (u64)(out_h - 1) * s_nv3089.dt_dy) >> 20);
+     if (sx1 < sx0 || sy1 < sy0) return;
+     const u32 loc = (s_nv3089.src_dma != 0xFEED0001u) ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+     rsx_draw_engine_guest_read(loc, s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u, in_pitch,
+@@ -1063,10 +1135,10 @@ static void nv3089_blit(void)
+           const u8* sbase = vm_base + src2;
+           u8* dbase = vm_base + dst2;
+           for (u32 y = 0; y < out_h; y++) {
+-              u64 sv = ((u64)v0b << 8) + (u64)y * s_nv3089.dt_dy;
++              u64 sv = nv3089_origin(v0b) + (u64)y * s_nv3089.dt_dy;
+               const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
+               for (u32 x = 0; x < out_w; x++) {
+-                  u64 su = ((u64)u0b << 8) + (u64)x * s_nv3089.ds_dx;
++                  u64 su = nv3089_origin(u0b) + (u64)x * s_nv3089.ds_dx;
+                   memcpy(dbase + (u64)nv309e_swz(x, y, l2w, l2h) * 4,
+                          srow + (u32)(su >> 20) * 4, 4);
+               }
+@@ -1196,12 +1268,12 @@ static void nv3089_blit(void)
+     for (u32 y = 0; y < out_h; y++) {
+         u32 dy = out_y + y;
+         if (dy < cy0 || dy >= cy1) continue;
+-        u64 sv = ((u64)v0 << 8) + (u64)y * s_nv3089.dt_dy;         /* 20.12 */
++        u64 sv = nv3089_origin(v0) + (u64)y * s_nv3089.dt_dy;
+         u32 sy = (u32)(sv >> 20);
+         for (u32 x = 0; x < out_w; x++) {
+             u32 dx = out_x + x;
+             if (dx < cx0 || dx >= cx1) continue;
+-            u64 su = ((u64)u0 << 8) + (u64)x * s_nv3089.ds_dx;
++            u64 su = nv3089_origin(u0) + (u64)x * s_nv3089.ds_dx;
+             u32 sx = (u32)(su >> 20);
+             u32 s = src + sy * in_pitch + sx * bpp;
+             u32 d = dst + dy * dst_pitch + dx * bpp;
+@@ -1540,7 +1612,12 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
+         unsigned rescued = 0;
+         for (u32 io = from; io + 8 <= land; io += 4) {
+             u32 ea = gcm_io2ea(io); if (!ea) continue;
+-            rescued += gcm_rescue_at(io, vm_read32(ea));
++            const u32 w = vm_read32(ea);
++            /* A flip marker skipped here will never be reached: count it, or
++             * every flip after it waits for the drain forever. */
++            if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER &&
++                s_fifo_flips_reached != s_fifo_flips_queued) { s_fifo_flips_reached++; continue; }
++            rescued += gcm_rescue_at(io, w);
+         }
+         if (rescued) { static int m = 0; if (m++ < 8)
+             fprintf(stderr, "[cellGcmSys] resync rescued %u fence(s) from"
+@@ -1566,6 +1643,10 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
+                 wrapped = 1; io = tgt; continue;
+             }
+             if ((w & 3u) == 2u || w == 0x00020000u || w == 0) { io += 4; continue; }
++            if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {     /* see above */
++                if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
++                io += 4; continue;
++            }
+             rescued += gcm_rescue_at(io, w);
+             io += 4 + ((w >> 18) & 0x7FFu) * 4;
+         }
+@@ -1895,6 +1976,14 @@ int cellGcm_rsx_wait_consumed(unsigned timeout_ms)
+     return ok;
+ }
+ 
++/* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
++static int gcm_get_eq_put(void)
++{
++    static int eq = -1;
++    if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
++    return eq;
++}
++
+ static void gcm_rsx_process_fifo_unlocked(void)
+ {
+     { static unsigned _n = 0; static unsigned long long _t0 = 0;
+@@ -2032,6 +2121,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                             s_fifo_getoff, put);
+             }
+             s_fifo_getoff = put;
++            /* Whatever the walker had not reached is gone, and so are the flips
++             * queued in it: do not let a flip wait on them. */
++            s_fifo_flips_reached = s_fifo_flips_queued;
+             why = "no-io-mapping";
+             break;
+         }
+@@ -2071,6 +2163,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 gcm_set_current_display_buffer(w & 7u);
+                 s_flip_pending = 1;
+                 s_flip_request_count++;
++                /* Not past `queued`: a resync may already have written off
++                 * this flip. */
++                if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
+                 /* The flip resets the RSX register state, as RPCS3's
+                  * GCM_FLIP_COMMAND handler does (RSX::reset). Titles start
+                  * their next frame from the defaults; Tokyo Jungle's world
+@@ -2126,7 +2221,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
+               }
+               s_park_io  = GCM_NO_OFF;
+               s_jump_src = s_fifo_getoff;
+-              s_fifo_getoff = tgt; }
++              s_fifo_getoff = tgt;
++              /* get is the RSX's fetch pointer: a title polling it sees the
++               * GPU leave a segment as soon as the JUMP out of it is taken,
++               * not at the end of the pass, which can come tens of
++               * milliseconds later (upstream #347). */
++              if (!gcm_get_eq_put()) vm_write32(GCM_CONTROL_GUEST_ADDR + 4, tgt); }
+             continue;
+         }
+         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
+@@ -2193,12 +2293,27 @@ static void gcm_rsx_process_fifo_unlocked(void)
+              * the hardware does. Off by default: a title whose label nothing
+              * ever writes would wedge the drain permanently, and RELEASE on
+              * its own is the half that unblocks a waiting guest. */
+-            static int blk = -1;
+-            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0; }
+-            if (blk) { sem_blocked = 1; break; }
++            static int blk = -1; static unsigned blk_ms;
++            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0;
++                           const char* t = getenv("GCM_SEMA_ACQUIRE_MS"); blk_ms = t ? (unsigned)atoi(t) : 0; }
++            if (blk) {
++                /* GCM_SEMA_ACQUIRE_MS=<ms>: a bounded wait (upstream #327). The
++                 * hardware waits for ever; a producer that never comes would
++                 * wedge the drain, so after <ms> on the same acquire it is
++                 * consumed and said so. */
++                static u32 b_off, b_val; static unsigned long long b_t0;
++                extern unsigned long long ps3_ms_now(void);
++                const unsigned long long now = ps3_ms_now();
++                if (!b_t0 || b_off != s_sema_offset || b_val != v) { b_off = s_sema_offset; b_val = v; b_t0 = now; }
++                if (!blk_ms || now - b_t0 < blk_ms) { sem_blocked = 1; break; }
++                { static int tn; if (tn++ < 12)
++                    fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X gave up after %u ms (label 0x%08X)\n",
++                            s_sema_offset, v, blk_ms, vm_read32(la)); }
++                b_t0 = 0;
++            }
+         }
+                 }
+-                if (sem_blocked) break;
++                if (sem_blocked) { s_sema_blocked_pass = 1; break; }
+                 s_fifo_getoff += 4 + count * 4;
+                 continue;
+             }
+@@ -2391,8 +2506,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
+           }
+       } else burned = 0; }
+ 
++    /* A drain stopped on a semaphore acquire holds `get` on purpose: that is
++     * the wait, not a stuck walker, and the acquire's own bound ends it
++     * (upstream #327). Same for a park being waited on. */
+     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
+-      if (s_fifo_getoff == last && s_fifo_getoff != put && strcmp(why, "park-wait") != 0) {
++      if (s_sema_blocked_pass) { stuck = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; }
++      else if (s_fifo_getoff == last && s_fifo_getoff != put && strcmp(why, "park-wait") != 0) {
+           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
+                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
+       } else { stuck = 0; last = s_fifo_getoff; } }
+@@ -2499,9 +2618,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+      * to answer one question for a title that reports its ring full while the
+      * walker says it is drained: is the title reading `get`, or something else?
+      * If the overflow survives this, `get` is not what it consults. */
+-    { static int eq = -1;
+-      if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
+-      vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
++    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, gcm_get_eq_put() ? put : s_fifo_getoff);
+     if (s_fifo_getoff == put) {
+         __atomic_store_n(&s_drain_caught_seq, drain_seq, __ATOMIC_RELEASE);
+         AcquireSRWLockExclusive(&s_caught_lock);       /* no lost wake-up */
+@@ -2712,10 +2829,14 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+         gcm_set_current_display_buffer(bufferId);
+         s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
+         s_flip_request_count++;
++        s_flip_direct_pending = 1;
+     }
+     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
+      * until the present thread's cellGcmTickFlip marks it done (vsync). */
++    FLIP_LOCK();
+     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
++    s_flip_req_seq++;
++    FLIP_UNLOCK();
+     s_last_flip_time = get_timestamp_ns();
+ 
+     /* Invoke via OPD resolution, not a raw call into guest code.
+@@ -2753,6 +2874,7 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+      * ring wraps, and the recycle above keys on them. */
+     if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
+     vm_write32(cur, GCM_FLIP_MARKER | bufferId);
++    s_fifo_flips_queued++;
+     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
+      * SDK's buffer-full callback does. Otherwise the drain thread recycles it
+      * (see "recycled the title's own ring"), rewriting ctx->current and put
+@@ -3524,10 +3646,31 @@ s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
+ }
+ 
+ /* NID: 0xD8F88E1A */
++/* libgcm writes this into the context: NV406E SEMAPHORE_OFFSET and
++ * SEMAPHORE_ACQUIRE for the label, then the flip, so the RSX flips once the
++ * label holds the value. The import used to write the label itself, from the
++ * PPU, and flip at call time, overruling whoever was meant to write the label
++ * (upstream #343). Queue it the same way as _cellGcmSetFlipCommand, and fall
++ * back to the immediate form when the context is not a mapped command buffer
++ * or has no room. */
+ s32 _cellGcmSetFlipCommandWithWaitLabel(void* ctx, u32 bufferId,
+                                         u32 labelIndex, u32 labelValue)
+ {
+-    (void)ctx;
++    const u32 c = (u32)(uintptr_t)ctx;
++    if (c && labelIndex < CELL_GCM_MAX_LABEL_COUNT &&
++        bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM && s_display_buffer_set[bufferId]) {
++        const u32 end = vm_read32(c + 4), cur = vm_read32(c + 8);
++        if (cur + 16 + 8 + GCM_RECYCLE_SLACK <= end && gcm_ea2io(cur) != 0xFFFFFFFFu) {
++            vm_write32(cur + 0,  0x00040064u);   /* SEMAPHORE_OFFSET  */
++            vm_write32(cur + 4,  labelIndex * GCM_LABEL_STRIDE);
++            vm_write32(cur + 8,  0x00040068u);   /* SEMAPHORE_ACQUIRE */
++            vm_write32(cur + 12, labelValue);
++            vm_write32(c + 8, cur + 16);
++            if (gcm_flip_into_fifo(c, bufferId))
++                return gcm_flip_request(bufferId, 1);
++            vm_write32(c + 8, cur);              /* no room for the flip */
++        }
++    }
+     return cellGcmSetFlipCommandWithWaitLabel(bufferId, labelIndex, labelValue);
+ }
+ 
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index a4c0085..4f0b6bd 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -61,9 +61,17 @@ extern "C" const char* ppu_vfs_root = ".";
+ #define CELL_FS_O_RDONLY     0
+ #define CELL_FS_O_WRONLY     1
+ #define CELL_FS_O_RDWR       2
+-#define CELL_FS_O_CREAT      0x0200
+-#define CELL_FS_O_TRUNC      0x0400
+-#define CELL_FS_O_APPEND     0x0100
++/* Open flags: the PS3 SDK values (octal), byte for byte the set
++ * libs/filesystem/cellFs.h declares. The hex guesses that used to be here
++ * (O_CREAT 0x0200, O_TRUNC 0x0400, O_APPEND 0x0100) put the right numbers on
++ * the wrong names -- 0x200 and 0x400 are TRUNC and APPEND, not CREAT and
++ * TRUNC -- so a title opening a file with O_RDWR|O_CREAT (flags 0x42 =
++ * 000002 | 000100) hit an unnamed bit and got a plain read-only open; the file
++ * was never created. */
++#define CELL_FS_O_CREAT      0x0040   /* 000100 */
++#define CELL_FS_O_TRUNC      0x0200   /* 001000 */
++#define CELL_FS_O_APPEND     0x0400   /* 002000 */
++#define CELL_FS_O_EXCL       0x0080   /* 000200 */
+ #define CELL_FS_SEEK_SET     0
+ #define CELL_FS_SEEK_CUR     1
+ #define CELL_FS_SEEK_END     2
+@@ -239,7 +247,7 @@ static void cellFsOpen(ppu_context* ctx)
+     }
+     int hfd = open(hpath, oflags | O_BINARY, 0666);
+     if (hfd < 0) {
+-        fprintf(stderr, "[fs] open FAIL '%s' -> '%s'\n", gpath, hpath);
++        fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X)\n", gpath, hpath, flags);
+         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+     }
+     const char* fmode = (acc == CELL_FS_O_RDWR)
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 2fb7f03..74acc28 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3014,6 +3014,7 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
+  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
+  * numbers fall through to the return-CELL_OK stub. */
+ extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
++extern "C" __attribute__((weak)) void ppu_gcm_pump(void);   /* cellGcmSys.c */
+ /* In-flight lv2 syscall per guest thread; 0 = not in a syscall. See the guard
+  * in lv2_syscall() below. */
+ #define PS3_SC_INFLIGHT_MAX 64
+@@ -3030,6 +3031,15 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+           const char* e = getenv("PPU_GUARD_EA");
+           if (e && *e) ppu_guard_page((uint32_t)strtoul(e, 0, 16)); } }
+     uint64_t num = ctx->gpr[11];
++    /* Deliver pending GCM vblank/flip/user callbacks at the timer sleeps too,
++     * not only at HLE imports (ppu_hle.cpp): on hardware they fire
++     * asynchronously, and a guest thread that polls with usleep alone would
++     * otherwise never see the handler it is waiting for. inFAMOUS 2 defers its
++     * FIFO put to the flip handler (0x13AC88 stores it at obj+72, 0x13AC34
++     * writes it) and then spins in 0x13ACE8 on the ref register with
++     * sys_timer_usleep only; it used to be rescued by another thread's HLE
++     * call, and hung once that thread had nothing left to poll. */
++    if ((num == 141 || num == 142) && ppu_gcm_pump) ppu_gcm_pump();
+     /* Milestone: which lv2 calls this title makes, in first-occurrence order.
+      * Formatting the key each time is noise next to the profiler stamp below,
+      * which resolves a host return address to a guest function. */
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 3745867..3786241 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -834,9 +834,10 @@ static void hle_sys_spu_image_import(ppu_context* ctx)
+  */
+ #define SPINLOCK_BE1  0x01000000u          /* be32(1) */
+ 
+-static inline volatile long* spin_word(uint32_t ea)
++static inline volatile LONG* spin_word(uint32_t ea)
+ {
+-    return (volatile long*)(vm_base + ea);
++    /* LONG stays 32-bit on LP64 hosts, unlike native long. */
++    return (volatile LONG*)(vm_base + ea);
+ }
+ 
+ /* Test-and-set, not compare-and-swap: writing "locked" over an already-locked
+@@ -844,7 +845,7 @@ static inline volatile long* spin_word(uint32_t ea)
+  * Exchange is the one RMW the POSIX shim in win32_compat.h already provides. */
+ static inline int spin_try(uint32_t ea)
+ {
+-    return _InterlockedExchange(spin_word(ea), (long)SPINLOCK_BE1) == 0;
++    return _InterlockedExchange(spin_word(ea), (LONG)SPINLOCK_BE1) == 0;
+ }
+ 
+ static void sys_spinlock_initialize(ppu_context* ctx)
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index b9e9448..718cea9 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -1154,18 +1154,44 @@ int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
+     return n;
+ }
+ 
++/* Set or clear a task's bit in the guest `signalled` bitset from a host thread.
++ *
++ * SPU tasks update this same line with GETLLAR/PUTLLC (a task signalling
++ * another, or a barrier releasing its waiters), and those commits are
++ * serialised by the lock-line lock, not by s_sig_lock. A read-modify-write
++ * outside that lock overwrote an SPU commit landing between the read and the
++ * write, and the woken task slept forever (upstream #340, Twisted Metal's
++ * post-FX barrier). Do the whole read-modify-write under the lock, as a PPU
++ * atomic would, and drop every reservation on the line. Raw guest bytes:
++ * vm_write32 takes the lock-line lock itself and the lock does not nest. */
++static void spu_signalled_update(uint32_t taskset_ea, uint32_t taskId, int set)
++{
++    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
++    extern void spu_coh_notify_write(uint32_t);
++    extern uint8_t* vm_base;
++    const uint32_t word = taskset_ea + CSTS_SIGNALLED + (taskId / 32u) * 4u;
++    const uint32_t mask = (1u << 31) >> (taskId % 32u);
++    uint8_t* p = vm_base + word;
++    spu_lockline_lock();
++    uint32_t v = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++    v = set ? (v | mask) : (v & ~mask);
++    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
++    spu_coh_notify_write(word);
++    spu_lockline_unlock();
++}
++
+ /* Deliver a signal to a task (callable from any PPU/host thread). */
+ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
+ {
+     if (!taskset_ea || taskId >= 128) return;
+ #ifdef _WIN32
+     AcquireSRWLockExclusive(&s_sig_lock);
+-    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
++    spu_signalled_update(taskset_ea, taskId, 1);
+     WakeAllConditionVariable(&s_sig_cv);
+     ReleaseSRWLockExclusive(&s_sig_lock);
+ #else
+     pthread_mutex_lock(&s_sig_lock);
+-    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
++    spu_signalled_update(taskset_ea, taskId, 1);
+     pthread_cond_broadcast(&s_sig_cv);
+     pthread_mutex_unlock(&s_sig_lock);
+ #endif
+@@ -1340,7 +1366,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+             if (drain && secs >= drain) { drained = 1; break; }
+         }
+     }
+-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
++    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
+     ReleaseSRWLockExclusive(&s_sig_lock);
+ #else
+     if (spu_task_is_stale(taskset_ea)) spu_task_exit_stale(taskset_ea, taskId);
+@@ -1359,7 +1385,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+             if (drain && secs >= drain) { drained = 1; break; }
+         }
+     }
+-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
++    if (!drained) spu_signalled_update(taskset_ea, taskId, 0);
+     pthread_mutex_unlock(&s_sig_lock);
+ #endif
+     if (drained) { static int _d = 0; if (_d++ < 24)
+diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
+index 5534857..ebe4302 100644
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -520,8 +520,13 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+      * use everything above the scratch buffer. Word 1 of r1 (available stack)
+      * matters: left at 0, Tokyo Jungle's geometry and animation jobs
+      * (E7517A8D, E0CE22AC) halted in their stack check on every run, before
+-     * writing anything, and the gameplay world was never drawn. */
+-    spu_abi_set_stack(&ctx, (stack_top - 16u) & ~15u, s_ls + size_scr + guard);
++     * writing anything, and the gameplay world was never drawn.
++     * A function saves its link register in its caller's frame, at 16($sp),
++     * and the cache buffers start right at stack_top: with $sp at
++     * stack_top - 16 the entry's first store overwrote the first quadword of
++     * cacheBuffer[0] (upstream #366). Leave the caller's 32-byte frame inside
++     * the stack. */
++    spu_abi_set_stack(&ctx, (stack_top - 32u) & ~15u, s_ls + size_scr + guard);
+     /* Link register: where the job returns when it is done. The job manager
+      * would pass an address inside itself; 0 makes the job re-enter its own
+      * entry at LS 0 and run a bogus second lap. */
+diff --git a/tools/test_spinlock_word_width.py b/tools/test_spinlock_word_width.py
+new file mode 100644
+index 0000000..7beb122
+--- /dev/null
++++ b/tools/test_spinlock_word_width.py
+@@ -0,0 +1,117 @@
++#!/usr/bin/env python3
++"""Exercise the production sys_spinlock helpers on four-byte guest words.
++
++Extract the complete spinlock section, as test_lwcond_layout.py does for its
++handlers, and use the real platform atomics. An eight-byte exchange must not
++overwrite the neighboring word or fault on a four-but-not-eight-aligned lock.
++"""
++import os
++import shutil
++import subprocess
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++
++HARNESS = r'''
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <cstdlib>
++#include "win32_compat.h"
++
++alignas(8) static uint8_t memory[512];
++static uint8_t* vm_base = memory;
++struct ppu_context { uint64_t gpr[32]; uint64_t lr; };
++
++// PRODUCTION_SPINLOCK_HELPERS
++
++static void check(uint32_t ea, uint8_t locked, const char* operation)
++{
++    const uint8_t expected[4] = {0, 0, 0, locked};
++    if (memcmp(memory + ea, expected, sizeof expected) != 0) {
++        fprintf(stderr, "FAIL: %s: wrong big-endian lock value\n", operation);
++        exit(1);
++    }
++    for (uint32_t i = 0; i < sizeof memory; ++i) {
++        if ((i < ea || i >= ea + 4) && memory[i] != 0xA5) {
++            fprintf(stderr, "FAIL: %s: modified byte outside four-byte lock at +%d\n",
++                    operation, (int)i - (int)ea);
++            exit(1);
++        }
++    }
++}
++
++static void exercise(uint32_t ea)
++{
++    memset(memory, 0xA5, sizeof memory);
++    ppu_context ctx = {};
++    ctx.gpr[3] = ea;
++    sys_spinlock_initialize(&ctx);
++    check(ea, 0, "initialize");
++
++    ctx.gpr[3] = ea;
++    sys_spinlock_lock(&ctx);
++    check(ea, 1, "lock");
++
++    ctx.gpr[3] = ea;
++    sys_spinlock_trylock(&ctx);
++    if (ctx.gpr[3] != UINT64_C(0xFFFFFFFF8001000A)) {
++        fprintf(stderr, "FAIL: trylock while held must return sign-extended EBUSY\n");
++        exit(1);
++    }
++    check(ea, 1, "busy trylock");
++
++    ctx.gpr[3] = ea;
++    sys_spinlock_unlock(&ctx);
++    check(ea, 0, "unlock");
++
++    ctx.gpr[3] = ea;
++    sys_spinlock_trylock(&ctx);
++    if (ctx.gpr[3] != 0) {
++        fprintf(stderr, "FAIL: trylock after unlock must return CELL_OK\n");
++        exit(1);
++    }
++    check(ea, 1, "successful trylock");
++
++    ctx.gpr[3] = ea;
++    sys_spinlock_unlock(&ctx);
++    check(ea, 0, "final unlock");
++    printf("PASS: spinlock at host address modulo 8 = %u\n",
++           (unsigned)((uintptr_t)(memory + ea) % 8));
++}
++
++int main()
++{
++    // The aligned case diagnoses adjacent-word corruption even on hosts where
++    // the misaligned eight-byte exchange would terminate with SIGBUS.
++    exercise(0x100);
++    exercise(0x104);
++    return 0;
++}
++'''
++
++
++def main():
++    if os.name == 'nt':
++        print('SKIP: LP64 regression harness uses a POSIX compiler driver')
++        return
++    cxx = os.environ.get('CXX') or shutil.which('c++') or shutil.which('clang++') or shutil.which('g++')
++    if not cxx:
++        raise SystemExit('FAIL: no C++ compiler available')
++    source = (ROOT / 'runtime/ppu/ppu_sysprx.cpp').read_text()
++    start = source.index('#define SPINLOCK_BE1')
++    end = source.index('extern "C" void ppu_sysprx_register', start)
++    code = HARNESS.replace('// PRODUCTION_SPINLOCK_HELPERS', source[start:end])
++    with tempfile.TemporaryDirectory() as tmp:
++        cpp = Path(tmp) / 'spinlock.cpp'
++        exe = Path(tmp) / 'spinlock'
++        cpp.write_text(code)
++        subprocess.run([cxx, '-std=c++17', '-O2', '-pthread',
++                        '-I', str(ROOT / 'runtime/platform'), str(cpp),
++                        '-o', str(exe)], check=True)
++        subprocess.run([str(exe)], check=True, timeout=10)
++
++
++if __name__ == '__main__':
++    main()
