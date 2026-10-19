@@ -1,0 +1,119 @@
+# sceNpDrmIsAvailable(2): register it, hand the title's klicensee to the EDAT layer
+# (used only where it verifies against the file's dev_hash). It was an unresolved
+# import faked to OK, the key was dropped, and Tokyo Jungle's DLC EDATs (license
+# type 3 under its own klicensee) never decrypted: DLC animals stayed locked.
+# User-confirmed 2026-10-19: all 21 DLC unlocked.
+diff --git a/libs/filesystem/edat.c b/libs/filesystem/edat.c
+index 64f0ff5..c0100b8 100644
+--- a/libs/filesystem/edat.c
++++ b/libs/filesystem/edat.c
+@@ -424,6 +424,20 @@ static int edat_rif_key(const char* in_path, uint8_t out[16])
+     return 0;
+ }
+ 
++/* Klicensees the title supplied (sceNpDrmIsAvailable): its own content key,
++ * which a license-type-3 EDAT of its DLC is encrypted under. */
++static uint8_t s_guest_klic[32][16];
++static int     s_guest_klic_n;
++
++void edat_note_klicensee(const uint8_t klic[16])
++{
++    if (!klic) return;
++    for (int i = 0; i < s_guest_klic_n; i++)
++        if (memcmp(s_guest_klic[i], klic, 16) == 0) return;
++    if (s_guest_klic_n >= 32) return;
++    memcpy(s_guest_klic[s_guest_klic_n++], klic, 16);
++}
++
+ int edat_decrypt_file(const char* in_path, const char* out_path)
+ {
+     static int checked = 0;
+@@ -496,11 +510,23 @@ int edat_decrypt_file(const char* in_path, const char* out_path)
+             aes128_cmac(ck, hdr, 0x60, mac);
+             if (memcmp(mac, dev_hash, 16) == 0) { found = c; break; }
+         }
++        int guest = -1;
++        for (int c = 0; found < 0 && guest < 0 && c < s_guest_klic_n; c++) {
++            uint8_t ck[16], mac[16];
++            for (int i = 0; i < 16; i++)
++                ck[i] = (uint8_t)(s_guest_klic[c][i] ^ NP_OMAC_KEY_2[i]);
++            aes128_cmac(ck, hdr, 0x60, mac);
++            if (memcmp(mac, dev_hash, 16) == 0) guest = c;
++        }
+         if (found >= 0 && (license & 3) == 3) {
+             memcpy(key, KLIC_CANDIDATES[found].key, 16);
+             have_key = 1;
+             fprintf(stderr, "[edat] klicensee %s verified against dev_hash\n",
+                     KLIC_CANDIDATES[found].name);
++        } else if (guest >= 0 && (license & 3) == 3) {
++            memcpy(key, s_guest_klic[guest], 16);
++            have_key = 1;
++            fprintf(stderr, "[edat] the title's klicensee (sceNpDrmIsAvailable) verified against dev_hash\n");
+         } else if (edat_rif_key(in_path, key)) {
+             have_key = 1;
+             fprintf(stderr, "[edat] license type %u: using the supplied RIF key%s\n",
+diff --git a/libs/filesystem/edat.h b/libs/filesystem/edat.h
+index 36b2559..ce830d9 100644
+--- a/libs/filesystem/edat.h
++++ b/libs/filesystem/edat.h
+@@ -35,6 +35,11 @@ extern "C" {
+ /* True if the file at host_path starts with the NPD magic. Cheap: one 4-byte read. */
+ int edat_is_npd(const char* host_path);
+ 
++/* A klicensee the title handed to sceNpDrmIsAvailable(2): tried like the
++ * built-in candidates, and used only when it verifies against a file's own
++ * dev_hash. Up to 32 distinct keys are kept. */
++void edat_note_klicensee(const uint8_t klic[16]);
++
+ /* Decrypt in_path -> out_path. 0 on success, negative on failure (reason logged). */
+ int edat_decrypt_file(const char* in_path, const char* out_path);
+ 
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index befa8e6..a4c0085 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -732,6 +732,35 @@ static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+  * (RPCS3's sys_fs_fsync agrees). Tokyo Jungle fsyncs every sound bank it has
+  * just read and prints "fileps3.c(1091) : failed to sync file (8001002A)" for
+  * each, then carries on; answering OK skipped those lines. */
++/* sceNpDrmIsAvailable(k_licensee*, path) / ...2: on hardware this primes the
++ * kernel with the title's content key, so its EDATs then read as plaintext.
++ * It was an unregistered import (faked OK), the key was dropped, and Tokyo
++ * Jungle's DLC EDATs (license type 3, under the title's own klicensee) could
++ * not be decrypted: every DLC animal stayed locked. Hand the key to the EDAT
++ * layer (used only where it verifies against a file's dev_hash) and answer
++ * whether the file opens: OK, or CELL_ENOENT. */
++static void sceNpDrmIsAvailable(ppu_context* ctx)
++{
++    const uint32_t klic_ea = (uint32_t)ctx->gpr[3];
++    const uint32_t path_ea = (uint32_t)ctx->gpr[4];
++    if (klic_ea) {
++        uint8_t k[16];
++        for (int i = 0; i < 16; i++) k[i] = vm_read8(klic_ea + (uint32_t)i);
++        edat_note_klicensee(k);
++    }
++    char gpath[512] = {0}, hpath[1024];
++    for (uint32_t i = 0; path_ea && i + 1 < sizeof gpath; i++) {
++        gpath[i] = (char)vm_read8(path_ea + i);
++        if (!gpath[i]) break;
++    }
++    host_path(hpath, sizeof hpath, gpath);
++    struct stat st;
++    const int ok = gpath[0] && stat(hpath, &st) == 0;
++    { static int n = 0; if (n++ < 32)
++        fprintf(stderr, "[npdrm] IsAvailable '%s' -> %s\n", gpath, ok ? "OK" : "ENOENT"); }
++    ctx->gpr[3] = ok ? 0 : (uint64_t)(int64_t)CELL_FS_ENOENT;
++}
++
+ static void cellFsFsync(ppu_context* ctx)
+ {
+     FS_LOCKED;
+@@ -844,6 +873,8 @@ extern "C" void ppu_fs_register(void)
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
++    ps3_hle_register_ctx(ps3_compute_nid("sceNpDrmIsAvailable"),  "sceNpDrmIsAvailable",  sceNpDrmIsAvailable);
++    ps3_hle_register_ctx(ps3_compute_nid("sceNpDrmIsAvailable2"), "sceNpDrmIsAvailable2", sceNpDrmIsAvailable);
+     ps3_hle_register_ctx(ps3_compute_nid("cellFsAllocateFileAreaWithoutZeroFill"),
+                          "cellFsAllocateFileAreaWithoutZeroFill", cellFsAllocateFileAreaWithoutZeroFill);
+     /* AIO by literal import NID -- ps3_compute_nid() of the friendly name does
