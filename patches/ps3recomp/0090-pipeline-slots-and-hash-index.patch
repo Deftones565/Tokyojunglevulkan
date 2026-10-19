@@ -1,0 +1,85 @@
+# Vulkan backend pipeline slots 512 -> 8192 (= the engine's cache), loud log when
+# full (past 512 every new shader combination's draws were dropped for good);
+# engine pipeline lookup by hash index instead of a per-draw linear scan.
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 5674b02..fce37e9 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -43,6 +43,7 @@ extern u32 ppu_vm_size;
+ #define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE
+ #define ENG_MAX_VTEXTURES  64
+ #define ENG_MAX_PIPELINES  8192
++#define ENG_PIPE_INDEX     16384   /* power of two, 2x ENG_MAX_PIPELINES */
+ #define ENG_MAX_BATCHES    256
+ #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
+ #define ENG_INVALID        0xFFFFFFFFu
+@@ -1905,13 +1906,30 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+     key = eng_fnv1a(&rt_count, sizeof rt_count, key);
+     key = rsx_draw_engine_hash_render_state(rs, key);
+ 
+-    for (u32 i = 0; i < g.n_pipelines; i++)
+-        if (g.pipelines[i].key == key) {
+-            *out_fixed = g.pipelines[i].fixed;
+-            *out_tex_used = g.pipelines[i].tex_used;
+-            return g.pipelines[i].handle;
++    /* Hash index over g.pipelines (open addressing, index + 1, 0 = empty):
++     * this runs for every draw, and a linear scan grew with every shader
++     * combination the session had seen. */
++    static u16 s_pipe_index[ENG_PIPE_INDEX];
++    if (!g.n_pipelines) memset(s_pipe_index, 0, sizeof s_pipe_index);
++    u32 hslot = (u32)(key ^ (key >> 29)) & (ENG_PIPE_INDEX - 1u);
++    for (;;) {
++        const u32 ix = s_pipe_index[hslot];
++        if (!ix) break;
++        if (g.pipelines[ix - 1u].key == key) {
++            *out_fixed = g.pipelines[ix - 1u].fixed;
++            *out_tex_used = g.pipelines[ix - 1u].tex_used;
++            return g.pipelines[ix - 1u].handle;
+         }
+-    if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
++        hslot = (hslot + 1u) & (ENG_PIPE_INDEX - 1u);
++    }
++    if (g.n_pipelines >= ENG_MAX_PIPELINES) {
++        static int warned;
++        if (!warned) { warned = 1;
++            fprintf(stderr, "[rsx engine] pipeline cache full (%u); new shader combinations are dropped\n",
++                    (unsigned)ENG_MAX_PIPELINES); }
++        return 0;
++    }
++    s_pipe_index[hslot] = (u16)(g.n_pipelines + 1u);   /* the entry added below */
+ 
+     u32 handle = 0;
+     int vi = 1, fi = 1;
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 585e21b..d0c57dc 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -3568,7 +3568,11 @@ static int vk_eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32
+  * samplers s0..s3 would alias the pixel samplers' binding), colour targets
+  * other than RGBA8 and RGBA16F, depth-only passes, and stencil (the depth format
+  * has no stencil aspect yet, so the test is inert). */
+-#define VK_ENG_MAX_PIPE   512
++/* As many as the engine caches (ENG_MAX_PIPELINES). It was 512: past that
++ * every new shader combination failed, the engine cached the failure, and its
++ * draws were dropped for the rest of the session (the LasVola port froze the
++ * same way when its 1024-entry vertex-shader cache filled after ~13 min). */
++#define VK_ENG_MAX_PIPE   8192
+ #define VK_ENG_TOPOLOGIES 5
+ #define VK_ENG_FB_CACHE   64
+ 
+@@ -3829,7 +3833,14 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
+     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
+     u32 slot = VK_ENG_MAX_PIPE;
+     for (u32 i = 0; i < VK_ENG_MAX_PIPE; i++) if (!s_epipe[i].used) { slot = i; break; }
+-    if (slot == VK_ENG_MAX_PIPE) return 0;
++    if (slot == VK_ENG_MAX_PIPE) {
++        if (!(s_e2.warned & 256u)) {
++            VK_LOG("engine: all %u pipeline slots in use; new shader combinations are dropped\n",
++                   (unsigned)VK_ENG_MAX_PIPE);
++            s_e2.warned |= 256u;
++        }
++        return 0;
++    }
+     vk_eng_pipe* P = &s_epipe[slot];
+     memset(P, 0, sizeof *P);
+     if (vk_eng_translate(vs_hlsl, RSX_SHADER_STAGE_VERTEX, &P->vs)) return 0;
