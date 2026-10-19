@@ -1,0 +1,470 @@
+# SPU job contexts from a pool, cleared only where the last job could write
+# (was a full 260 KB memset per job, ~19% of CPU); s_job_ls copied by extent;
+# MFC engine table 64 slots + per-thread last-slot cache; transient contexts
+# (lifted task runs, policy modules) release their slot (they leaked, the
+# table overflowed at boot, every DMA then took the claim lock: ~7.5% CPU).
+# User test 2026-10-19 with tj_vm_fast: 29-33 -> 40-49 FPS (forced 60 mode).
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 2a13d6e..08f5b10 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -22,9 +22,9 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <setjmp.h>
+-#ifndef _WIN32
+-#include <sched.h>   /* sched_yield */
+-#endif
++#ifndef _WIN32
++#include <sched.h>   /* sched_yield */
++#endif
+ #include <time.h>
+ #include "../platform/win32_compat.h"
+ 
+@@ -66,48 +66,48 @@ static uint64_t spu_host_ns(void)
+ #else
+ #  define SPU_TLS __thread
+ #endif
+-/* Called after an SPU atomic commits a 128-byte line, with the lock-line lock
+- * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
+- * when a task sets the flag, instead of on its next 2 ms poll. */
+-void (*g_spu_line_commit_hook)(uint32_t line) = 0;
+-/* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
+-void spu_taskset_line_committed(uint32_t line);
+-/* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
+- * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
+-#define SPU_WATCH_MAX 4
+-int g_spu_ls_watch_n = -1;
+-static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
+-unsigned* spu_ls_watch_list(int* out_n)
+-{
+-    if (g_spu_ls_watch_n < 0) {
+-        int n = 0; const char* e = getenv("SPU_LS_WATCH");
+-        while (e && *e && n < SPU_WATCH_MAX) {
+-            s_spu_ls_watch[n++] = (unsigned)strtoul(e, (char**)&e, 0) & ~0xFu;
+-            while (*e == ',' || *e == ' ') e++;
+-        }
+-        g_spu_ls_watch_n = n;
+-    }
+-    *out_n = g_spu_ls_watch_n;
+-    return s_spu_ls_watch;
+-}
+-void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
+-{
+-    int n; spu_ls_watch_list(&n);
+-    if (!n) return;
+-    uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
+-    for (int i = 0; i < g_spu_ls_watch_n; i++) {
+-        if (s_spu_ls_watch[i] == a) {
+-            fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X] "
+-                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+-                is_write ? "WR" : "rd", a, pc, lr,
+-                p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+-                p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
+-            fflush(stderr);
+-            break;
+-        }
+-    }
+-}
+-
++/* Called after an SPU atomic commits a 128-byte line, with the lock-line lock
++ * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
++ * when a task sets the flag, instead of on its next 2 ms poll. */
++void (*g_spu_line_commit_hook)(uint32_t line) = 0;
++/* spu_workload.c: wakes tasks parked in WAIT_SIGNAL on that line's taskset. */
++void spu_taskset_line_committed(uint32_t line);
++/* SPU_LS_WATCH=0x1BE80[,0x927D80...]: watch up to 4 16-byte LS lines (reads
++ * and writes) in every SPU image. See spu_ls_watch_hit2 for the fast path. */
++#define SPU_WATCH_MAX 4
++int g_spu_ls_watch_n = -1;
++static unsigned s_spu_ls_watch[SPU_WATCH_MAX];
++unsigned* spu_ls_watch_list(int* out_n)
++{
++    if (g_spu_ls_watch_n < 0) {
++        int n = 0; const char* e = getenv("SPU_LS_WATCH");
++        while (e && *e && n < SPU_WATCH_MAX) {
++            s_spu_ls_watch[n++] = (unsigned)strtoul(e, (char**)&e, 0) & ~0xFu;
++            while (*e == ',' || *e == ' ') e++;
++        }
++        g_spu_ls_watch_n = n;
++    }
++    *out_n = g_spu_ls_watch_n;
++    return s_spu_ls_watch;
++}
++void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr)
++{
++    int n; spu_ls_watch_list(&n);
++    if (!n) return;
++    uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
++    for (int i = 0; i < g_spu_ls_watch_n; i++) {
++        if (s_spu_ls_watch[i] == a) {
++            fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X] "
++                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
++                is_write ? "WR" : "rd", a, pc, lr,
++                p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
++                p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
++            fflush(stderr);
++            break;
++        }
++    }
++}
++
+ static SPU_TLS jmp_buf s_spu_halt_env;
+ static SPU_TLS int     s_spu_halt_armed = 0;
+ 
+@@ -225,7 +225,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+      * recursion guard halted the SPU at 2000 after a few minutes of idling. */
+     ctx->host_depth = 0;
+     ctx->irq_frame = 0;
+-    ctx->drain_ret_pc = 0;
++    ctx->drain_ret_pc = 0;
+     /* Nest-safe: a job run synchronously from inside another SPU's execution
+      * re-enters here on the same host thread. The halt target is per-thread,
+      * so save the outer one and put it back on the way out -- otherwise the
+@@ -296,7 +296,12 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+  *     stored both took the same slot and then shared one engine's queue and tag
+  *     state -- one SPU's tag wait satisfied by the other SPU's transfer.
+  * ===========================================================================*/
+-#define SPU_MAX_CONTEXTS 8
++/* Tokyo Jungle keeps more than 8 contexts alive (SPU threads, tasksets and a
++ * reused context per job-runner thread): past 8, every DMA of the rest went
++ * through the shared fallback engine and took s_mfc_claim_lock exclusively,
++ * ~7% of all CPU in gameplay, with those SPUs sharing one engine's tag state.
++ * The LasVola port uses 64 for the same reason. */
++#define SPU_MAX_CONTEXTS 64
+ 
+ typedef struct {
+     spu_context* volatile ctx;
+@@ -308,9 +313,19 @@ static SRWLOCK      s_mfc_claim_lock = SRWLOCK_INIT;
+ 
+ static mfc_engine* mfc_for(spu_context* ctx)
+ {
++    /* The slot this thread found last: a context runs on one thread at a time
++     * and issues many DMAs in a row. Checked against the slot's owner, so a
++     * slot released and claimed by another context since is not used. */
++#ifdef _WIN32
++    static __declspec(thread) int last = -1;
++#else
++    static __thread int last = -1;
++#endif
++    if (last >= 0 && s_mfc_slots[last].ctx == ctx)
++        return &s_mfc_slots[last].mfc;
+     for (int i = 0; i < SPU_MAX_CONTEXTS; i++)
+-        if (s_mfc_slots[i].ctx == ctx)
+-            return &s_mfc_slots[i].mfc;
++        if (s_mfc_slots[i].ctx == ctx) { last = i;
++            return &s_mfc_slots[i].mfc; }
+ 
+     /* No slot yet: take one. The engine is initialized before the slot is
+      * published, so it is never visible to anyone in a half-reset state. */
+@@ -746,10 +761,10 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
+         ctx->resv_valid = 0;                           /* reservation consumed */
+         spu_lockline_unlock();
+-        if (ctx->atomic_stat == 0) {
+-            spu_taskset_line_committed(ea & ~127u);
+-            if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+-        }
++        if (ctx->atomic_stat == 0) {
++            spu_taskset_line_committed(ea & ~127u);
++            if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
++        }
+         return 1;
+ 
+     case MFC_PUTLLUC_CMD:
+@@ -767,7 +782,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+         spu_lockline_unlock();
+         spu_taskset_line_committed(ea & ~127u);
+-        if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
++        if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+         return 1;
+ 
+     default:
+@@ -2042,10 +2057,10 @@ static int spu_smc_microstep(spu_context* ctx)
+                       " microstep set -- handing to the interpreter (steps=%d)\n",
+                       ctx->image_id, pc, w, steps); }
+         ctx->pc = pc;
+-        /* Stop at the drain's return point too: it sits mid-function, so it is
+-         * no lifted entry, and a job's return would otherwise run on through
+-         * the caller's code (GH3's song-freeze; see drain_ret_pc). */
+-        return spu_interp_run_until(ctx, pc, ctx->drain_ret_pc) ? 1 : 0;
++        /* Stop at the drain's return point too: it sits mid-function, so it is
++         * no lifted entry, and a job's return would otherwise run on through
++         * the caller's code (GH3's song-freeze; see drain_ret_pc). */
++        return spu_interp_run_until(ctx, pc, ctx->drain_ret_pc) ? 1 : 0;
+     }
+     { static int _n = 0; if (_n++ < 4)
+         fprintf(stderr, "[spu-smc] microstep img=%d runaway (4096 steps from 0x%05X)\n",
+diff --git a/runtime/spu/spu_lifted_job.h b/runtime/spu/spu_lifted_job.h
+index 58c9082..8bf8205 100644
+--- a/runtime/spu/spu_lifted_job.h
++++ b/runtime/spu/spu_lifted_job.h
+@@ -105,6 +105,11 @@ static inline int32_t spu_run_interp_job(uint8_t* local_store, uint32_t entry_pc
+      * first, or the coherency walk dereferences this stack frame after it is
+      * gone. See spu_coh_unregister. */
+     spu_coh_unregister(&ctx);
++    /* The context dies with this frame: give back the MFC engine slot its
++     * first DMA claimed. Left claimed, every task run leaked one, the table
++     * filled at boot, and from then on each DMA of a new context scanned it,
++     * took the claim lock and shared one fallback engine. */
++    { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
+     return (int32_t)ctx.stop_code;
+ }
+ 
+@@ -333,6 +338,11 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+      * in the reserver set it is walked by the next PPU store to that line.
+      * GH3's Havok task returning is what first hit it. */
+     spu_coh_unregister(&ctx);
++    /* The context dies with this frame: give back the MFC engine slot its
++     * first DMA claimed. Left claimed, every task run leaked one, the table
++     * filled at boot, and from then on each DMA of a new context scanned it,
++     * took the claim lock and shared one fallback engine. */
++    { extern void spu_mfc_release(spu_context*); spu_mfc_release(&ctx); }
+     if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
+     return 0;
+ }
+diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
+index 02f7022..6fc6255 100644
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -40,6 +40,7 @@
+ #include "spu_context.h"
+ 
+ #include <stdio.h>
++#include <stddef.h>   /* offsetof */
+ #include <stdlib.h>
+ #include <string.h>
+ #include "../platform/win32_compat.h"   /* SRWLOCK (s_job_ls copy) */
+@@ -175,6 +176,109 @@ SPURS_JOB_TLS int g_spurs_job_sent_event;
+ /* Set while this thread runs a job of a parallel JOBLIST (cellSpurs.c). */
+ SPURS_JOB_TLS int g_spurs_job_in_list;
+ 
++/* One job context per job-runner thread, reused from job to job.
++ *
++ * A job used to get a stack-local context that spu_context_init zeroed whole:
++ * 256 KB of local store plus registers and channels, for every job -- a
++ * memset that was ~19% of all CPU in Tokyo Jungle gameplay (mg5-base-perf;
++ * the LasVola port measured the same zeroing at 20-55% of SPU job time).
++ *
++ * Contexts come from a pool: a job takes a free one and returns it when it is
++ * done, so there are only ever as many as jobs that ran at once (job-chain
++ * walkers and policy workers are short-lived threads, so one per thread grew
++ * without bound), and each keeps its MFC engine slot from job to job. Between
++ * jobs a context is brought back to exactly what spu_context_init gives by clearing only what
++ * the previous job could own: registers and everything outside the local
++ * store, LS from the end of the new job's binary (which is copied over the
++ * rest) up to the end of the previous job's regions, and the descriptor and
++ * context block at the top of LS. The rest of LS is still zero.
++ *
++ * SPU_JOB_CTX_VERIFY=1 scans the rest of LS after every job and logs any
++ * write outside the job's regions; that context is then cleared whole before
++ * its next job. SPU_JOB_CTX_REUSE=0 restores the full clear every job. */
++#define JOB_LS_TOP_BLOCK 0x440u   /* descriptor (0x400) + context (0x40) */
++/* The job's entry saves its link register in its caller's frame, 16 bytes at
++ * the stack top, i.e. just past the job's regions (SPU_JOB_CTX_VERIFY found it
++ * on every image: 2 nonzero bytes at region end + 1, 0x3FF00's). */
++#define JOB_CALLER_FRAME 16u
++
++typedef struct spurs_job_ctx_slot {
++    spu_context ctx;
++    uint32_t    dirty_end;   /* LS [0, dirty_end) may be nonzero */
++    struct spurs_job_ctx_slot* next;   /* free list */
++} spurs_job_ctx_slot;
++
++static spurs_job_ctx_slot* s_job_ctx_free;
++static SRWLOCK s_job_ctx_lock = SRWLOCK_INIT;
++
++static int spurs_job_env_flag(const char* name, int dflt)
++{
++    const char* v = getenv(name);
++    return v && *v ? strcmp(v, "0") != 0 : dflt;
++}
++
++static spurs_job_ctx_slot* spurs_job_ctx_take(uint32_t bin_end)
++{
++    static int reuse = -1;
++    if (reuse < 0) reuse = spurs_job_env_flag("SPU_JOB_CTX_REUSE", 1);
++    AcquireSRWLockExclusive(&s_job_ctx_lock);
++    spurs_job_ctx_slot* slot = s_job_ctx_free;
++    if (slot) s_job_ctx_free = slot->next;
++    ReleaseSRWLockExclusive(&s_job_ctx_lock);
++    if (!slot) {
++        slot = (spurs_job_ctx_slot*)calloc(1, sizeof(*slot));
++        if (!slot) return NULL;
++        spu_context_init(&slot->ctx, 0);
++        slot->dirty_end = 0;
++        return slot;
++    }
++    spu_context* ctx = &slot->ctx;
++    if (!reuse || slot->dirty_end > SPU_LS_SIZE - JOB_LS_TOP_BLOCK) {
++        spu_context_init(ctx, 0);
++        return slot;
++    }
++    const size_t ls_begin = offsetof(spu_context, ls_store);
++    const size_t ls_end   = ls_begin + SPU_LS_SIZE;
++    memset(ctx, 0, ls_begin);
++    memset((uint8_t*)ctx + ls_end, 0, sizeof(*ctx) - ls_end);
++    if (slot->dirty_end > bin_end)
++        memset(ctx->ls_store + bin_end, 0, slot->dirty_end - bin_end);
++    memset(ctx->ls_store + SPU_LS_SIZE - JOB_LS_TOP_BLOCK, 0, JOB_LS_TOP_BLOCK);
++    ctx->ls     = ctx->ls_store;
++    ctx->spu_id = 0;
++    ctx->status = SPU_STATUS_STOPPED;
++    return slot;
++}
++
++/* After a job: how much of LS the next reset must clear. */
++static void spurs_job_ctx_done(spurs_job_ctx_slot* slot, uint32_t region_end,
++                               int image_id, uint32_t job_ea)
++{
++    static int verify = -1;
++    if (verify < 0) verify = spurs_job_env_flag("SPU_JOB_CTX_VERIFY", 0);
++    uint32_t end = region_end < SPU_LS_SIZE ? region_end : SPU_LS_SIZE;
++    if (verify) {
++        const uint8_t* ls = slot->ctx.ls_store;
++        const uint32_t top = SPU_LS_SIZE - JOB_LS_TOP_BLOCK;
++        uint32_t first = 0, count = 0;
++        for (uint32_t o = end; o < top; o++)
++            if (ls[o]) { if (!count) first = o; count++; }
++        if (count) {
++            static volatile long n_stray;
++            if (InterlockedIncrement(&n_stray) <= 32)
++                fprintf(stderr, "[spurs-job] stray LS write image=%d job=0x%08X "
++                                "region_end=0x%05X first=0x%05X bytes=%u\n",
++                        image_id, job_ea, end, first, count);
++            end = SPU_LS_SIZE;          /* clear it whole before the next job */
++        }
++    }
++    slot->dirty_end = end;
++    AcquireSRWLockExclusive(&s_job_ctx_lock);
++    slot->next = s_job_ctx_free;
++    s_job_ctx_free = slot;
++    ReleaseSRWLockExclusive(&s_job_ctx_lock);
++}
++
+ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+                       uint32_t job_ea, uint32_t job_desc_size)
+ {
+@@ -199,13 +303,18 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+         return -1;
+     }
+ 
+-    /* The job's local store is built straight into its context's: init zeroes
+-     * it, as the calloc'd staging store this used to be (then copied whole into
+-     * the context, and freed) was. That was a 256 KB allocation, page faults
+-     * and two 256 KB copies per job, ~20% of a job thread's time in Tokyo
+-     * Jungle gameplay (mg5-st1). */
+-    spu_context ctx;
+-    spu_context_init(&ctx, 0);
++    /* The job's local store is built straight into its context's (see
++     * spurs_job_ctx_take: a pooled context, cleared to the state
++     * spu_context_init gives). Before that it was a calloc'd staging store
++     * copied whole into a fresh context: a 256 KB allocation, page faults and
++     * two 256 KB copies per job, ~20% of a job thread's time (mg5-st1). */
++    spurs_job_ctx_slot* slot = spurs_job_ctx_take(size_bin);
++    if (!slot) {
++        fprintf(stderr, "[spurs-job] job 0x%08X: no job context -- not run\n", job_ea);
++        return -1;
++    }
++    spu_context* const ctxp = &slot->ctx;
++#define ctx (*ctxp)
+     uint8_t* ls = ctx.ls;
+ 
+     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
+@@ -361,7 +470,9 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+      * The header's input-DMA-list/io fields are legitimately zero for it. Dump
+      * the user data + that command block so the bail path is attributable. */
+     uint32_t dump_cmd = 0;
+-    if (getenv("SPURS_JOB_DUMP")) {
++    static int s_job_dump = -1;
++    if (s_job_dump < 0) s_job_dump = getenv("SPURS_JOB_DUMP") != NULL;
++    if (s_job_dump) {
+         uint64_t ud  = g64(job_ea + JH_SIZE);        /* desc+0x30 */
+         uint32_t cmd = (uint32_t)ud;                 /* low word = EA */
+         fprintf(stderr, "[spurs-job] job 0x%08X userdata: %016llX %016llX %016llX %016llX\n",
+@@ -446,8 +557,21 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+      * store is one job's, not a mix of two. */
+     if (!g_spurs_job_in_list || spurs_job_handle_polled(g_spurs_job_ls_handle))
+     { static SRWLOCK s_job_ls_lock = SRWLOCK_INIT;
++      /* Keep the store readable. Only the job's regions and the top block can
++       * be nonzero (spurs_job_ctx_take), so copy those and zero whatever the
++       * previous copy had past this job's regions: the same 256 KB image as a
++       * whole copy, without copying the zeros between them. */
++      static uint32_t s_job_ls_extent = SPU_LS_SIZE;
++      const uint32_t top = SPU_LS_SIZE - JOB_LS_TOP_BLOCK;
++      uint32_t end = p + JOB_CALLER_FRAME < top ? p + JOB_CALLER_FRAME : SPU_LS_SIZE;
+       AcquireSRWLockExclusive(&s_job_ls_lock);
+-      memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
++      memcpy(s_job_ls, ctx.ls, end);
++      if (end < top) {
++          if (s_job_ls_extent > end)
++              memset(s_job_ls + end, 0, (s_job_ls_extent < top ? s_job_ls_extent : top) - end);
++          memcpy(s_job_ls + top, ctx.ls + top, JOB_LS_TOP_BLOCK);
++      }
++      s_job_ls_extent = end;
+       s_job_ls_valid = 1;
+       ReleaseSRWLockExclusive(&s_job_ls_lock); }
+ 
+@@ -464,7 +588,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+           fprintf(stderr, "[spurs-job] job 0x%08X posted mbox=0x%08X intr=0x%08X\n",
+                   job_ea, g_spurs_job_mbox, g_spurs_job_mbox_intr); }
+ 
+-    if (getenv("SPURS_JOB_DUMP")) {
++    if (s_job_dump) {
+         fprintf(stderr, "[spurs-job] job 0x%08X exit: status=0x%X stop=0x%X pc=0x%05X\n",
+                 job_ea, ctx.status, ctx.stop_code, ctx.pc);
+         /* Post-run view of the same command block: the game polls result/status
+@@ -481,6 +605,8 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+         fflush(stderr);
+     }
+ 
+-    spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
++    spu_coh_unregister(&ctx);   /* out of the reserver set until the next job */
++    spurs_job_ctx_done(slot, p + JOB_CALLER_FRAME, image_id, job_ea);
++#undef ctx
+     return 0;
+ }
+diff --git a/runtime/spu/spurs_policy.c b/runtime/spu/spurs_policy.c
+index 4f82063..59e4975 100644
+--- a/runtime/spu/spurs_policy.c
++++ b/runtime/spu/spurs_policy.c
+@@ -265,18 +265,18 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
+     unsigned batch_before = g_wws_batch_gets;
+     unsigned claim_before = g_spu_putllc_sync_hit;
+ 
+-    const int pm_halted = spu_run_with_halt(entry, ctx);
+-    /* A lane's run should only end through exitToKernel. Anything else strands
+-     * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
+-    if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {
+-        extern unsigned spu_recent_pcs(uint32_t*, unsigned);
+-        uint32_t r[32]; unsigned n = spu_recent_pcs(r, 32);
+-        static volatile long s_pe; if (__atomic_add_fetch(&s_pe, 1, __ATOMIC_RELAXED) <= 64) {
+-            fprintf(stderr, "[pm-end] lane %u ctx=%p halted=%d status=0x%X pc=0x%05X lr=0x%05X r3=0x%08X depth=%u recent:",
+-                    spu_num, (void*)ctx, pm_halted, ctx->status, (uint32_t)ctx->pc & SPU_LS_MASK,
+-                    ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0], ctx->host_depth);
+-            for (unsigned k = 0; k < n; k++) fprintf(stderr, " %05X", r[k]);
+-            fprintf(stderr, "\n"); fflush(stderr); } }
++    const int pm_halted = spu_run_with_halt(entry, ctx);
++    /* A lane's run should only end through exitToKernel. Anything else strands
++     * the jobs it had claimed (GH3's once-per-~10-songs freeze): say how. */
++    if (((uint32_t)ctx->pc & SPU_LS_MASK) != SPURS_PM_EXIT_TO_KERNEL_LS) {
++        extern unsigned spu_recent_pcs(uint32_t*, unsigned);
++        uint32_t r[32]; unsigned n = spu_recent_pcs(r, 32);
++        static volatile long s_pe; if (__atomic_add_fetch(&s_pe, 1, __ATOMIC_RELAXED) <= 64) {
++            fprintf(stderr, "[pm-end] lane %u ctx=%p halted=%d status=0x%X pc=0x%05X lr=0x%05X r3=0x%08X depth=%u recent:",
++                    spu_num, (void*)ctx, pm_halted, ctx->status, (uint32_t)ctx->pc & SPU_LS_MASK,
++                    ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[3]._u32[0], ctx->host_depth);
++            for (unsigned k = 0; k < n; k++) fprintf(stderr, " %05X", r[k]);
++            fprintf(stderr, "\n"); fflush(stderr); } }
+ 
+     if (s_claimlog) {
+         unsigned claims = g_spu_putllc_sync_hit - claim_before;
+@@ -547,6 +547,7 @@ int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
+     }
+     int st = (int)ctx->status;
+     { extern void spu_coh_unregister(spu_context*); spu_coh_unregister(ctx); }
++    { extern void spu_mfc_release(spu_context*); spu_mfc_release(ctx); }   /* see spu_lifted_job.h */
+     free(ctx);
+     return st;
+ }

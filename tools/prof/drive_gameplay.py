@@ -9,10 +9,10 @@ A fixed wall-clock PAD_SCRIPT misses gameplay whenever the machine is loaded
 This drives the game with PAD_FILE instead and looks at what is on screen:
 
   1. until the Survival map starts loading (effect.efd in the log): CROSS and
-     START alternately every 3 s (logos, title "press START", main menu with
+     START alternately every --press-every s (logos, title "press START", main menu with
      SURVIVAL highlighted);
-  2. then CROSS every 3 s (intro movie, ~13 tutorial prompts); START once if
-     the HUD has not shown 60 s later (skips the movie; if it opened the
+  2. then CROSS every --press-every s (intro movie, ~13 tutorial prompts); START
+     once if the HUD has not shown --skip-after s later (skips the movie; if it opened the
      tutorial's pause dialog instead, a CROSS once the HUD shows picks No);
   3. once the HUD shows (LIFE bar blue, STAMINA bar red at their screen
      positions): no more input. After --settle s the window opens: the
@@ -68,6 +68,12 @@ def main():
     ap.add_argument('--measure', type=float, default=60)
     ap.add_argument('--settle', type=float, default=15)
     ap.add_argument('--timeout', type=float, default=420, help='give up if no HUD by then')
+    # Input pacing to reach gameplay. Was a 20 s start, a press every 3 s and
+    # the movie skip 60 s after loading began: ~3 minutes to the HUD.
+    ap.add_argument('--first-press', type=float, default=5, help='s before the first press')
+    ap.add_argument('--press-every', type=float, default=1.0, help='s between presses')
+    ap.add_argument('--skip-after', type=float, default=5,
+                    help='s after the map starts loading before START skips the movie')
     ap.add_argument('--no-prof', action='store_true')
     ap.add_argument('--clean-timing', action='store_true',
                     help='use native flip telemetry; pause dumps and disable sampling during timing')
@@ -129,7 +135,8 @@ def main():
 
     def press(m):
         nonlocal last_press, n_press
-        with open(pad, 'w') as f: f.write(m + '\n')
+        # Held 8 polls (~0.13 s), so presses --press-every apart stay separate.
+        with open(pad, 'w') as f: f.write(m + ' 8\n')
         last_press = time.time(); n_press += 1
 
     try:
@@ -152,10 +159,10 @@ def main():
                     if started_skip:
                         time.sleep(1.0); press(CROSS)
                     continue
-                if now - t0 < 20 or now - last_press < 3: continue
+                if now - t0 < a.first_press or now - last_press < a.press_every: continue
                 if loading_t is None:
                     press(CROSS if n_press % 2 == 0 else START)
-                elif not started_skip and now - loading_t > 60:
+                elif not started_skip and now - loading_t > a.skip_after:
                     press(START); started_skip = True
                 else:
                     press(CROSS)
