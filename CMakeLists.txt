@@ -406,7 +406,10 @@ if(MSVC)
         COMPILE_OPTIONS "/w;/bigobj")
 else()
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "-w;-ffp-contract=off")
+        COMPILE_OPTIONS "-w;-ffp-contract=off;-fwrapv")
+    # -fwrapv: guest integer arithmetic wraps (mulld, mulli, add overflow);
+    # without it the compiler may assume signed overflow never happens
+    # (ps3recomp v0.15, f6c7bec).
     # Inline guest memory access in the lifted PPU code (src/tj_vm_fast.h):
     # plain big-endian loads and stores, the runtime accessors only where they
     # do real work. OFF gives the debug hooks (PPU_RWATCH, ...) the lifted
@@ -414,7 +417,10 @@ else()
     option(TJ_VM_FAST "Inline guest memory access in lifted PPU code" ON)
     if(TJ_VM_FAST)
         set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY
-            COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/src/tj_vm_fast.h")
+            COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/src/tj_vm_fast.h;-DPPU_NO_INLINE_LOADS")
+        # The lifter's own inline loads (ppu_recomp.h, ps3recomp v0.15) define
+        # the same vm_read* names; tj_vm_fast.h covers loads and stores, so
+        # theirs stand down (PPU_NO_INLINE_LOADS).
         message(STATUS "Lifted PPU:      inline guest memory access (TJ_VM_FAST)")
     endif()
 endif()
