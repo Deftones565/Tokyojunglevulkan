@@ -34,5 +34,9 @@ bool tj_settings_show_fps(void);
 enum { TJ_AA_OFF = 0, TJ_AA_GAME_MLAA = 1 };
 int tj_settings_anti_aliasing(void);
 
+/* Frame rate: aim for 60 (the game's drop to its 30 FPS mode switched off)
+ * or let the game's own 30/60 governor decide. Read per vblank by main.cpp. */
+bool tj_settings_target60(void);
+
 /* "Quit game" was chosen in the menu: take the same path as closing the window. */
 bool tj_settings_quit_requested(void);

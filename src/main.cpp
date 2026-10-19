@@ -267,11 +267,14 @@ static void tj_flip_promote_vblank(void)
         limit = (v >= 1 && v <= 9) ? (uint32_t)v : 5;
     }
     if (tj_be32(TJ_GOV_LIMIT) != limit) tj_wbe32(TJ_GOV_LIMIT, limit);
-    /* TJ_FORCE_FLIP60=1 (measurement only): CheckFlipMode30 off, so the game
-     * never drops to 30 and the frame rate shows what the port can reach. */
+    /* The settings menu's Frame rate: "Aim for 60" (the default) switches
+     * CheckFlipMode30 off, so the game never drops to its 30 FPS mode and
+     * runs as fast as it can; "Game decides" restores the game's own check.
+     * TJ_FORCE_FLIP60=1 forces it on for scripted runs. */
     static int force = -1;
     if (force < 0) force = getenv("TJ_FORCE_FLIP60") != nullptr;
-    if (force && vm_base[TJ_GOV_CHECK30]) vm_base[TJ_GOV_CHECK30] = 0;
+    const uint8_t check30 = (force || tj_settings_target60()) ? 0 : 1;
+    if (vm_base[TJ_GOV_CHECK30] != check30) vm_base[TJ_GOV_CHECK30] = check30;
     if (tj_be32(TJ_GOV_N) != 2) return;
     const uint32_t ctrl = ppu_hle_inject_base + 0x2000u;   /* CellGcmControl */
     if (tj_be32(ctrl) != tj_be32(ctrl + 4)) return;       /* the handler counts this one */
