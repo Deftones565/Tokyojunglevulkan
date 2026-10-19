@@ -1,0 +1,38 @@
+# Tokyo Jungle 30/60 FPS governor: cellGcmGetFlipStatus records when it last
+# answered WAITING, and ppu_gcm_pump runs an optional game hook before each
+# vblank handler call (src/main.cpp tj_flip_promote_vblank).
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 384d7a9..085e764 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -662,9 +662,22 @@ void cellGcmResetFlipStatus(void)
+     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
+ }
+ 
++/* When the title last polled cellGcmGetFlipStatus and was told WAITING, i.e.
++ * its frame was done and it was waiting for the flip. Read by the vblank hook
++ * (cellGcm_last_flip_wait_poll_ns). */
++static volatile u64 s_flip_wait_poll_ns;
++u64 cellGcm_last_flip_wait_poll_ns(void) { return s_flip_wait_poll_ns; }
++u64 cellGcm_now_ns(void) { return get_timestamp_ns(); }
++
++/* A game's hook run on the main thread just before each vblank handler call,
++ * for title-specific pacing fixes (Tokyo Jungle's 30/60 FPS governor). */
++void (*g_gcm_vblank_hook)(void);
++
+ /* NID: 0xE315A0B2 */
+ u32 cellGcmGetFlipStatus(void)
+ {
++    if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
++        s_flip_wait_poll_ns = get_timestamp_ns();
+     /* Avoid host-calling the guest OPDs directly (they're not valid host
+      * function pointers). Use cellGcmTickVBlank() / TickFlip() instead,
+      * which dispatch via g_ps3_guest_caller — see below. */
+@@ -781,6 +794,7 @@ void ppu_gcm_pump(void)
+                            calls, nv, nf, s_vblank_count, 10); } }
+     if (s_vblank_handler_opd && g_ps3_guest_caller) {
+         for (long i = nvb; i > 0; i--) {
++            if (g_gcm_vblank_hook) g_gcm_vblank_hook();
+             ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
+             g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)(s_vblank_count - (u32)(i - 1)),
+                                0, 0, 0, 0, 0, 0, 0);

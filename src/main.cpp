@@ -216,8 +216,97 @@ extern "C" unsigned ppu_boot_frames_presented(void)
     return (unsigned)g_frames_presented;
 }
 
+/* Tokyo Jungle's own 30/60 FPS governor (found by the LasVola/tokyojungle
+ * port on v1.00; these are the v1.01 addresses). Its vblank handler
+ * (0x1F250C) keeps an object at 0xC0408C: N at +0 is the vblanks per flip
+ * (1 = 60 FPS, 2 = 30), and +0x10 counts the flip releases that found the next
+ * frame already queued (put != get). Flip30ModeLimitNum (0x3B42E0, default 2)
+ * is how many missed frames of 9 drop it to 30; CheckFlipMode30 (0x3B42DC,
+ * default 1) turns that check on. */
+#define TJ_GOV_N          0x00C0408Cu
+#define TJ_GOV_AHEAD      0x00C0409Cu
+#define TJ_GOV_LIMIT      0x003B42E0u
+#define TJ_GOV_CHECK30    0x003B42DCu
+
+static uint32_t tj_be32(uint32_t ea)
+{
+    const uint8_t* p = vm_base + ea;
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+static void tj_wbe32(uint32_t ea, uint32_t v)
+{
+    uint8_t* p = vm_base + ea;
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+
+static unsigned long s_tj_promotes;   /* vblanks the hook counted as "ahead" */
+
+/* The governor drops to 30 FPS on a couple of missed frames and returns to 60
+ * only after flip releases that find the next frame already queued: on a PS3
+ * the RSX is still working through it. Our FIFO drains as soon as it is
+ * written, so put == get at every release, the count never grows, and after
+ * the first hitch the game stayed at 30 for good (mg5-gov2: N=2 for 134 of
+ * 145 s of gameplay). Run before each vblank handler call: in 30 FPS mode,
+ * with the FIFO idle, a title that polled cellGcmGetFlipStatus and was told
+ * WAITING in the last 2 ms has its frame done early, which is what the count
+ * means; count it. The handler still counts real put != get itself, and
+ * demotion is unchanged. Also raises Flip30ModeLimitNum from 2 to 5 of 9, so
+ * one brief hitch doesn't drop it (the other port's tested value).
+ * TJ_FLIP_PROMOTE=0 turns both off; TJ_FLIP30_LIMIT=n (1..9) sets the limit. */
+extern "C" uint64_t cellGcm_last_flip_wait_poll_ns(void);
+extern "C" uint64_t cellGcm_now_ns(void);
+extern "C" void (*g_gcm_vblank_hook)(void);
+
+static void tj_flip_promote_vblank(void)
+{
+    if (!vm_base) return;
+    static uint32_t limit = 0;
+    if (!limit) {
+        const char* e = getenv("TJ_FLIP30_LIMIT");
+        const int v = e && *e ? atoi(e) : 5;
+        limit = (v >= 1 && v <= 9) ? (uint32_t)v : 5;
+    }
+    if (tj_be32(TJ_GOV_LIMIT) != limit) tj_wbe32(TJ_GOV_LIMIT, limit);
+    /* TJ_FORCE_FLIP60=1 (measurement only): CheckFlipMode30 off, so the game
+     * never drops to 30 and the frame rate shows what the port can reach. */
+    static int force = -1;
+    if (force < 0) force = getenv("TJ_FORCE_FLIP60") != nullptr;
+    if (force && vm_base[TJ_GOV_CHECK30]) vm_base[TJ_GOV_CHECK30] = 0;
+    if (tj_be32(TJ_GOV_N) != 2) return;
+    const uint32_t ctrl = ppu_hle_inject_base + 0x2000u;   /* CellGcmControl */
+    if (tj_be32(ctrl) != tj_be32(ctrl + 4)) return;       /* the handler counts this one */
+    const uint64_t poll = cellGcm_last_flip_wait_poll_ns();
+    if (poll && cellGcm_now_ns() - poll < 2000000ull) {
+        tj_wbe32(TJ_GOV_AHEAD, tj_be32(TJ_GOV_AHEAD) + 1);
+        s_tj_promotes++;
+    }
+}
+
+static void tj_flip_promote_install(void)
+{
+    const char* e = getenv("TJ_FLIP_PROMOTE");
+    if (e && e[0] == '0') { fprintf(stderr, "[tj-flipgov] 60 FPS return off\n"); return; }
+    g_gcm_vblank_hook = tj_flip_promote_vblank;
+}
+
+/* TJ_FLIP_GOV_TRACE=1: the governor's state once a second. */
+static void tj_flip_gov_trace(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("TJ_FLIP_GOV_TRACE") != nullptr;
+    if (!on || !vm_base) return;
+    static auto next = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) return;
+    next = now + std::chrono::seconds(1);
+    fprintf(stderr, "[tj-flipgov] N=%u limit=%u check30=%u ahead=%u promotes=%lu frames=%u\n",
+            tj_be32(TJ_GOV_N), tj_be32(TJ_GOV_LIMIT), vm_base[TJ_GOV_CHECK30],
+            tj_be32(TJ_GOV_AHEAD), s_tj_promotes, (unsigned)g_frames_presented);
+}
+
 static void present_guest_frame(void)
 {
+    tj_flip_gov_trace();
     rsx_backend_present();
     /* This thread increments and guest threads read, so interlocked rather
      * than a volatile ++, which on arm64 is neither atomic nor a fence. */
@@ -915,6 +1004,7 @@ int main(int argc, char** argv)
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",
            entry, STACK_TOP);
 
+    tj_flip_promote_install();
     int rc = ppu_run(entry, STACK_TOP);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
 
