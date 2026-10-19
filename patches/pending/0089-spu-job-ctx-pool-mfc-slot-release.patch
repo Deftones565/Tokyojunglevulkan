@@ -4,6 +4,43 @@
 # (lifted task runs, policy modules) release their slot (they leaked, the
 # table overflowed at boot, every DMA then took the claim lock: ~7.5% CPU).
 # User test 2026-10-19 with tj_vm_fast: 29-33 -> 40-49 FPS (forced 60 mode).
+# Also: fingerprint-cache hits share the slot lock (try-lock fallback re-hashed
+# whole images); opt-in SPURS_EF_SPIN_US event-flag spin (user test +2 FPS at 200).
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index b9e9088..d69ca37 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -1958,6 +1958,30 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
+ 
+     u16 pattern = vm_read16(bits_ea);
+ 
++    /* SPURS_EF_SPIN_US=n (default 0, off): before taking the lock and
++     * sleeping, poll the events word for up to n microseconds. The job batches
++     * the main thread waits on here often finish within ~0.1 ms, and a
++     * condition-variable wake-up costs tens of microseconds each time (the
++     * LasVola port's TJ_EF_SPIN_US). Only looks: the loop below still decides
++     * under the lock and does the clear. */
++    { static long spin_us = -1;
++      if (spin_us < 0) { const char* e = getenv("SPURS_EF_SPIN_US");
++                         spin_us = e ? atol(e) : 0; if (spin_us < 0) spin_us = 0; }
++      if (spin_us) {
++          LARGE_INTEGER f, t0, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
++          const LONGLONG limit = f.QuadPart * spin_us / 1000000;
++          for (;;) {
++              const u16 cur = vm_read16(ea + EF_EVENTS);
++              if (mode == CELL_SPURS_EVENT_FLAG_AND ? (cur & pattern) == pattern
++                                                    : (cur & pattern) != 0) break;
++              QueryPerformanceCounter(&t);
++              if (t.QuadPart - t0.QuadPart >= limit) break;
++#if defined(__x86_64__) || defined(_M_X64)
++              __builtin_ia32_pause();
++#endif
++          }
++      } }
++
+     ef_lock(sync);
+ 
+     /* Block until the requested bit pattern is satisfied in the GUEST struct
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
 index 2a13d6e..08f5b10 100644
 --- a/runtime/spu/spu_channels.c
@@ -224,6 +261,75 @@ index 58c9082..8bf8205 100644
      if (local_store) memcpy(local_store, ctx.ls, SPU_LS_SIZE);  /* LS back out */
      return 0;
  }
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 8b1755c..9bdb538 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -53,16 +53,19 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n)
+  * even if the guest is rewriting the image meanwhile.
+  *
+  * One global table, not per-thread: spu_async creates a thread per dispatch,
+- * and thread-local copies would be lost (or leaked) with each of them. A
+- * slot is held with a try-lock; a thread that finds its slot busy just hashes
+- * directly, so nobody waits on another thread's memcmp.
++ * and thread-local copies would be lost (or leaked) with each of them. A hit
++ * holds its slot's lock shared, so threads running the same job image compare
++ * at the same time; only a miss (copy + hash) holds it exclusively. It used to
++ * be a try-lock, and a thread that found the slot busy hashed the whole image
++ * byte by byte -- which, with a chain's jobs running on parallel threads, was
++ * most hits: 6.8% of all CPU in gameplay.
+  *
+  * SPU_FP_CACHE=0 turns the cache off. SPU_FP_CACHE_VERIFY=1 also hashes the
+  * guest bytes on every cache hit and aborts if the fps differ. */
+ #define SPU_FP_CACHE_SLOTS 64u
+ 
+ typedef struct {
+-    volatile LONG  busy;
++    SRWLOCK        lock;      /* zero-initialised == SRWLOCK_INIT */
+     const uint8_t* ptr;
+     size_t         size;
+     uint64_t       fp;
+@@ -96,12 +99,13 @@ static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, size_t n)
+     uintptr_t k = (uintptr_t)image ^ ((uintptr_t)n * 0x9E3779B1u);
+     k ^= k >> 7; k ^= k >> 17;
+     spu_fp_cache_slot* s = &s_fp_cache[k % SPU_FP_CACHE_SLOTS];
+-    if (InterlockedExchange(&s->busy, 1) != 0)
+-        return spu_workload_fingerprint(image, n);   /* slot in use: hash directly */
+ 
+     uint64_t fp;
+-    if (s->ptr == image && s->size == n && s->copy && memcmp(s->copy, image, n) == 0) {
+-        fp = s->fp;
++    AcquireSRWLockShared(&s->lock);
++    int hit = s->ptr == image && s->size == n && s->copy && memcmp(s->copy, image, n) == 0;
++    fp = s->fp;
++    ReleaseSRWLockShared(&s->lock);
++    if (hit) {
+         if (mode == 2) {
+             uint64_t ref = spu_workload_fingerprint(image, n);
+             if (ref != fp) {
+@@ -114,10 +118,11 @@ static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, size_t n)
+             }
+         }
+     } else {
++        AcquireSRWLockExclusive(&s->lock);
+         if (s->cap < n) {
+             uint8_t* nb = (uint8_t*)realloc(s->copy, n);
+             if (!nb) {                    /* keep the old slot, hash directly */
+-                InterlockedExchange(&s->busy, 0);
++                ReleaseSRWLockExclusive(&s->lock);
+                 return spu_workload_fingerprint(image, n);
+             }
+             s->copy = nb;
+@@ -128,8 +133,8 @@ static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, size_t n)
+         s->ptr  = image;
+         s->size = n;
+         s->fp   = fp;
++        ReleaseSRWLockExclusive(&s->lock);
+     }
+-    InterlockedExchange(&s->busy, 0);
+     return fp;
+ }
+ 
 diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
 index 02f7022..6fc6255 100644
 --- a/runtime/spu/spurs_job.c

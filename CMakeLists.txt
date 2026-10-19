@@ -210,6 +210,7 @@ add_executable(${PROJECT_NAME}
     src/main.cpp
     src/settings_menu.cpp
     src/stubs.cpp
+    src/tj_mlaa.cpp          # TJ_DISABLE_MLAA (linker --wrap below)
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
     ${RECOMP_SOURCES}
@@ -218,6 +219,13 @@ add_executable(${PROJECT_NAME}
 )
 if(PRX_SOURCES)
     target_compile_definitions(${PROJECT_NAME} PRIVATE TJ_HAVE_PRX=1)
+endif()
+# src/tj_mlaa.cpp sits in front of the game's per-frame MLAA wrapper
+# (func_001536EC); its one caller is in another lifted translation unit, so the
+# linker can route that call without editing the lifted source.
+if(NOT MSVC)
+    target_link_options(${PROJECT_NAME} PRIVATE
+        "-Wl,--wrap=_Z13func_001536ECP11ppu_context")
 endif()
 
 # Recompilation only, no emulation (see AGENTS.md): after every link, check that
