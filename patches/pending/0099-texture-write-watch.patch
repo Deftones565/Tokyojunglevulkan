@@ -1,0 +1,175 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index e968988..3d91c40 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -138,6 +138,7 @@ typedef struct {
+     u64 content_hash;
+     u32 last_hash_frame;
+     u64 last_use_serial;
++    u64 ww_stamp;          /* eng_ww serial when its pages were last checked */
+ } eng_texture;
+ 
+ typedef struct {
+@@ -1201,6 +1202,102 @@ static u64 eng_texture_content_hash(u32 location, u32 offset, u32 span,
+     return hash;
+ }
+ 
++/* Write watch for the texture cache (Linux). Hashing every cached texture
++ * once a frame re-read ~10 MB a frame in Tokyo Jungle gameplay and was 36% of
++ * the RSX drain thread, which the main PPU thread waits on before each job
++ * chain. Instead, guest memory is registered with userfaultfd in asynchronous
++ * write-protect mode (no privileges needed, no fault reaches user space: the
++ * kernel just drops a page's protection on its first write, kernel writes such
++ * as read() included), and PAGEMAP_SCAN asks, per texture, which of its pages
++ * were written since they were last protected and protects them again. A page
++ * found written gets the current serial, so textures sharing a page each see
++ * it. Only a texture with a written page is hashed as before; one with none is
++ * unchanged and skipped. Any failure answers "unknown" and the texture is
++ * hashed. The LasVola port does the same with GetWriteWatch.
++ * RSX_TEX_WRITEWATCH=0 turns it off. */
++#if defined(__linux__)
++#include <fcntl.h>
++#include <linux/fs.h>
++#include <linux/userfaultfd.h>
++#include <sys/ioctl.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
++
++static int  s_ww_on = -1;           /* -1 not tried, 0 off, 1 on */
++static int  s_ww_pagemap = -1;
++static u64* s_ww_page_stamp;        /* per 4 KB guest page */
++static u64  s_ww_serial;
++static u64  s_ww_skipped, s_ww_hashed, s_ww_unknown;
++
++static int eng_ww_init(void)
++{
++#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
++    s_ww_on = 0;
++    const char* e = getenv("RSX_TEX_WRITEWATCH");
++    if ((e && e[0] == '0') || !vm_base || s_guest_reader) return 0;
++    const int fd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
++    if (fd < 0) { fprintf(stderr, "[rsx engine] write watch: no userfaultfd\n"); return 0; }
++    struct uffdio_api api = { .api = UFFD_API,
++                              .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED };
++    struct uffdio_register reg = { .range = { (unsigned long)vm_base, 0x100000000ull },
++                                   .mode = UFFDIO_REGISTER_MODE_WP };
++    if (ioctl(fd, UFFDIO_API, &api) || ioctl(fd, UFFDIO_REGISTER, &reg)) {
++        fprintf(stderr, "[rsx engine] write watch: register failed\n");
++        close(fd); return 0;
++    }
++    s_ww_pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
++    s_ww_page_stamp = (u64*)calloc(0x100000000ull >> 12, sizeof(u64));
++    if (s_ww_pagemap < 0 || !s_ww_page_stamp) return 0;   /* fd stays: registration lives with it */
++    s_ww_on = 1;
++    fprintf(stderr, "[rsx engine] texture write watch on\n");
++    return 1;
++#else
++    s_ww_on = 0;
++    return 0;
++#endif
++}
++
++/* 1 if a page of [src, src + span) was written since *stamp, 0 if none was,
++ * -1 when it cannot tell. Sets *stamp to now either way. */
++static int eng_ww_changed(const u8* src, u32 span, u64* stamp)
++{
++#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
++    if (s_ww_on < 0) eng_ww_init();
++    if (s_ww_on <= 0 || !src || !span) return -1;
++    const uintptr_t lo = (uintptr_t)src & ~(uintptr_t)4095u;
++    const uintptr_t hi = ((uintptr_t)src + span + 4095u) & ~(uintptr_t)4095u;
++    if (lo < (uintptr_t)vm_base || hi > (uintptr_t)vm_base + 0x100000000ull) return -1;
++    const u64 now = ++s_ww_serial;
++    struct page_region r[32];
++    struct pm_scan_arg a;
++    uintptr_t at = lo;
++    while (at < hi) {
++        memset(&a, 0, sizeof(a));
++        a.size = sizeof(a);
++        a.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
++        a.start = at; a.end = hi;
++        a.vec = (unsigned long)r; a.vec_len = 32;
++        a.category_mask = PAGE_IS_WRITTEN; a.return_mask = PAGE_IS_WRITTEN;
++        const long n = ioctl(s_ww_pagemap, PAGEMAP_SCAN, &a);
++        if (n < 0) { *stamp = 0; return -1; }
++        for (long i = 0; i < n; i++)
++            for (uintptr_t p = r[i].start; p < r[i].end; p += 4096u)
++                s_ww_page_stamp[(p - (uintptr_t)vm_base) >> 12] = now;
++        if (a.walk_end <= at) { *stamp = 0; return -1; }
++        at = a.walk_end;
++    }
++    int changed = *stamp == ~0ull;                /* eng_textures_touch */
++    for (uintptr_t p = lo; !changed && p < hi; p += 4096u)
++        if (s_ww_page_stamp[(p - (uintptr_t)vm_base) >> 12] > *stamp) { changed = 1; break; }
++    *stamp = now;
++    return changed;
++#else
++    (void)src; (void)span; (void)stamp;
++    return -1;
++#endif
++}
++
+ static int eng_staging_reserve(u32 bytes)
+ {
+     if (g.tex_staging_cap >= bytes) return 1;
+@@ -1270,10 +1367,15 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+             e->cubemap != (u32)(cube != 0))
+             continue;
+         if (e->handle && e->last_hash_frame != g.frames) {
++            e->last_hash_frame = g.frames;
++            const int written = eng_ww_changed(eng_guest_ptr(NULL, location, offset, span),
++                                               span, &e->ww_stamp);
++            if (written < 0) s_ww_unknown++;
++            if (!written) { s_ww_skipped++; goto hit; }
++            s_ww_hashed++;
+             int readable = 0;
+             const u64 hash = eng_texture_content_hash(location, offset, span,
+                                                       &readable);
+-            e->last_hash_frame = g.frames;
+             if (readable && hash != e->content_hash) {
+                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
+                                                      levels, pitch, cube, remap);
+@@ -1284,6 +1386,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                 }
+             }
+         }
++    hit:
+         e->last_use_serial = ++g.texture_use_serial;
+         return e->handle;
+     }
+@@ -1307,6 +1410,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+     e.remap = remap; e.cubemap = (u32)(cube != 0);
+     e.last_hash_frame = g.frames;
+     e.last_use_serial = ++g.texture_use_serial;
++    (void)eng_ww_changed(eng_guest_ptr(NULL, location, offset, span), span, &e.ww_stamp);
+     { int readable = 0;
+       e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
+     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
+@@ -1333,8 +1437,10 @@ static void eng_textures_touch(u32 location, u32 offset, u32 bytes)
+ {
+     for (u32 i = 0; i < g.n_textures; i++) {
+         eng_texture* e = &g.textures[i];
+-        if (e->location == location && e->offset >= offset && e->offset - offset < bytes)
++        if (e->location == location && e->offset >= offset && e->offset - offset < bytes) {
+             e->last_hash_frame = g.frames - 1u;
++            e->ww_stamp = ~0ull;                      /* hash it, written or not */
++        }
+     }
+ }
+ 
+@@ -3088,6 +3194,14 @@ static void eng_present(u32 buffer_id)
+     g.last_present_surface = target;
+     g.be->present(g.be->user, g.surfaces[target].handle);
+     g.frames++;
++    { static int st = -1;                         /* RSX_TEX_WW_STATS=1 (diag) */
++      if (st < 0) st = getenv("RSX_TEX_WW_STATS") ? 1 : 0;
++      if (st && g.frames % 600u == 0) {
++          fprintf(stderr, "[rsx engine] tex write watch: %llu skipped, %llu hashed, %llu unknown\n",
++                  (unsigned long long)s_ww_skipped, (unsigned long long)s_ww_hashed,
++                  (unsigned long long)s_ww_unknown);
++          s_ww_skipped = s_ww_hashed = s_ww_unknown = 0;
++      } }
+     g.last_guest_draws = g.guest_draws;
+     g.guest_draws = 0;
+ }
