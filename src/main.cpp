@@ -128,6 +128,7 @@ int      cellGcm_take_flip_pending(void);
 extern "C" { extern uint8_t* vm_base; extern uint32_t ppu_hle_inject_base; }
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
 int      cellGcm_rsx_waiters(void);           /* guest threads waiting on the drain */
+void     cellGcm_drain_nap(unsigned us);      /* poll nap, ends early when a guest thread waits */
 unsigned cellGcm_flip_request_count(void);
 int      cellSaveData_busy(void);   /* cellSaveData.c: saves being written */
 }
@@ -541,7 +542,7 @@ static DWORD WINAPI frame_clock(LPVOID)
         } else {
             const vclock::time_point w0 = vclock::now();
             for (;;) {
-                usleep((useconds_t)poll_us);
+                cellGcm_drain_nap((unsigned)poll_us);
                 const vclock::time_point t = vclock::now();
                 if (t - w0 >= std::chrono::milliseconds(4) || t >= tick_due(vk)) break;
                 const uint32_t put = ctrl_word(0), get = ctrl_word(4);

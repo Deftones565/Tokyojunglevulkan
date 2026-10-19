@@ -1,0 +1,93 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 3ffea52..e4ba0f9 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1727,6 +1727,22 @@ static void gcm_rsx_process_fifo_unlocked(void);
+  * (taken right after it reads `put`), s_drain_caught_seq is the number of the
+  * last pass that ended with the walker at that `put`. */
+ static volatile u32 s_drain_seq, s_drain_caught_seq;
++/* Wake-ups around cellGcm_rsx_wait_consumed (the main PPU thread waits there
++ * before every job chain; 40% of its time in Tokyo Jungle's busy areas):
++ * s_caught_cv when a pass catches up, s_waiter_cv when a waiter arrives, which
++ * cellGcm_drain_nap (the frame clock's nap) ends on. Both used to be polls --
++ * usleep(100) on one side, a 250 us nap on the other -- each overshooting on
++ * Linux, and they added up on every wait. */
++static SRWLOCK            s_caught_lock = SRWLOCK_INIT;
++static CONDITION_VARIABLE s_caught_cv   = CONDITION_VARIABLE_INIT;
++static volatile int       s_drain_waiter_arrived;
++#ifndef _WIN32
++#include <pthread.h>
++#include <time.h>
++/* Microsecond nap for the frame clock (the SRW wrapper only does whole ms). */
++static pthread_mutex_t s_nap_mu = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t  s_nap_cv = PTHREAD_COND_INITIALIZER;
++#endif
+ 
+ 
+ /* Kick event: a game thread whose fence wait finds the queue DRY signals the
+@@ -1813,6 +1829,25 @@ void cellGcm_rsx_process_fifo(void)
+  * the main PPU thread spent 62% of gameplay here while the drain thread idled
+  * 42%). GCM_RSX_WAKE=0 turns the early wake off. */
+ static volatile int s_rsx_waiters;
++/* The frame clock's nap between polls: up to `us` microseconds, ending at
++ * once when a guest thread starts waiting on the drain. */
++void cellGcm_drain_nap(unsigned us)
++{
++#ifndef _WIN32
++    struct timespec ts;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    ts.tv_nsec += (long)us * 1000L;
++    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec += ts.tv_nsec / 1000000000L; ts.tv_nsec %= 1000000000L; }
++    pthread_mutex_lock(&s_nap_mu);
++    if (!s_drain_waiter_arrived)
++        pthread_cond_timedwait(&s_nap_cv, &s_nap_mu, &ts);
++    s_drain_waiter_arrived = 0;
++    pthread_mutex_unlock(&s_nap_mu);
++#else
++    Sleep(us >= 1000 ? us / 1000 : 1);
++#endif
++}
++
+ int cellGcm_rsx_waiters(void)
+ {
+     static int on = -1;
+@@ -1832,15 +1867,20 @@ int cellGcm_rsx_wait_consumed(unsigned timeout_ms)
+     if (stats < 0) stats = getenv("GCM_WAIT_STATS") ? 1 : 0;
+     const u64 ns0 = stats ? get_timestamp_ns() : 0;
+     __atomic_add_fetch(&s_rsx_waiters, 1, __ATOMIC_ACQ_REL);
++#ifndef _WIN32
++    pthread_mutex_lock(&s_nap_mu);                     /* wake the frame clock now */
++    s_drain_waiter_arrived = 1;
++    pthread_cond_signal(&s_nap_cv);
++    pthread_mutex_unlock(&s_nap_mu);
++#endif
+     int ok;
+     for (;;) {
+         if ((s32)(__atomic_load_n(&s_drain_caught_seq, __ATOMIC_ACQUIRE) - seq0) > 0) { ok = 1; break; }
+         if (ps3_ms_now() - t0 >= timeout_ms) { ok = 0; break; }
+-#ifdef _WIN32
+-        Sleep(0);
+-#else
+-        usleep(100);
+-#endif
++        AcquireSRWLockExclusive(&s_caught_lock);
++        if ((s32)(__atomic_load_n(&s_drain_caught_seq, __ATOMIC_ACQUIRE) - seq0) <= 0)
++            SleepConditionVariableSRW(&s_caught_cv, &s_caught_lock, 1, 0);
++        ReleaseSRWLockExclusive(&s_caught_lock);
+     }
+     __atomic_sub_fetch(&s_rsx_waiters, 1, __ATOMIC_ACQ_REL);
+     if (stats) {
+@@ -2462,8 +2502,12 @@ static void gcm_rsx_process_fifo_unlocked(void)
+     { static int eq = -1;
+       if (eq < 0) { const char* e = getenv("GCM_GET_EQ_PUT"); eq = e ? atoi(e) : 0; }
+       vm_write32(GCM_CONTROL_GUEST_ADDR + 4, eq ? put : s_fifo_getoff); }
+-    if (s_fifo_getoff == put)
++    if (s_fifo_getoff == put) {
+         __atomic_store_n(&s_drain_caught_seq, drain_seq, __ATOMIC_RELEASE);
++        AcquireSRWLockExclusive(&s_caught_lock);       /* no lost wake-up */
++        ReleaseSRWLockExclusive(&s_caught_lock);
++        WakeAllConditionVariable(&s_caught_cv);
++    }
+ 
+     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
+     gcm_ref_publish_one();
