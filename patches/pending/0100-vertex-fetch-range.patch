@@ -1,0 +1,267 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 3d91c40..556c8af 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -2226,12 +2226,10 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+         dc.fetch_ok = 0;
+         return;
+     }
+-    for (u32 i = 0; i < dc.n_refs; i++) {
+-        u8* dst = layout->stride ? dc.verts + (u64)i * layout->stride : NULL;
+-        if (!rsx_vertex_fetch_one(&dc.fetch_plan, &dc.refs[i], dst)) {
+-            dc.fetch_ok = 0;
+-            return;
+-        }
++    if (!rsx_vertex_fetch_range(&dc.fetch_plan, dc.refs, dc.n_refs,
++                                layout->stride ? dc.verts : NULL)) {
++        dc.fetch_ok = 0;
++        return;
+     }
+     dc.n_verts = dc.n_refs;
+ }
+diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
+index 4334f16..2f778c9 100644
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -292,6 +292,143 @@ int rsx_vertex_fetch_one(
+     return 1;
+ }
+ 
++/* One attribute of one vertex the slow way, exactly as rsx_vertex_fetch_one
++ * does it: returns 0 for an invalid ATTR0. */
++static int rsx_vertex_fetch_attr_one(
++    const rsx_vertex_fetch_plan* plan, u32 attr, u32 element, float* value)
++{
++    const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
++    const u8* source = NULL;
++    if (fetch->stable_base &&
++        element >= fetch->stable_first && element <= fetch->stable_last) {
++        source = fetch->stable_base +
++            (u64)(element - fetch->stable_first) * fetch->stride;
++    } else if (plan->inline_data) {
++        source = NULL;
++    } else if (plan->guest_ptr) {
++        const u32 offset =
++            plan->base_offset + fetch->desc.offset + element * fetch->stride;
++        source = plan->guest_ptr(
++            plan->guest_user, fetch->desc.location, offset, fetch->elem_size);
++    }
++    if (source && rsx_vertex_decode_element(
++            fetch->desc.type, fetch->desc.size, source, value))
++        return 1;
++    if (attr == 0)
++        return 0;
++    memcpy(value, fetch->default_value, 16);
++    return 1;
++}
++
++static inline u32 rsx_compact_be32(const u8* p)
++{
++    u32 w;
++    memcpy(&w, p, 4);
++    return __builtin_bswap32(w);
++}
++
++static const float rsx_compact_unit_w[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
++
++/* The per-type loops of rsx_vertex_fetch_range: the same arithmetic as
++ * rsx_vertex_decode_element, with the type and the component count fixed. */
++#define RSX_FETCH_LOOP(DECODE)                                                \
++    for (u32 i = 0; i < count; i++) {                                         \
++        float* value = (float*)(out + (size_t)i * stride + slot * 16u);       \
++        const u32 element = per_vertex                                        \
++            ? (refs[i].vertex_id + refs[i].base_index) & 0x000FFFFFu          \
++            : rsx_vertex_element_index(refs[i].vertex_id,                     \
++                  refs[i].base_index, fetch->desc.frequency, modulo);         \
++        if (element < first || element > last) {                             \
++            if (!rsx_vertex_fetch_attr_one(plan, attr, element, value))       \
++                return 0;                                                     \
++            continue;                                                         \
++        }                                                                     \
++        const u8* source = base + (u64)(element - first) * fetch->stride;     \
++        /* Straight into the output: a local array written per component     \
++         * and copied out as one 16-byte load stalled on store forwarding. */ \
++        float* v = value;                                                     \
++        memcpy(v, rsx_compact_unit_w, 16);                                    \
++        DECODE;                                                               \
++    }
++
++int rsx_vertex_fetch_range(
++    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
++    u8* out)
++{
++    if (!plan || (!refs && count))
++        return 0;
++    const u32 stride = plan->layout.stride;
++    if (!stride || !out) {
++        for (u32 i = 0; i < count; i++)
++            if (!rsx_vertex_fetch_one(plan, &refs[i], out))
++                return 0;
++        return 1;
++    }
++    for (u32 slot = 0; slot < plan->layout.count; slot++) {
++        const u32 attr = plan->layout.attrs[slot];
++        const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
++        if (!fetch->desc.type || !fetch->desc.size) {
++            for (u32 i = 0; i < count; i++)
++                memcpy(out + (size_t)i * stride + slot * 16u,
++                       fetch->default_value, 16);
++            continue;
++        }
++        const int per_vertex = fetch->desc.frequency <= 1;
++        const u32 modulo = (plan->divider_mask >> attr) & 1u;
++        const u8* base = fetch->stable_base;
++        /* No stable span: every element takes the slow path. */
++        const u32 first = base ? fetch->stable_first : 1u;
++        const u32 last = base ? fetch->stable_last : 0u;
++        const u32 n = fetch->desc.size < 4 ? fetch->desc.size : 4;
++        switch (fetch->desc.type) {
++        case RSX_VTX_TYPE_FLOAT:
++            RSX_FETCH_LOOP(
++                for (u32 c = 0; c < n; c++) {
++                    const u32 w = rsx_compact_be32(source + c * 4);
++                    memcpy(&v[c], &w, 4);
++                })
++            break;
++        case RSX_VTX_TYPE_HALF:
++            RSX_FETCH_LOOP(
++                for (u32 c = 0; c < n; c++)
++                    v[c] = rsx_compact_be_f16(source + c * 2))
++            break;
++        case RSX_VTX_TYPE_UNORM8:
++            RSX_FETCH_LOOP(
++                for (u32 c = 0; c < n; c++)
++                    v[c] = source[c] / 255.0f)
++            break;
++        case RSX_VTX_TYPE_UINT8:
++            RSX_FETCH_LOOP(
++                for (u32 c = 0; c < n; c++)
++                    v[c] = (float)source[c])
++            break;
++        case RSX_VTX_TYPE_SNORM16:
++            RSX_FETCH_LOOP(
++                for (u32 c = 0; c < n; c++)
++                    v[c] = (s16)((source[c * 2] << 8) | source[c * 2 + 1]) / 32767.0f)
++            break;
++        case RSX_VTX_TYPE_SINT16:
++            RSX_FETCH_LOOP(
++                for (u32 c = 0; c < n; c++)
++                    v[c] = (float)(s16)((source[c * 2] << 8) | source[c * 2 + 1]))
++            break;
++        default:        /* CMP32 and anything unusual: the per-element path */
++            for (u32 i = 0; i < count; i++) {
++                float* value = (float*)(out + (size_t)i * stride + slot * 16u);
++                const u32 element = rsx_vertex_element_index(
++                    refs[i].vertex_id, refs[i].base_index,
++                    fetch->desc.frequency, modulo);
++                if (!rsx_vertex_fetch_attr_one(plan, attr, element, value))
++                    return 0;
++            }
++            break;
++        }
++    }
++    return 1;
++}
++#undef RSX_FETCH_LOOP
++
+ static u64 rsx_vertex_remap_hash(u64 value)
+ {
+     value ^= value >> 33;
+@@ -321,6 +458,58 @@ int rsx_vertex_remap_build(
+         remap->occurrence_capacity = count;
+     }
+ 
++    /* The same first-occurrence numbering without hashing: refs that are one
++     * consecutive run have no repeats, and refs of one base index whose
++     * vertex ids span a compact range are numbered through a direct table. */
++    {
++        const u32 base = refs[0].base_index, v0 = refs[0].vertex_id;
++        u32 lo = v0, hi = v0;
++        int run = 1, one_base = 1;
++        for (u32 i = 1; i < count; i++) {
++            const u32 v = refs[i].vertex_id;
++            if (refs[i].base_index != base) { one_base = 0; break; }
++            if (v != v0 + i) run = 0;
++            if (v < lo) lo = v;
++            if (v > hi) hi = v;
++        }
++        if (one_base && run)
++            return 1;                          /* *unique_count = count */
++        const u64 range = (u64)hi - lo + 1u;
++        if (one_base && range <= (u64)count * 4u + 4096u && range <= (1u << 24)) {
++            if (range > remap->dense_capacity) {
++                u32* gen = (u32*)realloc(remap->dense_gen, (size_t)range * sizeof(u32));
++                if (!gen) return 0;
++                remap->dense_gen = gen;
++                u32* val = (u32*)realloc(remap->dense_val, (size_t)range * sizeof(u32));
++                if (!val) return 0;
++                remap->dense_val = val;
++                memset(remap->dense_gen, 0, (size_t)range * sizeof(u32));
++                remap->dense_capacity = (u32)range;
++                remap->dense_generation = 0;
++            }
++            if (!++remap->dense_generation) {
++                memset(remap->dense_gen, 0, (size_t)remap->dense_capacity * sizeof(u32));
++                remap->dense_generation = 1u;
++            }
++            const u32 g = remap->dense_generation;
++            u32 unique = 0;
++            for (u32 occurrence = 0; occurrence < count; occurrence++) {
++                const rsx_vertex_ref ref = refs[occurrence];
++                const u32 k = ref.vertex_id - lo;
++                if (remap->dense_gen[k] != g) {
++                    remap->dense_gen[k] = g;
++                    remap->dense_val[k] = unique;
++                    refs[unique] = ref;
++                    remap->occurrence_to_unique[occurrence] = unique++;
++                } else {
++                    remap->occurrence_to_unique[occurrence] = remap->dense_val[k];
++                }
++            }
++            *unique_count = unique;
++            return 1;
++        }
++    }
++
+     if (count > UINT_MAX / 2u)
+         return 0;
+     u32 slot_capacity = 16u;
+@@ -390,6 +579,8 @@ void rsx_vertex_remap_destroy(rsx_vertex_remap* remap)
+         return;
+     free(remap->occurrence_to_unique);
+     free(remap->slots);
++    free(remap->dense_gen);
++    free(remap->dense_val);
+     memset(remap, 0, sizeof(*remap));
+ }
+ 
+diff --git a/libs/video/rsx_vertex_compact.h b/libs/video/rsx_vertex_compact.h
+index ad21361..f699d61 100644
+--- a/libs/video/rsx_vertex_compact.h
++++ b/libs/video/rsx_vertex_compact.h
+@@ -44,6 +44,10 @@ typedef struct rsx_vertex_remap {
+     rsx_vertex_remap_slot* slots;
+     u32 slot_capacity;
+     u32 generation;
++    u32* dense_gen;        /* direct table for a compact index range */
++    u32* dense_val;
++    u32 dense_capacity;
++    u32 dense_generation;
+ } rsx_vertex_remap;
+ 
+ typedef struct rsx_vertex_fetch_attr {
+@@ -116,6 +120,14 @@ void rsx_vertex_fetch_plan_prepare(
+ int rsx_vertex_fetch_one(
+     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
+ 
++/* Fetch refs[0..count) into out (layout.stride bytes each), the same bytes
++ * count calls of rsx_vertex_fetch_one would write, one attribute at a time
++ * with the format decided once per attribute. Returns 0 where any of those
++ * calls would (the output is then not used). */
++int rsx_vertex_fetch_range(
++    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
++    u8* out);
++
+ /* Collapse repeated (vertex_id, base_index) references in first-use order.
+  * refs is rewritten in place with the unique prefix.  The occurrence map
+  * remains valid until the next call using the same remap object. */
