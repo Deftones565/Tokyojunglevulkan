@@ -8,6 +8,7 @@
 # gameplay. Runs before 2026-10-19 used the old 11-press script (gameplay
 # from flip 4200, 240 s), so their numbers are not directly comparable. Extra VAR=value
 # arguments go into the game's environment (A/B toggles).
+# RUN_S=<seconds> changes the run length (default 150).
 # Output: build-runs/<run-name>.txt, build-runs/<run-name>/{frames,prof.bin}.
 set -e
 R=/opt/git/tokyoJungleRecomp
@@ -22,7 +23,7 @@ env PS3_VERBOSE=0 TJ_HEADLESS=1 SDL_AUDIODRIVER=dummy TJ_TICK_STATS=1 GCM_WAIT_S
   TJ_FRAME_DUMP=$out/frames TJ_FRAME_DUMP_EVERY=15 TJ_FRAME_DUMP_MAX=2000 \
   PROF_OUT=$out/prof.bin PROF_WALL_HZ=200 PROF_START_S=80 PROF_END_S=145 LD_PRELOAD=$R/build-runs/sigprof.so \
   PAD_SCRIPT="$($R/tools/play/fast_pad.sh)" \
-  "$@" timeout -s KILL 150 "$bin" $R/input/EBOOT.ELF > "$log" 2>&1 || true
+  "$@" timeout -s KILL ${RUN_S:-150} "$bin" $R/input/EBOOT.ELF > "$log" 2>&1 || true
 cd $R; rm -rf "$out/cwd" "$out/vfs"
 echo "$name: FATAL $(grep -c FATAL $log); LIFT-GAP $(grep -c LIFT-GAP $log); effect.efd $(grep -c effect.efd $log)"
 grep '\[gcm-wait\]' $log | tail -2 || true
