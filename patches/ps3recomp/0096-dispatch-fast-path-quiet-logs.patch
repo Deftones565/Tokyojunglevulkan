@@ -1,0 +1,270 @@
+# SPU_DRAIN per-hop fast path: skip spu_task_launch_check when it cannot act (not
+# LS 0, not a policy module, no stack-reset entry, no trace switch) and the
+# lockstep tick while lockstep is off; spu_depth_guard's ring per thread (it
+# bounced between cores). ~14% of busy-area CPU was this overhead.
+# Also: per-frame SPURS job-chain log lines behind ps3_log_verbose (11 writes a
+# frame, ~2.8% CPU; 11.7 MB -> 134 KB per run), queue-full warning rate-limited;
+# SPU_JOB_LS_CLEAR=0 switch (no LS clear between jobs, as the console; default
+# clears; visual A/B identical: docs/ab/2026-10-19-job-ls-noclear-ab.png).
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index da0d66d..f681bbc 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2267,7 +2267,8 @@ s32 _cellSpursJobChainAttributeInitialize(u32 jmRevision, u32 sdkRevision, u64 a
+     vm_write32((u32)attr_ea + JCATTR_MAX_SIZE_D, 0);
+     vm_write32((u32)attr_ea + JCATTR_INIT_SPU,   0);
+     vm_write32((u32)attr_ea + JCATTR_NAME,       0);
+-    printf("[cellSpurs] _JobChainAttributeInitialize(attr=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u maxCont=%u)\n",
++    if (ps3_log_verbose())   /* once per frame: Tokyo Jungle rebuilds its chains */
++        printf("[cellSpurs] _JobChainAttributeInitialize(attr=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u maxCont=%u)\n",
+            (u32)attr_ea, (u32)entry_ea, sizeJobDescriptor, maxGrabbedJob, maxContention);
+     return CELL_OK;
+ }
+@@ -2276,7 +2277,8 @@ s32 cellSpursJobChainAttributeSetName(u64 attr_ea, u64 name_ea)
+ {
+     if (!attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+     vm_write32((u32)attr_ea + JCATTR_NAME, (u32)name_ea);
+-    printf("[cellSpurs] JobChainAttributeSetName(attr=0x%08X, \"%s\")\n",
++    if (ps3_log_verbose())   /* once per frame: Tokyo Jungle rebuilds its chains */
++        printf("[cellSpurs] JobChainAttributeSetName(attr=0x%08X, \"%s\")\n",
+            (u32)attr_ea, name_ea ? (const char*)(vm_base + (u32)name_ea) : "-");
+     return CELL_OK;
+ }
+@@ -2321,7 +2323,8 @@ s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
+         }
+         _n++;
+     }
+-    printf("[cellSpurs] CreateJobChainWithAttribute(jc=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u name=\"%s\")\n",
++    if (ps3_log_verbose())   /* once per frame: Tokyo Jungle rebuilds its chains */
++        printf("[cellSpurs] CreateJobChainWithAttribute(jc=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u name=\"%s\")\n",
+            (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu,
+            name_ea ? (const char*)(vm_base + name_ea) : "-");
+ 
+@@ -2497,7 +2500,8 @@ s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
+      * peek meaningful. */
+     vm_write32(ea, notify_count);
+ 
+-    printf("[cellSpurs] JobGuardInitialize(guard=0x%08X chain=0x%08X notify=%u "
++    if (ps3_log_verbose())   /* once per frame: Tokyo Jungle rebuilds its chains */
++        printf("[cellSpurs] JobGuardInitialize(guard=0x%08X chain=0x%08X notify=%u "
+            "autoReset=%u)\n", ea, (u32)jc_ea, notify_count, auto_reset);
+     return CELL_OK;
+ }
+@@ -2919,7 +2923,8 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
+         if (op == 7) {
+             if (ext == (7 | (15 << 3))) {                     /* END */
+-                printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
++                if (ps3_log_verbose())   /* once per frame: Tokyo Jungle rebuilds its chains */
++                    printf("[cellSpurs] chain 0x%08X: END after %d job(s)\n", jc_ea, jobs);
+                 /* SPURS_ONE_EVENT_PER_JOB=1: the per-job signal above already
+                  * reported the last job; a second one is a stale extra event. */
+                 if (jobs && !getenv("SPURS_ONE_EVENT_PER_JOB")) jc_signal_done(jc_ea, jobs - 1);
+@@ -2992,7 +2997,8 @@ static s32 jc_start(u64 jc_ea, const char* who)
+         if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
+         s_jobchains[i].run_count++;
+         if (s_jobchains[i].run_count <= 3) {
+-            printf("[cellSpurs] %s(jc=0x%08X) run#%d entry=0x%08X\n",
++            if (ps3_log_verbose())   /* once per frame: Tokyo Jungle rebuilds its chains */
++                printf("[cellSpurs] %s(jc=0x%08X) run#%d entry=0x%08X\n",
+                    who, (u32)jc_ea, s_jobchains[i].run_count, s_jobchains[i].entry_ea);
+             jc_dump_commands(who, s_jobchains[i].entry_ea, 16);
+         }
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 08f5b10..cedc415 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1517,11 +1517,13 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
+  * unrelated overlays using the same address. Registration precedes execution. */
+ static struct { uint32_t entry; int image_id; } s_stack_reset[16];
+ static unsigned s_stack_reset_count;
++volatile unsigned g_spu_stack_reset_n;   /* spu_task_launch_fast reads it */
+ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
+ {
+     if (s_stack_reset_count < 16) {
+         s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
+         s_stack_reset[s_stack_reset_count++].image_id = image_id;
++        g_spu_stack_reset_n = s_stack_reset_count;
+     }
+ }
+ 
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 7ff8329..c3ce218 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -838,6 +838,20 @@ extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
+ /* Ring of the last PCs this SPU thread executed, for the unlifted-branch
+  * report. The dispatcher records indirect branches; SPU_DRAIN records every
+  * trampoline hop, which is the one that actually precedes a bad branch. */
++/* Per-hop dispatch fast path (SPU_DRAIN). Every hop of every SPU job called
++ * yz_lockstep_tick and spu_task_launch_check out of line -- ~14% of gameplay
++ * CPU in Tokyo Jungle's busy areas with their neighbours -- though almost all
++ * of their work is diagnostics that are off. A hop skips the check when it
++ * cannot do anything: not a branch to LS 0 (a job's end), not a policy module,
++ * no stack-reset entry registered, no trace switched on
++ * (g_spu_launch_slow, set by the first full call). It still counts the step,
++ * which the LS-0 test reads. The lockstep tick is skipped while lockstep is
++ * off (g_yz_lockstep_on 0; -1 = not decided yet, so it is called). */
++extern volatile int g_yz_lockstep_on;
++extern int          g_spu_launch_slow;           /* -1 unknown, 0 fast ok, 1 always full */
++extern volatile unsigned g_spu_stack_reset_n;
++static inline int spu_task_launch_fast(const struct spu_context* ctx);
++
+ extern SPU_THREAD_LOCAL uint32_t g_spu_pch[8];
+ extern SPU_THREAD_LOCAL unsigned g_spu_pch_n;
+ 
+@@ -878,6 +892,12 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc);
+  *
+  * Extents from the .symtab embedded in ps1_netemu (firmware file offset
+  * 0x171100), so they are exact rather than guessed. */
++static inline int spu_task_launch_fast(const spu_context* ctx)
++{
++    return g_spu_launch_slow == 0 && (ctx->pc & SPU_LS_MASK) != 0 &&
++           !ctx->policy_mode && g_spu_stack_reset_n == 0;
++}
++
+ static inline void spu_pchist_tick(const spu_context* ctx)
+ {
+     static int en = -1;
+@@ -933,8 +953,9 @@ static inline void spu_pchist_tick(const spu_context* ctx)
+             }                                                              \
+             void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
+             g_spu_trampoline_fn = 0;                            \
+-            yz_lockstep_tick(ctx);                             \
+-            spu_task_launch_check((ctx), (void*)_tf);          \
++            if (g_yz_lockstep_on) yz_lockstep_tick(ctx);       \
++            if (spu_task_launch_fast(ctx)) (ctx)->steps++;     \
++            else spu_task_launch_check((ctx), (void*)_tf);     \
+             if ((ctx)->int_enable &&                            \
+                 ((ctx)->event_status & (ctx)->event_mask))      \
+                 _tf = spu_take_interrupt((ctx), _tf);          \
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 931d3b3..01e6eed 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -57,8 +57,14 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
+     return k;
+ }
+ 
++int g_spu_launch_slow = -1;
++
+ void spu_task_launch_check(spu_context* ctx, void* fn)
+ {
++    if (g_spu_launch_slow < 0)   /* any switch that needs every hop: never skip */
++        g_spu_launch_slow = (getenv("SPU_NO_LS0_END") || getenv("SPU_EXITTRACE") ||
++                             getenv("SPU_STEPTRACE") || getenv("SPU_JOBDRAIN") ||
++                             getenv("SPURS_PM_FLOW")) ? 1 : 0;
+     t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
+     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+@@ -344,9 +350,12 @@ void spu_depth_guard(spu_context* ctx)
+     /* Ring of recent drain sites. When the depth trips, the useful question is
+      * not "where are we" but "what cycle got us here" -- one pc names a point,
+      * a ring names the loop. */
++    /* Per thread: one ring every SPU thread wrote kept its cache line moving
++     * between cores on every drain (~2% of gameplay CPU). The report below
++     * prints the tripping thread's own ring, which is the cycle it is in. */
+     enum { RING = 24 };
+-    static uint32_t s_ring[RING];
+-    static uint32_t s_n;
++    static SPU_THREAD_LOCAL uint32_t s_ring[RING];
++    static SPU_THREAD_LOCAL uint32_t s_n;
+     s_ring[s_n % RING] = ((uint32_t)ctx->pc & SPU_LS_MASK);
+     s_n++;
+ 
+diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
+index 6fc6255..52c9c5e 100644
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -241,7 +241,13 @@ static spurs_job_ctx_slot* spurs_job_ctx_take(uint32_t bin_end)
+     const size_t ls_end   = ls_begin + SPU_LS_SIZE;
+     memset(ctx, 0, ls_begin);
+     memset((uint8_t*)ctx + ls_end, 0, sizeof(*ctx) - ls_end);
+-    if (slot->dirty_end > bin_end)
++    /* SPU_JOB_LS_CLEAR=0: leave the previous job's bytes in LS, as the real
++     * job manager does (it does not clear LS between jobs). Default: cleared,
++     * the state a fresh context had. Each clear is most of 256 KB for the
++     * geometry job, ~7.6% of gameplay CPU. */
++    static int ls_clear = -1;
++    if (ls_clear < 0) ls_clear = spurs_job_env_flag("SPU_JOB_LS_CLEAR", 1);
++    if (ls_clear && slot->dirty_end > bin_end)
+         memset(ctx->ls_store + bin_end, 0, slot->dirty_end - bin_end);
+     memset(ctx->ls_store + SPU_LS_SIZE - JOB_LS_TOP_BLOCK, 0, JOB_LS_TOP_BLOCK);
+     ctx->ls     = ctx->ls_store;
+diff --git a/runtime/syscalls/sys_event.c b/runtime/syscalls/sys_event.c
+index 4240edf..85d967b 100644
+--- a/runtime/syscalls/sys_event.c
++++ b/runtime/syscalls/sys_event.c
+@@ -283,9 +283,9 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
+             queue_id);
+ }
+ 
+-/* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
+-static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
+-
++/* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
++static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
++
+ int64_t sys_event_queue_receive(ppu_context* ctx)
+ {
+     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
+@@ -301,7 +301,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+ 
+     /* PS3_WAITBT: one-shot guest-stack dump per (tid,queue) so we can name the
+      * exact game function the main thread is stuck polling in the flip loop. */
+-    if ((s_ps3_waitbt < 0 ? (s_ps3_waitbt = getenv("PS3_WAITBT") ? 1 : 0) : s_ps3_waitbt)) {
++    if ((s_ps3_waitbt < 0 ? (s_ps3_waitbt = getenv("PS3_WAITBT") ? 1 : 0) : s_ps3_waitbt)) {
+         static unsigned char seen[8][8] = {{0}};
+         unsigned t = (unsigned)ctx->thread_id & 7, qk = queue_id & 7;
+         if (!seen[t][qk]) {
+@@ -365,7 +365,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+      * 0x004F5F80) against the recorded SPURS context. It claims the ready task
+      * from libsre's taskset and runs the task body -- real recompiled SPU code,
+      * not a synthesized completion. Gated by YDKJ_SPUTASK; fire once. */
+-    if ((s_ydkj_sputask < 0 ? (s_ydkj_sputask = getenv("YDKJ_SPUTASK") ? 1 : 0) : s_ydkj_sputask) && timeout_us == 0 && g_ydkj_spurs_ctx_ea) {
++    if ((s_ydkj_sputask < 0 ? (s_ydkj_sputask = getenv("YDKJ_SPUTASK") ? 1 : 0) : s_ydkj_sputask) && timeout_us == 0 && g_ydkj_spurs_ctx_ea) {
+         static int s_fired = 0;
+         if (!s_fired) {
+             s_fired = 1;
+@@ -386,7 +386,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+      * returns. Synthesize a ready event so init returns -> see whether the PPU
+      * then reaches CreateTaskset and the running policy dispatches the cri task.
+      * Returns a zero-ish SPU-thread-group event; refine the format if init rejects it. */
+-    if ((s_ydkj_spurs_ready < 0 ? (s_ydkj_spurs_ready = getenv("YDKJ_SPURS_READY") ? 1 : 0) : s_ydkj_spurs_ready) && (queue_id == 1 || queue_id == 4)
++    if ((s_ydkj_spurs_ready < 0 ? (s_ydkj_spurs_ready = getenv("YDKJ_SPURS_READY") ? 1 : 0) : s_ydkj_spurs_ready) && (queue_id == 1 || queue_id == 4)
+             && timeout_us == 0 && q->count == 0) {
+         static int s_fire[8] = {0};
+         if (s_fire[queue_id] < 64) {
+@@ -412,7 +412,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+      * main thread times out after 30s and the title tears down. Synthesize a
+      * completion so the wait returns -> see whether the game then advances to
+      * asset load + menu draw (content). Returns immediately with a zero event. */
+-    if ((s_ydkj_fakecomplete < 0 ? (s_ydkj_fakecomplete = getenv("YDKJ_FAKECOMPLETE") ? 1 : 0) : s_ydkj_fakecomplete) && (queue_id == 2 || queue_id == 3) && q->count == 0) {
++    if ((s_ydkj_fakecomplete < 0 ? (s_ydkj_fakecomplete = getenv("YDKJ_FAKECOMPLETE") ? 1 : 0) : s_ydkj_fakecomplete) && (queue_id == 2 || queue_id == 3) && q->count == 0) {
+         if (event_addr != 0) {
+             uint64_t* out = (uint64_t*)vm_to_host(event_addr);
+             out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
+@@ -422,7 +422,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
+     /* YDKJ_HLE_DRAW (diagnostic): also unblock the AsyncLoad q=1 wait (timeout=0,
+      * blocks forever) so the loader thread proceeds. Tests whether the game's
+      * render/draw code is reachable once the completion waits are satisfied. */
+-    if ((s_ydkj_hle_draw < 0 ? (s_ydkj_hle_draw = getenv("YDKJ_HLE_DRAW") ? 1 : 0) : s_ydkj_hle_draw) && queue_id == 1 && timeout_us == 0 && q->count == 0) {
++    if ((s_ydkj_hle_draw < 0 ? (s_ydkj_hle_draw = getenv("YDKJ_HLE_DRAW") ? 1 : 0) : s_ydkj_hle_draw) && queue_id == 1 && timeout_us == 0 && q->count == 0) {
+         static int s_n1 = 0;
+         if (s_n1 < 256) { s_n1++;
+             if (event_addr != 0) {
+@@ -999,8 +999,12 @@ int64_t sys_event_port_send(ppu_context* ctx)
+       g_spu_pending_evt_valid = 0; }
+ 
+     if (event_queue_push(q, &evt) < 0) {
+-        fprintf(stderr, "[evt] port_send(port=%u): queue %d FULL -> EBUSY%c",
+-                port_id, qidx, 10);
++        /* Tokyo Jungle overflows queue 1 every frame (it does not drain it):
++         * the first 16, then one line per 1000. */
++        static unsigned long n_full;
++        if (++n_full <= 16 || n_full % 1000 == 0)
++            fprintf(stderr, "[evt] port_send(port=%u): queue %d FULL -> EBUSY (#%lu)%c",
++                    port_id, qidx, n_full, 10);
+         return (int64_t)(int32_t)CELL_EBUSY;
+     }
+ 
