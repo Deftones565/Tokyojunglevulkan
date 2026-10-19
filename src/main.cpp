@@ -54,6 +54,7 @@
 
 #include "settings_menu.h"   /* settings.ini and the in-game settings menu */
 
+#include <atomic>
 #include <chrono>
 #include <stdint.h>
 #include <stdio.h>
@@ -128,6 +129,7 @@ extern "C" { extern uint8_t* vm_base; extern uint32_t ppu_hle_inject_base; }
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
 int      cellGcm_rsx_waiters(void);           /* guest threads waiting on the drain */
 unsigned cellGcm_flip_request_count(void);
+int      cellSaveData_busy(void);   /* cellSaveData.c: saves being written */
 }
 
 /* ---------------------------------------------------------------------------
@@ -447,6 +449,23 @@ static void perf_telemetry(void)
     fflush(out);
 }
 
+/* Stopping the frame clock before the process exits. A title's
+ * sys_process_exit ends in the host exit(), which runs the exit handlers --
+ * the graphics driver's teardown among them -- while this thread is still
+ * submitting GPU work: every quit crashed in the driver under vk_kick
+ * (SIGSEGV, then minutes of core dump, 2026-10-19). The handler below is
+ * registered after the backend is up, so it runs before the driver's: it asks
+ * the loop to stop and waits until the loop has parked between iterations. */
+static std::atomic<int> s_clock_state{0};   /* 0 running, 1 stop asked, 2 parked */
+
+static void frame_clock_stop_at_exit(void)
+{
+    s_clock_state.store(1);
+    for (int i = 0; i < 500 && s_clock_state.load() != 2; i++) usleep(1000);
+    fprintf(stderr, "[quit] frame clock %s before exit\n",
+            s_clock_state.load() == 2 ? "stopped" : "did not stop");
+}
+
 static DWORD WINAPI frame_clock(LPVOID)
 {
     const char* title = getenv("PS3_TITLE");
@@ -457,6 +476,7 @@ static DWORD WINAPI frame_clock(LPVOID)
             !rsx_ok ? "FAILED"
             : getenv("PS3RECOMP_VK_WINDOW") ? "OK -- window open" : "OK");
     if (rsx_ok) tj_settings_backend_ready();   /* window mode, vsync, internal resolution */
+    atexit(frame_clock_stop_at_exit);
 
     unsigned  last_flip = 0;
     /* NTSC vblank, 60000/1001 Hz (59.94), on an absolute schedule: tick k is
@@ -519,9 +539,19 @@ static DWORD WINAPI frame_clock(LPVOID)
                 if (cellGcm_rsx_waiters()) break;   /* a guest thread is blocked on the drain */
             }
         }
+        if (s_clock_state.load() == 1) {         /* exit() is running: park */
+            s_clock_state.store(2);
+            for (;;) pause();
+        }
         vclock::time_point now = vclock::now();
 
-        if (quitting && now >= quit_deadline) {
+        /* A save still being written gets to finish (up to 30 s past the
+         * close): ending the process now would cut it off. */
+        if (quitting && now >= quit_deadline && cellSaveData_busy() &&
+            now < quit_deadline + std::chrono::seconds(30)) {
+            static bool said;
+            if (!said) { said = true; fprintf(stderr, "[quit] a save is in progress; waiting for it\n"); }
+        } else if (quitting && now >= quit_deadline) {
             const int code = g_sys_process_exit_called ? (int)g_sys_process_exit_code : 0;
             fprintf(stderr, "[quit] %s; ending the process (code %d)\n",
                     g_sys_process_exit_called ? "sys_process_exit did not finish"
