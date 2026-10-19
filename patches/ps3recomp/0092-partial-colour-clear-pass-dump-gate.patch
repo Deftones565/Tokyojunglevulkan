@@ -1,0 +1,99 @@
+# CLEAR_SURFACE names R, G, B and A on their own: a clear of only some keeps the
+# others (readback, set, write back). Clearing all four painted Tokyo Jungle's
+# pause-menu map panel white (user-confirmed fixed 2026-10-19). Diagnostics:
+# RSX_ENGINE_PASS_DUMP_GATE=<file> starts the pass dump when <file> appears;
+# RSX_ENGINE_PASS_DUMP_TEX=1 saves each sampled texture's guest bytes.
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index fce37e9..e968988 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -2473,6 +2473,18 @@ static int pd_capturing(void)
+     if (s_pd.state == 1 && s_pd.after_s &&
+         difftime(time(NULL), s_pd.start) >= (double)s_pd.after_s && pd_open_index())
+         fprintf(s_pd.index, "from a draw of frame %u, %u s in\n", g.frames, s_pd.after_s);
++    /* RSX_ENGINE_PASS_DUMP_GATE=<file>: start at the first frame where <file>
++     * exists, so a screen the player opens at any time (a pause menu) can be
++     * captured: create the file once it is up. Checked once a frame. */
++    { static const char* gate = (const char*)-1; static u32 checked = ~0u;
++      if (gate == (const char*)-1) gate = getenv("RSX_ENGINE_PASS_DUMP_GATE");
++      if (s_pd.state == 1 && gate && checked != g.frames) {
++          checked = g.frames;
++          FILE* gf = fopen(gate, "rb");
++          if (gf) { fclose(gf);
++                    if (pd_open_index())
++                        fprintf(s_pd.index, "from a draw of frame %u, gate file %s\n", g.frames, gate); }
++      } }
+     return s_pd.state == 2;
+ }
+ 
+@@ -2652,6 +2664,26 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+             rsx_dsp_get_texture(&g.rsx, u, &t);
+             fprintf(s_pd.draws_log, " t%u %u:0x%08X f%02X %ux%u", u, t.location, t.offset,
+                     t.format & 0xFFu, t.width, t.height);
++            /* Each sampled texture's guest bytes, once per address, as
++             * <dir>/tex_L_ADDR_fFF_WxH_pPITCH.bin (RSX_ENGINE_PASS_DUMP_TEX=1). */
++            static int dump_tex = -1;
++            if (dump_tex < 0) dump_tex = getenv("RSX_ENGINE_PASS_DUMP_TEX") != NULL;
++            if (dump_tex) {
++                static u32 done[256]; static u32 n_done;
++                int seen = 0;
++                for (u32 k = 0; k < n_done; k++) if (done[k] == (t.offset ^ (t.location << 31))) seen = 1;
++                const u32 span = eng_texture_span(t.format, t.width, t.height, t.mipmaps,
++                                                  t.pitch, (int)t.cubemap);
++                const u8* src = (!seen && span) ? eng_guest_ptr(NULL, t.location, t.offset, span) : NULL;
++                if (src && n_done < 256) {
++                    done[n_done++] = t.offset ^ (t.location << 31);
++                    char path[1200];
++                    snprintf(path, sizeof path, "%s/tex_%u_%08X_f%02X_%ux%u_p%u.bin", s_pd.dir,
++                             t.location, t.offset, t.format & 0xFFu, t.width, t.height, t.pitch);
++                    FILE* tf = fopen(path, "wb");
++                    if (tf) { fwrite(src, 1, span, tf); fclose(tf); }
++                }
++            }
+         }
+         fprintf(s_pd.draws_log, "\n");
+     }
+@@ -2935,10 +2967,43 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
+         eng_draw_window(&csf, &ox, &oy, &ext_w, &ext_h);
+         const u32 cw = csf.clip_w ? csf.clip_w : g.width;
+         const u32 ch = csf.clip_h ? csf.clip_h : g.height;
++        /* CLEAR_SURFACE names each colour channel on its own. A clear of only
++         * some of them keeps the others: Tokyo Jungle's pause menu draws the
++         * map into the bloom atlas and then clears just part of it, and
++         * clearing all four channels painted the map panel white. Such a
++         * clear reads the rectangle back, sets the named channels and writes
++         * it back -- slower, but only partial clears take this path. */
++        const u32 all4 = RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G | RSX_CLEAR_COLOR_B | RSX_CLEAR_COLOR_A;
++        const u32 cmask = mask & all4;
++        if (cmask != all4) {
++            static int logged;
++            if (!logged) { logged = 1;
++                fprintf(stderr, "[rsx engine] partial colour clear (mask 0x%X): only those channels\n", cmask); }
++        }
+         for (u32 i = 0; i < n_targets; i++) {
+             const eng_surface* t = &g.surfaces[targets[i]];
+             u32 sx, sy, sw, sh;
+             eng_window_scissor(targets[i], ox, oy, cw, ch, &sx, &sy, &sw, &sh);
++            if (cmask != all4) {
++                if (!sw || !sh || t->fmt != RSX_BE_FMT_R8G8B8A8 || !g.be->readback ||
++                    !g.be->color_target_write)
++                    continue;               /* cannot keep the other channels: leave it */
++                const u32 row = sw * 4u;
++                u8* px = (u8*)malloc((size_t)row * sh);
++                if (!px) continue;
++                g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
++                g.be->readback(g.be->user, t->handle, sx, sy, sw, sh, px, row);
++                const u8 cv[4] = { (u8)((c >> 16) & 0xFF), (u8)((c >> 8) & 0xFF),
++                                   (u8)(c & 0xFF), (u8)((c >> 24) & 0xFF) };
++                const int on[4] = { !!(cmask & RSX_CLEAR_COLOR_R), !!(cmask & RSX_CLEAR_COLOR_G),
++                                    !!(cmask & RSX_CLEAR_COLOR_B), !!(cmask & RSX_CLEAR_COLOR_A) };
++                for (size_t k = 0; k < (size_t)sw * sh; k++)
++                    for (int ch4 = 0; ch4 < 4; ch4++)
++                        if (on[ch4]) px[k * 4u + ch4] = cv[ch4];
++                g.be->color_target_write(g.be->user, t->handle, sx, sy, sw, sh, px, row);
++                free(px);
++                continue;
++            }
+             const int whole = sx == 0 && sy == 0 && sw >= t->w && sh >= t->h;
+             if (whole || !g.be->color_target_write || t->fmt != RSX_BE_FMT_R8G8B8A8) {
+                 g.be->clear_color(g.be->user, t->handle, rgba);
