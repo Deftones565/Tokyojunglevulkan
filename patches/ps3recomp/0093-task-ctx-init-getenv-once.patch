@@ -1,0 +1,198 @@
+# SPU task runs: clear everything but the local store when the caller copies
+# the thread's 256 KB in anyway (a redundant 256 KB memset per task run, ~10%
+# CPU in busy areas); dispatch-path getenv() calls cached (SPU_GETENV_ONCE).
+# Headless A/B, same street, nothing else running: 55.3 -> 57.3 flips/s.
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 7ff740f..7ff8329 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -12,6 +12,7 @@
+ 
+ #include "../../include/ps3emu/ps3types.h"
+ #include <stdint.h>
++#include <stddef.h>   /* offsetof */
+ #include <string.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -424,6 +425,29 @@ static inline void spu_context_init(spu_context* ctx, uint32_t spu_id)
+     ctx->status = SPU_STATUS_STOPPED;
+ }
+ 
++/* spu_context_init for a context whose local store the caller is about to
++ * overwrite whole (a task run copying its thread's 256 KB in): clears every
++ * field but the local store. The result after the copy is the same as a full
++ * init and the copy; it saves a 256 KB memset per task run, which was ~10% of
++ * gameplay CPU in Tokyo Jungle's busier areas. */
++static inline void spu_context_init_except_ls(spu_context* ctx, uint32_t spu_id)
++{
++    const size_t ls_begin = offsetof(spu_context, ls_store);
++    const size_t ls_end   = ls_begin + SPU_LS_SIZE;
++    memset(ctx, 0, ls_begin);
++    memset((uint8_t*)ctx + ls_end, 0, sizeof(*ctx) - ls_end);
++    ctx->ls     = ctx->ls_store;
++    ctx->spu_id = spu_id;
++    ctx->status = SPU_STATUS_STOPPED;
++}
++
++/* getenv() looked up once per call site: the SPU dispatch paths test a dozen
++ * diagnostic switches on every task run, and each getenv scans the whole
++ * environment. Nothing changes them while the game runs. */
++#define SPU_GETENV_ONCE(name) \
++    ({ static const char* _spu_env = (const char*)-1; \
++       if (_spu_env == (const char*)-1) _spu_env = getenv(name); _spu_env; })
++
+ /* Set r1 the way the SPU ABI defines it: word 0 is the stack pointer, word 1
+  * the number of bytes of stack still available below it. Code built with
+  * stack checking subtracts every frame from all four words (ai r1,r1,-N) and
+diff --git a/runtime/spu/spu_lifted_job.h b/runtime/spu/spu_lifted_job.h
+index 8bf8205..6ff446d 100644
+--- a/runtime/spu/spu_lifted_job.h
++++ b/runtime/spu/spu_lifted_job.h
+@@ -165,7 +165,8 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+ {
+     if (!entry) return -1;
+     spu_context ctx;
+-    spu_context_init(&ctx, 0);
++    if (local_store) spu_context_init_except_ls(&ctx, 0);   /* LS copied in below */
++    else             spu_context_init(&ctx, 0);
+     { static int s_cl = -1;
+       if (s_cl < 0) s_cl = getenv("SPU_CTX_LOG") ? 1 : 0;
+       if (s_cl) { fprintf(stderr, "[spu-ctx] new job context %p image=%d\n",
+@@ -293,7 +294,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+         }
+     }
+     #undef _LB
+-    if (taskset_ctx && getenv("SPURS_TASKSET_TRACE")) {
++    if (taskset_ctx && SPU_GETENV_ONCE("SPURS_TASKSET_TRACE")) {
+         fprintf(stderr, "[taskset] run image=%d r3=%08X %08X %08X %08X "
+                 "r4=%08X %08X %08X %08X\n", image_id,
+                 ctx.gpr[3]._u32[0], ctx.gpr[3]._u32[1], ctx.gpr[3]._u32[2], ctx.gpr[3]._u32[3],
+@@ -307,7 +308,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+      * outbound word leaves the PPU blocked in sys_event_queue_receive forever,
+      * and the difference between "parked at its idle poll" and "fell over after
+      * three instructions" is invisible without this. */
+-    if (opts && getenv("SPU_WORKER_TRACE")) {
++    if (opts && SPU_GETENV_ONCE("SPU_WORKER_TRACE")) {
+         fprintf(stderr, "[worker] spu=0x%X halted=%d steps=%llu status=0x%X pc=0x%05X "
+                 "inmbox(n=%u) outmbox(n=%u v=0x%08X) outintr(n=%u v=0x%08X)\n",
+                 ctx.spu_id, _halted, (unsigned long long)ctx.steps, (unsigned)ctx.status,
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 9bdb538..b9e9448 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -623,7 +623,7 @@ static void spu_async_run(spu_async_job* j)
+              * the policy module (libsre @0x30021480 -> LS 0xA00) and write the
+              * task descriptor {0xFFFFFFFF, 0x400, 0x2700, 0x3000} at 0x2FB0, then
+              * run the cri task, to see how much further it gets. Diagnostic only. */
+-            if (j->image_id == 22 && getenv("YDKJ_CRI_TASKSET")) {
++            if (j->image_id == 22 && SPU_GETENV_ONCE("YDKJ_CRI_TASKSET")) {
+                 /* cri build: load the TASKSET POLICY module (libsre 0x23680 ->
+                  * LS 0xA00) alongside the cri task (already at 0x3000), then RUN
+                  * THE POLICY ENTRY (tsp_spu_func_00000A00) under image 23. The
+@@ -667,11 +667,11 @@ static void spu_async_run(spu_async_job* j)
+              * trampoline (LS 0xA70, intercepted in spu_channels.c) + the task
+              * descriptor @0x2FB0. Adopted from JonathanDC64/ps3recomp (aaea4158).
+              * Gate: default on for image 22 unless YDKJ_NO_CRI_CTX. */
+-            if (j->image_id == 22 && !getenv("YDKJ_NO_CRI_CTX")) {
++            if (j->image_id == 22 && !SPU_GETENV_ONCE("YDKJ_NO_CRI_CTX")) {
+                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                 extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+                 #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
+-                if (g_ydkj_real_taskset_ea && !getenv("YDKJ_MINIMAL_CTX")) {
++                if (g_ydkj_real_taskset_ea && !SPU_GETENV_ONCE("YDKJ_MINIMAL_CTX")) {
+                     /* REAL taskset context: build the SpursTasksetContext at LS 0x2700
+                      * from the actual BE CellSpursTaskset (spurs ptr, args, TaskInfo)
+                      * so the cri leaf reads valid data instead of my planted guesses. */
+@@ -706,9 +706,9 @@ static void spu_async_run(spu_async_job* j)
+                      * can't be diffed -- sweep candidate values here and read the probe's
+                      * r3. Overrides the plants above so one build tests many values. */
+                     { const char* _e;
+-                      if ((_e=getenv("YDKJ_G1_LSPAT"))) { uint32_t v=(uint32_t)strtoul(_e,0,0);
++                      if ((_e=SPU_GETENV_ONCE("YDKJ_G1_LSPAT"))) { uint32_t v=(uint32_t)strtoul(_e,0,0);
+                           LSBE32(0x27A0,v); LSBE32(0x27A4,v); LSBE32(0x27A8,v); LSBE32(0x27AC,v); }
+-                      if ((_e=getenv("YDKJ_G1_CTX")))   { uint32_t v=(uint32_t)strtoul(_e,0,0);
++                      if ((_e=SPU_GETENV_ONCE("YDKJ_G1_CTX")))   { uint32_t v=(uint32_t)strtoul(_e,0,0);
+                           LSBE32(0x2798,v); LSBE32(0x279C,v); } }
+                     fprintf(stderr, "[cri] REAL SpursTasksetContext built from taskset 0x%08X task %u (elf=0x%llX)\n",
+                             g_ydkj_real_taskset_ea, g_ydkj_real_taskid, (unsigned long long)elf);
+@@ -754,7 +754,7 @@ static void spu_async_run(spu_async_job* j)
+              * timing bug, fix = defer/re-dispatch on signal); if it still loops on
+              * a null base, the buffer is never filled (=> an audio HLE gap). */
+             if (j->image_id != 22) {
+-                const char* d = getenv("LBP_TASK_DELAY");
++                const char* d = SPU_GETENV_ONCE("LBP_TASK_DELAY");
+                 if (d && *d) {
+ #ifdef _WIN32
+                     Sleep((unsigned)(atoi(d) * 1000));
+@@ -771,7 +771,7 @@ static void spu_async_run(spu_async_job* j)
+              * Planting it makes the mixer read the real FMOD control block
+              * (0x0094F5xx) and the EventFlag handshake completes. Default ON;
+              * LBP_NO_TASKSET restores the old direct-dispatch for comparison. */
+-            if (j->image_id != 22 && !getenv("LBP_NO_TASKSET")) {
++            if (j->image_id != 22 && !SPU_GETENV_ONCE("LBP_NO_TASKSET")) {
+                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                 /* Use the taskset+taskid captured for THIS job at dispatch (not the
+                  * globals, which the next CreateTask clobbers -- the race that made
+@@ -825,7 +825,7 @@ static void spu_async_run(spu_async_job* j)
+                     }
+                     fflush(stderr);
+                 }
+-                if (getenv("LBP_REAL_POLICY") && j->taskset_ea) {
++                if (SPU_GETENV_ONCE("LBP_REAL_POLICY") && j->taskset_ea) {
+                     extern int spurs_run_taskset_policy_probe(uint32_t,uint32_t,uint32_t,
+                                                               uint64_t,uint32_t,uint8_t*,uint32_t);
+                     /* spurs EA from the taskset header lo32 @ +0x64 (be64 @0x60). */
+@@ -857,7 +857,7 @@ static void spu_async_run(spu_async_job* j)
+                      * (not green) the policy's fuller ctx is the fix (H1); if still
+                      * green, the frame-output gate is Bink-layer (H2). Keeps the
+                      * build_context 0x100 kernel ctx (moduleId "TK") intact. */
+-                    if (getenv("LBP_POLICY_CTX")) {
++                    if (SPU_GETENV_ONCE("LBP_POLICY_CTX")) {
+                         memcpy(ls + 0x2700, real2700, sizeof real2700);
+                         fprintf(stderr, "[real-pm] OVERLAID policy ctx onto binkspu LS 0x2700 (LBP_POLICY_CTX)\n");
+                     }
+@@ -876,7 +876,7 @@ static void spu_async_run(spu_async_job* j)
+              * in a bounded loop until it actually DECODES (a >256B video GET sets
+              * g_cri_video_dma) or we time out. This does NOT fake data: the task
+              * only decodes if the PPU genuinely populated real work meanwhile. */
+-            if (j->image_id == 22 && getenv("YDKJ_CRI_RESUME") && !g_cri_video_dma) {
++            if (j->image_id == 22 && SPU_GETENV_ONCE("YDKJ_CRI_RESUME") && !g_cri_video_dma) {
+                 for (int attempt = 0; attempt < 400 && !g_cri_video_dma; attempt++) {
+ #ifdef _WIN32
+                     Sleep(3);
+@@ -903,7 +903,7 @@ static void spu_async_run(spu_async_job* j)
+             /* YDKJ_CRI_WAKE probe: on cri task (image 22) completion, wake any PPU
+              * completion-waiter (the SPU->PPU cellSpursEventFlag completion isn't
+              * propagated yet). Tests whether the game then advances to draw content. */
+-            if (j->image_id == 22 && getenv("YDKJ_CRI_WAKE")) {
++            if (j->image_id == 22 && SPU_GETENV_ONCE("YDKJ_CRI_WAKE")) {
+                 extern void ydkj_wake_all_event_flags(void);
+                 ydkj_wake_all_event_flags();
+                 fprintf(stderr, "[cri] YDKJ_CRI_WAKE: woke all event-flag waiters on cri completion\n");
+@@ -912,7 +912,7 @@ static void spu_async_run(spu_async_job* j)
+              * ends. A reference dump from real hardware is a full local store,
+              * so the only way to ask "what ELSE is different" -- rather than
+              * checking one guessed word at a time -- is to diff all 256 KB. */
+-            { const char* pfx = getenv("SPU_LS_DUMP");
++            { const char* pfx = SPU_GETENV_ONCE("SPU_LS_DUMP");
+               if (pfx) { char path[512];
+                   snprintf(path, sizeof path, "%s_img%d.bin", pfx, j->image_id);
+                   FILE* f = fopen(path, "wb");
+@@ -978,7 +978,7 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
+          * programs they are NOT embedded ELFs in the EBOOT, so
+          * tools/extract_spu_images.py cannot find them and this is the only
+          * place the bytes exist. One file per fingerprint. */
+-        { const char* _dir = getenv("SPU_DUMP_MISS");
++        { const char* _dir = SPU_GETENV_ONCE("SPU_DUMP_MISS");
+           if (_dir && *_dir) {
+               static uint64_t _seen[64]; static unsigned _nseen = 0;
+               unsigned _k = 0;
+@@ -1388,7 +1388,7 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
+          * persistent worker -- could only ever report a fingerprint you had no
+          * way to resolve. These blobs are not ELFs in the EBOOT, so this dump
+          * is the only place their bytes exist. */
+-        { const char* _dir = getenv("SPU_DUMP_MISS");
++        { const char* _dir = SPU_GETENV_ONCE("SPU_DUMP_MISS");
+           if (_dir && *_dir) {
+               static uint64_t _seen[64]; static unsigned _nseen = 0;
+               unsigned _k = 0;

@@ -275,8 +275,18 @@ static void tj_flip_promote_vblank(void)
      * TJ_FORCE_FLIP60=1 forces it on for scripted runs. */
     static int force = -1;
     if (force < 0) force = getenv("TJ_FORCE_FLIP60") != nullptr;
-    const uint8_t check30 = (force || tj_settings_target60()) ? 0 : 1;
+    const bool target60 = force || tj_settings_target60();
+    const uint8_t check30 = target60 ? 0 : 1;
     if (vm_base[TJ_GOV_CHECK30] != check30) vm_base[TJ_GOV_CHECK30] = check30;
+    /* With the check off the game no longer drops to 30 on missed frames,
+     * but it still sets 30 itself (the pause menu does), and nothing brings it
+     * back: the return to 60 sits behind the same check. So aiming for 60
+     * also puts it back at one vblank per flip (user, 2026-10-19: locked at 30
+     * after opening the map). */
+    if (target60) {
+        if (tj_be32(TJ_GOV_N) == 2) tj_wbe32(TJ_GOV_N, 1);
+        return;
+    }
     if (tj_be32(TJ_GOV_N) != 2) return;
     const uint32_t ctrl = ppu_hle_inject_base + 0x2000u;   /* CellGcmControl */
     if (tj_be32(ctrl) != tj_be32(ctrl + 4)) return;       /* the handler counts this one */
