@@ -1,0 +1,75 @@
+diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
+index b981e3b..5aeee83 100644
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -194,10 +194,23 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+      * wedged jobs were doing: each spun DMAing to the word at offset 0x64 of
+      * its own image, which is why the addresses were misaligned and looked
+      * like floats -- they were opcodes. */
+-    uint32_t io_ls     = p;                p += ALIGN1024(size_io);
+-    uint32_t out_ls    = p;                p += ALIGN1024(size_out);
++    /* MEMORY_CHECK jobs (jobType bit 0x02) guard their own buffers: the
++     * job's startup code lowers every non-empty buffer size in its LS copy of
++     * the descriptor by 16 and plants a 0xDEADBEEF word at the new end, which
++     * it checks when the job finishes. The job manager therefore hands such a
++     * job 16 bytes more than the game declared for each buffer. Without that
++     * room the guard landed on the last row of real input: Tokyo Jungle's
++     * animation job (E0CE22AC) then built its last bone matrix from DEADBEEF,
++     * and the skinned character covered the screen. SPURS_JOB_MEMCHECK_ROOM=0
++     * restores the old layout. */
++    static int s_mc_room = -1;
++    if (s_mc_room < 0) { const char* e = getenv("SPURS_JOB_MEMCHECK_ROOM");
++                         s_mc_room = (e && *e == '0') ? 0 : 1; }
++    const uint32_t guard = (s_mc_room && ((g32(job_ea + JH_JOB_TYPE) >> 24) & 0x02u)) ? 16u : 0u;
++    uint32_t io_ls     = p;                p += ALIGN1024(size_io + guard);
++    uint32_t out_ls    = p;                p += ALIGN1024(size_out + guard);
+     if (use_io && !out_ls) out_ls = io_ls;    /* in-out: output shares ioBuffer */
+-    uint32_t ss_size   = ALIGN1024(size_scr + size_stk);
++    uint32_t ss_size   = ALIGN1024(size_scr + guard + size_stk);
+     /* The scratch pointer is the BASE OF THE SCRATCH+STACK BLOCK, and it is
+      * valid even when sizeScratch is 0 -- a zero-length buffer still has an
+      * address. Handing the job a NULL here meant it dereferenced 0 and read
+@@ -217,10 +230,10 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+         uint32_t sz  = (uint32_t)(e >> 32);
+         uint32_t eal = (uint32_t)e;
+         if (!sz || !eal) continue;
+-        if (p + sz > SPU_LS_SIZE) break;
++        if (p + sz + guard > SPU_LS_SIZE) break;
+         cache_ls[i] = p;
+         memcpy(ls + p, vm_base + eal, sz);
+-        p += ALIGN1024(sz);
++        p += ALIGN1024(sz + guard);
+     }
+ 
+     /* ---- input DMA list -> ioBuffer, each entry 16-byte aligned ---------- */
+@@ -247,6 +260,21 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+         fprintf(stderr, "[spurs-job] job 0x%08X: WARNING regions reach 0x%X, "
+                         "past the context at 0x%X\n", job_ea, p, ctx_ls);
+     memcpy(ls + desc_ls, vm_base + job_ea, dsz);
++    if (guard) {
++        /* The job sees each non-empty buffer 16 bytes larger (see above). */
++        static const uint32_t offs[2] = { JH_SIZE_IN_OR_INOUT, JH_SIZE_OUT };
++        for (int k = 0; k < 2; k++) {
++            uint32_t o = desc_ls + offs[k];
++            uint32_t v = ((uint32_t)ls[o] << 24) | ((uint32_t)ls[o+1] << 16) | ((uint32_t)ls[o+2] << 8) | ls[o+3];
++            if (v) ls32(ls, o, v + guard);
++        }
++        for (uint32_t i = 0; i < n_cache; i++) {
++            uint32_t o = desc_ls + JH_SIZE + (n_dma + i) * 8u;
++            if (o + 8 > desc_ls + dsz) break;
++            uint32_t v = ((uint32_t)ls[o] << 24) | ((uint32_t)ls[o+1] << 16) | ((uint32_t)ls[o+2] << 8) | ls[o+3];
++            if (v) ls32(ls, o, v + guard);
++        }
++    }
+ 
+     ls32(ls, ctx_ls + JC_IO_BUFFER, io_ls);
+     for (int i = 0; i < 4; i++)
+@@ -351,7 +379,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+      * matters: left at 0, Tokyo Jungle's geometry and animation jobs
+      * (E7517A8D, E0CE22AC) halted in their stack check on every run, before
+      * writing anything, and the gameplay world was never drawn. */
+-    spu_abi_set_stack(&ctx, (stack_top - 16u) & ~15u, s_ls + size_scr);
++    spu_abi_set_stack(&ctx, (stack_top - 16u) & ~15u, s_ls + size_scr + guard);
+     /* Link register: where the job returns when it is done. The job manager
+      * would pass an address inside itself; 0 makes the job re-enter its own
+      * entry at LS 0 and run a bogus second lap. */

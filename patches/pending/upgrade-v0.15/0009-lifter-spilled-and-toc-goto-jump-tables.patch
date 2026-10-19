@@ -1,0 +1,138 @@
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index b30bb3e..fe82fcd 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -4193,7 +4193,50 @@ def _const_base_targets(win, rC, read_u32, text_lo, text_hi, bctr_addr):
+     return None
+ 
+ 
+-def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts=None):
++def _toc_goto_target(win, rC, read_u32, toc, func_ranges, bctr_addr):
++    """Target of a TOC-slot goto (see discover_jump_tables), or None.
++
++    Walks `win` backward from the bctr: the nearest definition of rC must be
++    `lwz/ld rC,d(r2)`, optionally through `clrldi rC,rC,32` (the 64-bit zero
++    extension SN puts between the load and the mtctr). The slot's value counts
++    only when it is a word-aligned address inside the function that holds the
++    bctr; without function bounds there is nothing to check it against."""
++    if not func_ranges:
++        return None
++    reg = rC
++    for w in reversed(win):
++        a = [x.strip() for x in w.operands.split(',')]
++        if not a or a[0] != reg or w.mnemonic.startswith(('st', 'lf', 'mt', 'cmp')):
++            continue                    # these read reg, they do not define it
++        if a[1:] in ([reg, '32'], [reg, '0', '32']) and w.mnemonic in ('clrldi', 'rldicl'):
++            continue                    # zero-extends in place (ppu_disasm prints rldicl); keep walking
++        if w.mnemonic not in ('lwz', 'ld') or len(a) != 2 or '(r2)' not in a[1]:
++            return None
++        try:
++            disp = int(a[1].split('(')[0].strip(), 0)
++        except ValueError:
++            return None
++        lo = hi = None
++        for s, e in func_ranges:
++            if s <= bctr_addr < e and (lo is None or s > lo):
++                lo, hi = s, e
++        if lo is None:
++            return None
++        for t in (toc if isinstance(toc, (list, tuple)) else [toc]):
++            if not t:
++                continue
++            ea = (t + disp) & 0xFFFFFFFF
++            v = read_u32(ea)
++            if v is not None and w.mnemonic == 'ld':
++                v = read_u32((ea + 4) & 0xFFFFFFFF) if v == 0 else None
++            if v is not None and lo <= v < hi and v % 4 == 0:
++                return v
++        return None
++    return None
++
++
++def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts=None,
++                         func_ranges=None):
+     """Find `mtctr rX; bctr` switch dispatchers and read their jump tables.
+ 
+     Handles both absolute tables (entry = case address) and base-relative
+@@ -4213,6 +4256,9 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+     entry snapshot, handing the caller a vtable pointer in r25 -- the "vtable
+     used as an object" that sent startup into an 82 MB memset.)
+ 
++    func_ranges: optional [(start, end)] function bounds; enables the
++    TOC-slot goto form, whose target must lie in the bctr's own function.
++
+     Returns {dispatcher_addr: sorted [case target addrs]}.
+     """
+     def mem_disp(op):
+@@ -4339,6 +4385,15 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+         if cb:
+             tables[all_insns[i].addr] = cb
+             continue
++        # TOC-slot goto: `lwz rC,d(r2); [clrldi rC,rC,32]; mtctr rC; bctr` jumps
++        # to the one code address held in a TOC slot. SN emits it for long
++        # in-function branches (libsail's command loop has 77, through 23 slots).
++        # A one-case table makes it a goto. Only when the target lies inside the
++        # enclosing function: anything else stays an indirect call.
++        tg = _toc_goto_target(win, rC, read_u32, toc, func_ranges, all_insns[i].addr)
++        if tg is not None:
++            tables[all_insns[i].addr] = [tg]
++            continue
+         # the indexed table load: `lwzx`, or `lwax` (the sign-extending load
+         # some compilers use for signed offset tables; the entries are treated
+         # as signed below either way)
+@@ -4451,6 +4506,36 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+                 if w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
+                     disp = mem_disp(a[1]); r_base = cand
+                     base_is_ld = (w.mnemonic == 'ld')
++                elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r1)' in a[1]:
++                    # STACK-SPILLED base: the prologue loads the table address
++                    # from the TOC, spills it (`std r7,0x370(r1)`), and every
++                    # dispatch in a long body reloads it (`ld r10,0x370(r1)`).
++                    # Follow the reload to the nearest spill of that slot, then
++                    # the spilled register to its TOC load. (libsail 0x314126E8:
++                    # the player command loop's 213-case switch; dropped, the
++                    # first command lifted to an unresolved bctr.)
++                    _sd = mem_disp(a[1])
++                    _k = win_cand.index(w) if w in win_cand else -1
++                    _src = None
++                    for _k2 in range(_k - 1, -1, -1):
++                        s = win_cand[_k2]
++                        b = [x.strip() for x in s.operands.split(',')]
++                        if s.mnemonic in ('std', 'stw') and len(b) == 2 and \
++                                '(r1)' in b[1] and mem_disp(b[1]) == _sd:
++                            _src = (b[0], _k2)
++                            break
++                        if b and b[0] == 'r1' and not s.mnemonic.startswith('st'):
++                            break           # r1 redefined: a different frame
++                    if _src is not None:
++                        for _k3 in range(_src[1] - 1, -1, -1):
++                            s = win_cand[_k3]
++                            b = [x.strip() for x in s.operands.split(',')]
++                            if not b or b[0] != _src[0] or s.mnemonic.startswith(('st', 'lf')):
++                                continue
++                            if s.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(r2)' in b[1]:
++                                disp = mem_disp(b[1]); r_base = cand
++                                base_is_ld = (s.mnemonic == 'ld')
++                            break           # nearest def of the spilled reg wins/loses
+                 elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(' in a[1]:
+                     # TWO-LEVEL base: `lwz r30, d1(r2); lwz r11, d2(r30)`. The
+                     # table address is not in the TOC itself but in a global the
+@@ -5035,7 +5120,7 @@ def main() -> None:
+             return None
+ 
+         tables = discover_jump_tables(all_insns, _raw_read_u32, [args.toc],
+-                                      _raw_lo, _raw_hi)
++                                      _raw_lo, _raw_hi, func_ranges=func_bounds)
+         jt_dispatchers = tables
+         for ts in tables.values():
+             jt_targets.update(ts)
+@@ -5097,7 +5182,8 @@ def main() -> None:
+             if len(toc_candidates) > 1:
+                 print(f"  TOC candidates: {', '.join(hex(t) for t in toc_candidates)}")
+             tables = discover_jump_tables(all_insns, _read_u32, toc_candidates, text_lo, text_hi,
+-                                          func_starts=sorted(s for s, _ in func_bounds))
++                                          func_starts=sorted(s for s, _ in func_bounds),
++                                          func_ranges=func_bounds)
+             jt_dispatchers = tables
+             for ts in tables.values():
+                 jt_targets.update(ts)

@@ -1,0 +1,48 @@
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 53d1cd3..57e5bc8 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -480,6 +480,34 @@ static int64_t sys_ss_get_open_psid_handler(ppu_context* ctx)
+     return 0;
+ }
+ 
++/* sys_gpio_set (630) / sys_gpio_get (631): the debug console's LEDs (device 1)
++ * and DIP switches (device 2). A retail console has neither, so lv2 answers
++ * get with 0 (RPCS3 sys_gpio.cpp does the same when not in debug-console
++ * mode). Unimplemented, get returned CELL_OK with *value untouched: Tokyo
++ * Jungle's sound file layer reads the DIP switches at init (func_002304AC)
++ * and zeroes the value only when the call FAILS, so it ran with whatever
++ * stack bytes were there as its debug switches. */
++#define SYS_GPIO_LED_DEVICE_ID        1
++#define SYS_GPIO_DIP_SWITCH_DEVICE_ID 2
++static int64_t sys_gpio_set_handler(ppu_context* ctx)
++{
++    const uint64_t dev = ctx->gpr[3];
++    if (dev != SYS_GPIO_LED_DEVICE_ID && dev != SYS_GPIO_DIP_SWITCH_DEVICE_ID)
++        return (int64_t)(int32_t)CELL_ESRCH;
++    return CELL_OK;   /* nothing to light */
++}
++static int64_t sys_gpio_get_handler(ppu_context* ctx)
++{
++    const uint64_t dev = ctx->gpr[3];
++    const uint32_t out = (uint32_t)ctx->gpr[4];
++    if (dev != SYS_GPIO_LED_DEVICE_ID && dev != SYS_GPIO_DIP_SWITCH_DEVICE_ID)
++        return (int64_t)(int32_t)CELL_ESRCH;
++    if (!out) return (int64_t)(int32_t)CELL_EFAULT;
++    vm_write_be32(out + 0, 0);   /* u64 value = 0 */
++    vm_write_be32(out + 4, 0);
++    return CELL_OK;
++}
++
+ /* sys_spu_initialize(nspu, nrawspu) — one-shot global init */
+ static int64_t sys_spu_initialize_handler(ppu_context* ctx)
+ {
+@@ -2494,6 +2522,8 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
+     /* sys_ss_get_open_psid (console PSN/NP identity) — LBP 1.30 reads it during
+      * boot; the unimplemented stub left the out-param as garbage. */
+     lv2_syscall_register(tbl, 872, sys_ss_get_open_psid_handler);
++    lv2_syscall_register(tbl, 630, sys_gpio_set_handler);
++    lv2_syscall_register(tbl, 631, sys_gpio_get_handler);
+ 
+     /* sys_process_get_sdk_version (25). Reported as a stub for a long time and
+      * returning CELL_OK with the out-param untouched, which reads as SDK 0.

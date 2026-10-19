@@ -1,0 +1,18 @@
+0001 superseded: upstream #263 argv on the entry stack
+0005 merged (defines side by side)
+0009 hunk 3 ported by hand (lwzx/lwax context moved)
+0021 merged: our opt-in GCM_PARK_WAIT_MS first, then upstream #312's 50 ms park grace instead of instant resync
+0022 superseded: upstream #248 cellGcmMapEaIoAddressWithFlags (rejects flags != STRICT_ORDERING: check TJ's 1 MB movie window still maps)
+0024 superseded: upstream has 512 IO slots + free-slot fix
+0028 decompiler hunks ported by hand (preamble already 32K upstream)
+0041 superseded: upstream spu_helpers.h has full bit-exact extended-range single precision (truncation, saturation, FTZ); x86 path is scalar-exact => perf risk; CHANGES SPU FLOAT RESULTS (truncate vs our round-nearest) => needs visual A/B
+0044 kept ours (layout fix = upstream #277, plus real CV); replaced upstream's block
+0046 ported by hand: window offset scaled by upstream's AA sample factors (#281); own-target copy kept for backends without color_snapshot (Vulkan; upstream's feedback path is Metal-only, Vulkan is open PR #352)
+0047 vulkan hunks ported by hand (warn bit 128, 64 is upstream's depth-bounds)
+0048 applied to upstream's *_ref scalar forms
+0057 dropped: vectorised our 0041 float helpers, which upstream's exact float layer replaced (perf to re-measure)
+0058 DEFERRED: spu_helpers.h restructured upstream; port SSE paths after
+0061-spu-shufb-host-order.patch DEFERRED (spu_helpers.h SIMD group)
+0062-spu-pow2-no-libm.patch DEFERRED (spu_helpers.h SIMD group)
+0081 PARTIAL: spu_context.h (probe-free LS) applied; spu_helpers.h SSE word ops DEFERRED
+0082 DEFERRED (spu_helpers.h SIMD group)

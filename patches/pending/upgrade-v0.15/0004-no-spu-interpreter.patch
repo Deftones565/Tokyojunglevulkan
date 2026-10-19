@@ -1,0 +1,63 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 506da3f..58951e0 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1893,6 +1893,9 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+  * branch, 0 on an unknown opcode (caller falls through to BRANCH-TO-0). */
+ static int spu_smc_microstep(spu_context* ctx)
+ {
++#ifdef PS3RECOMP_NO_INTERP
++    spu_no_interp_fatal(ctx, ctx->pc, "spu_smc_microstep");
++#endif
+     uint32_t pc = ctx->pc & SPU_LS_MASK & ~3u;
+     for (int steps = 0; steps < 4096; steps++) {
+         uint32_t w = ((uint32_t)ctx->ls[pc] << 24) | ((uint32_t)ctx->ls[pc+1] << 16) |
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index 9a3bfc0..8341f77 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -389,7 +389,27 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
+     return spu_interp_run_until(ctx, start_lsa, 0);
+ }
+ 
++#ifdef PS3RECOMP_NO_INTERP
++/* A port built with PS3RECOMP_NO_INTERP runs lifted code only: reaching the
++ * interpreter means a lift gap (a branch target with no lifted function), and
++ * that is fixed by adding the entry point and re-lifting, never by stepping
++ * the bytes here. Fail loudly with what's needed to fix it. */
++void spu_no_interp_fatal(const spu_context* ctx, uint32_t lsa, const char* via) {
++    fprintf(stderr, "[spu] FATAL: no lifted code at LS 0x%05X (image %d, via %s, "
++            "lr=0x%05X). Interpretation is disabled (PS3RECOMP_NO_INTERP): add 0x%05X "
++            "as an entry point and re-lift this image.\n",
++            lsa & 0x3FFFC, ctx->image_id, via, ctx->gpr[0]._u32[0] & 0x3FFFC, lsa & 0x3FFFC);
++    fflush(stdout);
++    fflush(stderr);
++    _Exit(70);   /* not abort(): the runtime's crash handler would catch it and hang */
++}
++#endif
++
+ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
++#ifdef PS3RECOMP_NO_INTERP
++    (void)stop_lsa;
++    spu_no_interp_fatal(ctx, start_lsa, "spu_interp_run");
++#endif
+     ctx->pc = start_lsa & 0x3FFFC;
+     ctx->status = SPU_STATUS_RUNNING;
+     uint64_t steps = 0;
+diff --git a/runtime/spu/spu_interp.h b/runtime/spu/spu_interp.h
+index 0266d46..a6b09c7 100644
+--- a/runtime/spu/spu_interp.h
++++ b/runtime/spu/spu_interp.h
+@@ -35,6 +35,12 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa);
+ /* As spu_interp_run, but also hands back at stop_lsa (0 = no such point): the
+  * return point of the drain the caller goes back to (spu_smc_microstep). */
+ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa);
++
++#ifdef PS3RECOMP_NO_INTERP
++/* Built with PS3RECOMP_NO_INTERP: every interpreter entry calls this, which
++ * reports the unlifted address and exits. */
++void spu_no_interp_fatal(const spu_context* ctx, uint32_t lsa, const char* via);
++#endif
+ 
+ /* The single dispatch point every computed branch routes through. If `target`
+  * is a registered lifted entry, runs it; otherwise interprets from `target`.

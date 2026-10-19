@@ -1,0 +1,56 @@
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 7f1ffc9..d671eab 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -85,6 +85,7 @@ extern "C" const char* ppu_vfs_root = ".";
+ #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
+ #define CELL_FS_EIO          (-2147418111)
+ #define CELL_FS_ENOSYS       (-2147418109)   /* 0x80010003 */
++#define CELL_FS_EBADF        (-2147418070)   /* 0x8001002A */
+ #define CELL_FS_S_IFDIR      0x4000u
+ #define CELL_FS_S_IFREG      0x8000u
+ #define CELL_FS_O_RDONLY     0
+@@ -182,13 +183,15 @@ static void host_path(char* out, size_t cap, const char* guest)
+ #define FS_MAX 256
+ static FILE* g_files[FS_MAX];
+ static uint8_t g_fd_usm[FS_MAX];
++static uint8_t g_fd_rdonly[FS_MAX];      /* 1 if opened read-only (cellFsFsync answers EBADF) */
+ static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
+ static DIR*  g_dirs[FS_MAX];
+ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
+ 
+ static int fd_alloc_file(FILE* f)
+ {
+-    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; return i; }
++    /* Read-only until cellFsOpen says otherwise (SdataOpen files always are). */
++    for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; g_fd_rdonly[i] = 1; return i; }
+     return -1;
+ }
+ static int fd_alloc_dir(DIR* d)
+@@ -256,6 +259,7 @@ static void cellFsOpen(ppu_context* ctx)
+     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
++    g_fd_rdonly[fd] = (acc == CELL_FS_O_RDONLY) ? 1 : 0;
+     /* FS_CALLER=1: name the guest function that opened each file. A title whose
+      * streaming layer opens a file and never reads it (You Don't Know Jack's
+      * movies) is diagnosed from the opener: its sibling read path is the one
+@@ -770,10 +774,17 @@ static void cellFsMkdir(ppu_context* ctx)
+ }
+ static void cellFsRmdir(ppu_context* ctx)  { ctx->gpr[3] = CELL_OK; }
+ static void cellFsUnlink(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
++/* Syncing a file opened read-only fails with CELL_FS_EBADF on the console
++ * (RPCS3's sys_fs_fsync agrees). Tokyo Jungle fsyncs every sound bank it has
++ * just read and prints "fileps3.c(1091) : failed to sync file (8001002A)" for
++ * each, then carries on; answering OK skipped those lines. */
+ static void cellFsFsync(ppu_context* ctx)
+ {
+     int fd = (int)(uint32_t)ctx->gpr[3];
+-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) fflush(g_files[fd]);
++    if (fd < 0 || fd >= FS_MAX || !g_files[fd] || g_fd_rdonly[fd]) {
++        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EBADF; return;
++    }
++    fflush(g_files[fd]);
+     ctx->gpr[3] = CELL_OK;
+ }
+ /* File-area preallocation (LBP cache warm-up spams this): host filesystems

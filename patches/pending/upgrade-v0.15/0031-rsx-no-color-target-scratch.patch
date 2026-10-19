@@ -1,0 +1,62 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index 02bf399..932d2d6 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -46,6 +46,9 @@ extern u32 ppu_vm_size;
+ #define ENG_MAX_BATCHES    256
+ #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
+ #define ENG_INVALID        0xFFFFFFFFu
++/* Location of the scratch colour target a depth-only pass draws into: not a
++ * guest memory space, so it never aliases a real surface or is written back. */
++#define ENG_SCRATCH_LOCATION 0xFFu
+ /* Guest textures larger than this are a misdecoded register, not an image;
+  * rsx_live_draw.c rejects the same 4096 bound (2033). */
+ #define ENG_MAX_TEX_DIM    4096u
+@@ -601,6 +604,19 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+  * vtable path's target_for binds by. Resolution stops at the first member
+  * that cannot be created, as that path stops at the first gap. Returns how
+  * many were resolved, or 0. */
++/* Bytes per pixel of an NV4097 surface colour format. */
++static u32 eng_surface_bpp(u32 color_format)
++{
++    switch (color_format) {
++    case 9u:                     return 1;   /* B8 */
++    case 1u: case 2u: case 3u:               /* X1R5G5B5 (Z/O), R5G6B5 */
++    case 10u:                    return 2;   /* G8B8 */
++    case 11u:                    return 8;   /* F_W16Z16Y16X16 */
++    case 12u:                    return 16;  /* F_W32Z32Y32X32 */
++    default:                     return 4;   /* 8-bit RGBA family, F_X32 */
++    }
++}
++
+ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
+ {
+     rsx_dsp_surface sf;
+@@ -609,12 +625,25 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
+      * A, and the MRT selectors add B, C and D on top of it. */
+     const u32 sel = (sf.color_target == CELL_GCM_SURFACE_TARGET_1) ? 1u : 0u;
+     const rsx_be_format fmt = eng_surface_format(sf.color_format);
+-    const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
+-                                      sf.clip_w, sf.clip_h, fmt);
++    /* A colour pitch of 64 that cannot hold one row of the clip is GCM's 'no
++     * colour target' (a depth-only pass sets the colour offset to 0 with
++     * pitch 64); a narrow target whose rows really are 64 bytes is not.
++     * Binding the guest address instead aliased whatever really lives at
++     * that offset: Tokyo Jungle's display buffer 0 is at offset 0, so its
++     * shadow pass recreated that surface at the shadow map's size every frame.
++     * Draw such a pass into a scratch target that no guest address maps to. */
++    const int no_color = sf.color_pitch[sel] <= 64u &&
++                         sf.color_pitch[sel] < sf.clip_w * eng_surface_bpp(sf.color_format);
++    const u32 first = no_color
++        ? eng_surface_get(ENG_SCRATCH_LOCATION, (sf.clip_w << 16) | sf.clip_h,
++                          sf.clip_w, sf.clip_h, fmt)   /* one scratch per size */
++        : eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
++                          sf.clip_w, sf.clip_h, fmt);
+     if (first == ENG_INVALID) return 0;
+     g.surfaces[first].pitch = sf.color_pitch[sel];
+     slots[0] = first;
+     u32 n = 1;
++    if (no_color) return n;
+ 
+     static const u32 mrt_from[3] = {
+         CELL_GCM_SURFACE_TARGET_MRT1, CELL_GCM_SURFACE_TARGET_MRT2,

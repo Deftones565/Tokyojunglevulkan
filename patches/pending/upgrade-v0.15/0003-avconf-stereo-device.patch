@@ -1,0 +1,111 @@
+diff --git a/libs/misc/cellAvconfExt.c b/libs/misc/cellAvconfExt.c
+index 50e6fe8..9b487fb 100644
+--- a/libs/misc/cellAvconfExt.c
++++ b/libs/misc/cellAvconfExt.c
+@@ -12,9 +12,9 @@
+  * bare deref here writes to whatever host address shares that number. These
+  * three out-params were dereferenced directly, and cellAudioOutGetDeviceInfo
+  * memset()s through one -- an access violation the moment a title reaches audio
+- * device setup, which is exactly where Tokyo Jungle crashed. Both device structs
+- * are all-u8, so translation alone is correct for them; the float needs a
+- * byte-swapped store. */
++ * device setup, which is exactly where Tokyo Jungle crashed. The device structs'
++ * u8 fields need translation alone; their u16/u32 fields and the float need
++ * byte-swapped stores. */
+ extern u8* vm_base;
+ #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
+ #include <stdio.h>
+@@ -35,17 +35,15 @@ s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
+     (void)audioOut;
+     (void)option;
+ 
+-    /* Report the SAME capability set a real PS3/RPCS3 reports, not just stereo.
+-     * Golden trace (RPCS3.log, real YDKJ boot) shows:
+-     *   cellAudioOut: found support for Linear PCM 2 Ch. / 5.1 Ch. / 7.1 Ch.
+-     *   cellAudioOut: found support for Dolby Digital 5.1 Ch. / DTS 5.1 Ch.
+-     * This call returns the MAX channel count available for (type, fs). Under-reporting
+-     * stereo (the old behaviour) makes FMOD's init probe fail its 8/6-channel checks and
+-     * then fall through to DTS/AC3 probes that also returned 0 -- YDKJ ends up with no
+-     * FMOD threads at all. Returning the real 7.1 for LPCM matches the console. */
++    /* This returns the MAX channel count available for (type, fs) on the
++     * CONFIGURED output, not every mode the device could do. RPCS3 (stereo
++     * output, the default) logs "found support for Linear PCM 2/5.1/7.1 Ch." yet
++     * hands Tokyo Jungle 2 here: its TTY prints "audio device info (PCM:2,...)"
++     * then "audio configure (2ch, enc:0)". Reporting 6 made the game configure a
++     * 5.1 output the device info doesn't list. The output is stereo, so: 2. */
+     if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM) {
+-        if (fs & CELL_AUDIO_OUT_FS_48KHZ) return CELL_AUDIO_OUT_CHNUM_6;  /* 5.1 (A/B: was 8) */
+-        return CELL_AUDIO_OUT_CHNUM_2;
++        if (fs & CELL_AUDIO_OUT_FS_48KHZ) return CELL_AUDIO_OUT_CHNUM_2;
++        return 0;
+     }
+ 
+     /* Dolby Digital / DTS: real hardware reports 5.1 for these. */
+@@ -83,23 +81,20 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
+ 
+     memset(info, 0, sizeof(CellAudioOutDeviceInfo));
+ 
+-    /* Report the mode set a real PS3 reports. Golden trace (RPCS3.log, real YDKJ boot):
+-     *   "found support for Linear PCM 2 Ch. / 5.1 Ch. / 7.1 Ch."
+-     *   "found support for Dolby Digital 5.1 Ch. / DTS 5.1 Ch."
+-     * Advertising a single stereo mode here while GetSoundAvailability reports 5.1/7.1 is
+-     * self-inconsistent, and middleware (FMOD) validates these against each other. */
++    /* Match RPCS3's stereo device, as Tokyo Jungle prints it from this struct:
++     * "audio device info (PCM:2,AC3:0,DTS:0,port:0,latency:13[msec])" and one
++     * mode "0:type=0,ch=2,fs=0x4,layout=1". The old 4-byte sound mode with no
++     * latency field put the modes at the wrong offsets (the game read
++     * latency:2 and garbage modes like type=4,ch=0). Multi-byte fields are
++     * big-endian in guest memory. */
+     info->portType = 0; /* HDMI */
+     info->state = 2;    /* connected */
+-    info->availableModeCount = 3;
++    info->latency = __builtin_bswap16(13);
++    info->availableModeCount = 1;
+     info->availableModes[0].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+     info->availableModes[0].channel = CELL_AUDIO_OUT_CHNUM_2;
+     info->availableModes[0].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+-    info->availableModes[1].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+-    info->availableModes[1].channel = CELL_AUDIO_OUT_CHNUM_6;
+-    info->availableModes[1].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+-    info->availableModes[2].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+-    info->availableModes[2].channel = CELL_AUDIO_OUT_CHNUM_8;
+-    info->availableModes[2].fs      = CELL_AUDIO_OUT_FS_48KHZ;
++    info->availableModes[0].layout  = __builtin_bswap32(CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH);
+ 
+     return CELL_OK;
+ }
+diff --git a/libs/misc/cellAvconfExt.h b/libs/misc/cellAvconfExt.h
+index 2521ff0..7e68bff 100644
+--- a/libs/misc/cellAvconfExt.h
++++ b/libs/misc/cellAvconfExt.h
+@@ -44,20 +44,28 @@ extern "C" {
+  * Types
+  * -----------------------------------------------------------------------*/
+ 
++/* Speaker layouts (CellAudioOutSoundMode.layout) */
++#define CELL_AUDIO_OUT_SPEAKER_LAYOUT_2CH            0x00000001
++#define CELL_AUDIO_OUT_SPEAKER_LAYOUT_6CH_LREClr     0x00010000
++#define CELL_AUDIO_OUT_SPEAKER_LAYOUT_8CH_LREClrxy   0x40000000
++
++/* Guest layouts: the multi-byte fields are BIG-ENDIAN in guest memory. */
+ typedef struct CellAudioOutSoundMode {
+     u8  type;
+     u8  channel;
+     u8  fs;
+     u8  reserved;
+-} CellAudioOutSoundMode;
++    u32 layout;                 /* big-endian */
++} CellAudioOutSoundMode;        /* 8 bytes */
+ 
+ typedef struct CellAudioOutDeviceInfo {
+     u8  portType;
+     u8  availableModeCount;
+     u8  state;
+     u8  reserved[3];
++    u16 latency;                /* big-endian, msec */
+     CellAudioOutSoundMode availableModes[16];
+-} CellAudioOutDeviceInfo;
++} CellAudioOutDeviceInfo;       /* 136 bytes */
+ 
+ typedef struct CellAudioOutConfiguration {
+     u8  channel;

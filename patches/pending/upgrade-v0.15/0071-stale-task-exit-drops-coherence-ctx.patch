@@ -1,0 +1,34 @@
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 8ed24d1..ed0aec1 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -546,6 +546,7 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+ static struct { uint32_t ea; volatile uint32_t gen; } s_ts_gen[TS_GEN_MAX];
+ static _Thread_local uint32_t t_task_ts;   /* taskset this thread's task belongs to */
+ static _Thread_local uint32_t t_task_gen;  /* its generation when the task started */
++static _Thread_local uintptr_t t_task_stack_top; /* in spu_async_run's frame: the task's run lives below it */
+ 
+ uint32_t spu_taskset_generation(uint32_t taskset_ea)
+ {
+@@ -577,6 +578,7 @@ static void spu_async_run(spu_async_job* j)
+ {
+     t_task_ts  = j->taskset_ea;
+     t_task_gen = spu_taskset_generation(j->taskset_ea);
++    { volatile char top; t_task_stack_top = (uintptr_t)&top; }
+     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
+      * back to a fresh per-dispatch LS when disabled / no taskset. */
+@@ -1219,6 +1221,13 @@ static void spu_task_exit_stale(uint32_t taskset_ea, uint32_t taskId)
+     { static int _n = 0; if (_n++ < 16)
+         fprintf(stderr, "[spu_workload] task %u of shut-down taskset 0x%08X: ending its thread\n",
+                 taskId, taskset_ea); }
++    /* Ending the thread here skips spu_run_lifted_job_abi's spu_coh_unregister:
++     * its stack-local spu_context (the fur task reserves lock lines) stayed in
++     * the reserver set, and the next PPU store to such a line read the freed
++     * stack (USER: SIGSEGV in spu_coh_notify_write at the end of Survival,
++     * right after these threads ended). Drop whatever this run registered. */
++    { volatile char here; extern void spu_coh_forget_range(uintptr_t, uintptr_t);
++      if (t_task_stack_top) spu_coh_forget_range((uintptr_t)&here, t_task_stack_top); }
+ #ifdef _WIN32
+     ExitThread(0);
+ #else

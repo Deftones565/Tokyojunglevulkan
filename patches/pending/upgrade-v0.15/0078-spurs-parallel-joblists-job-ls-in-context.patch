@@ -1,0 +1,277 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index f6232af..dbc9e6b 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2723,6 +2723,147 @@ static void jc_signal_done(u32 jc_ea, int job_index)
+     }
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * JOBLIST jobs on several host threads
++ *
++ * SPURS hands a job list's jobs to every SPU the chain may use, which run them
++ * at the same time; only a SYNC (or the end of the list's command) orders them
++ * against what follows. The walker ran them one after another on one virtual
++ * SPU, so in Tokyo Jungle gameplay ~30 ms of geometry and animation jobs a
++ * frame were serial work on the main thread's critical path (it waits for the
++ * chain in cellSpursEventFlagWait). A list now goes to a small pool of
++ * persistent workers plus the walker itself, as on hardware; the walker waits
++ * for the whole list, then sends the per-job completions in job order, each
++ * with the mailbox/event state its job left (thread-local on the thread that
++ * ran it). SPURS_JOBLIST_PARALLEL=0 runs lists serially as before;
++ * SPURS_JOBLIST_WORKERS sets the pool size (default 4: five SPUs with the
++ * walker, of the six a PS3 title gets).
++ * -------------------------------------------------------------------------*/
++extern SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr, g_spurs_job_cmd;
++extern SPURS_JOB_TLS int g_spurs_job_mbox_valid, g_spurs_job_sent_event;
++
++typedef struct { uint32_t mbox, mbox_intr, cmd; int mbox_valid, sent_event; } jl_result;
++
++typedef struct jl_batch {
++    u32 list, size, n, jc_ea;
++    int idx0;
++    volatile long next;        /* next job index to claim   */
++    volatile long done;        /* jobs finished             */
++    long active;               /* pool workers inside jl_drain(b); s_jl_lock.
++                                * The batch lives on the walker's stack: it is
++                                * unlinked only when done == n AND active == 0,
++                                * so no worker can touch it afterwards (a
++                                * worker's last claim attempt, or one that
++                                * picked it just as the others finished). */
++    jl_result* res;
++    struct jl_batch* link;
++} jl_batch;
++
++static SRWLOCK            s_jl_lock = SRWLOCK_INIT;
++static CONDITION_VARIABLE s_jl_work = CONDITION_VARIABLE_INIT;   /* a list was posted */
++static CONDITION_VARIABLE s_jl_fin  = CONDITION_VARIABLE_INIT;   /* a list finished   */
++static jl_batch*          s_jl_head;
++
++static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc);
++
++/* Claim and run jobs of `b` until none are left. */
++static void jl_drain(jl_batch* b)
++{
++    for (;;) {
++        const long k = InterlockedIncrement(&b->next) - 1;
++        if (k >= (long)b->n) return;
++        { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = b->jc_ea; }
++        g_spurs_job_mbox_valid = 0;
++        g_spurs_job_sent_event = 0;
++        { extern SPURS_JOB_TLS int g_spurs_job_in_list; g_spurs_job_in_list = 1; }
++        jc_run_one_job(b->list + (u32)k * b->size, b->idx0 + (int)k, b->size);
++        { extern SPURS_JOB_TLS int g_spurs_job_in_list; g_spurs_job_in_list = 0; }
++        jl_result* r = &b->res[k];
++        r->mbox = g_spurs_job_mbox; r->mbox_intr = g_spurs_job_mbox_intr;
++        r->cmd = g_spurs_job_cmd; r->mbox_valid = g_spurs_job_mbox_valid;
++        r->sent_event = g_spurs_job_sent_event;
++        g_spurs_job_mbox_valid = 0;
++        g_spurs_job_sent_event = 0;
++        if (InterlockedIncrement(&b->done) == (long)b->n) {
++            AcquireSRWLockExclusive(&s_jl_lock);
++            WakeAllConditionVariable(&s_jl_fin);
++            ReleaseSRWLockExclusive(&s_jl_lock);
++        }
++    }
++}
++
++static DWORD WINAPI jl_worker(LPVOID p)
++{
++    (void)p;
++    AcquireSRWLockExclusive(&s_jl_lock);
++    for (;;) {
++        jl_batch* b = s_jl_head;
++        while (b && b->next >= (long)b->n) b = b->link;
++        if (!b) { SleepConditionVariableSRW(&s_jl_work, &s_jl_lock, INFINITE, 0); continue; }
++        b->active++;
++        ReleaseSRWLockExclusive(&s_jl_lock);
++        jl_drain(b);
++        AcquireSRWLockExclusive(&s_jl_lock);
++        if (--b->active == 0 && b->done >= (long)b->n)
++            WakeAllConditionVariable(&s_jl_fin);
++    }
++    return 0;
++}
++
++/* Number of pool workers, starting them the first time; 0 = run serially. */
++static int jl_workers(void)
++{
++    static volatile long started = 0;
++    static int n = -1;
++    if (n < 0) {
++        const char* e = getenv("SPURS_JOBLIST_PARALLEL");
++        const char* w = getenv("SPURS_JOBLIST_WORKERS");
++        int k = w ? atoi(w) : 4;
++        if (k < 0) k = 0;
++        if (k > 15) k = 15;
++        n = (e && *e == '0') ? 0 : k;
++    }
++    if (n > 0 && InterlockedCompareExchange(&started, 1, 0) == 0) {
++        for (int i = 0; i < n; i++) {
++            HANDLE th = CreateThread(NULL, 4u << 20, jl_worker, NULL, 0, NULL);
++            if (th) CloseHandle(th);
++        }
++        fprintf(stderr, "[cellSpurs] JOBLIST jobs run on %d pool threads + the chain walker\n", n);
++    }
++    return n;
++}
++
++/* Run a JOBLIST's n jobs on the pool and the calling walker, then signal each
++ * job's completion in order. Returns 0 if the chain is stopping. */
++static int jl_run_parallel(u32 jc_ea, u32 list, u32 n, u32 size, int idx0)
++{
++    jl_batch b;
++    memset(&b, 0, sizeof b);
++    b.list = list; b.size = size; b.n = n; b.jc_ea = jc_ea; b.idx0 = idx0;
++    b.res = (jl_result*)calloc(n, sizeof(jl_result));
++    if (!b.res) return -1;
++    AcquireSRWLockExclusive(&s_jl_lock);
++    b.link = s_jl_head; s_jl_head = &b;
++    WakeAllConditionVariable(&s_jl_work);
++    ReleaseSRWLockExclusive(&s_jl_lock);
++    jl_drain(&b);
++    AcquireSRWLockExclusive(&s_jl_lock);
++    while (b.done < (long)n || b.active > 0)
++        SleepConditionVariableSRW(&s_jl_fin, &s_jl_lock, INFINITE, 0);
++    jl_batch** pp = &s_jl_head;
++    while (*pp != &b) pp = &(*pp)->link;
++    *pp = b.link;
++    ReleaseSRWLockExclusive(&s_jl_lock);
++    for (u32 i = 0; i < n; i++) {
++        g_spurs_job_mbox = b.res[i].mbox; g_spurs_job_mbox_intr = b.res[i].mbox_intr;
++        g_spurs_job_cmd = b.res[i].cmd; g_spurs_job_mbox_valid = b.res[i].mbox_valid;
++        g_spurs_job_sent_event = b.res[i].sent_event;
++        jc_signal_done(jc_ea, idx0 + (int)i);
++    }
++    free(b.res);
++    return 1;
++}
++
+ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+ {
+     u32 pc = entry_ea, ret_pc = 0;
+@@ -2775,7 +2916,17 @@ static void jc_execute(u32 entry_ea, u32 jc_ea, u32 size_desc)
+               if (t) fprintf(stderr, "[jc-trace] chain 0x%08X JOBLIST @0x%08X n=%u size=%u list=0x%08X\n",
+                              jc_ea, jl, n, size, list); }
+             if (n == 0) { pc += 8; continue; }    /* an empty list is valid: nothing to run */
+-            if (n <= 4096 && size >= 64 && size <= 0x1000 && list) {
++            if (n > 1 && n <= 4096 && size >= 64 && size <= 0x1000 && list && jl_workers() > 0) {
++                const int idx0 = jobs;
++                jobs += (int)n;
++                if (jl_run_parallel(jc_ea, list, n, size, idx0) < 0) {
++                    jobs = idx0;
++                    goto serial;
++                }
++                if (jc_stopping()) return;
++                idle = 0;
++            } else if (n <= 4096 && size >= 64 && size <= 0x1000 && list) {
++            serial:
+                 for (u32 i = 0; i < n; i++) {
+                     if (jc_stopping()) return;
+                     { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
+diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
+index 5aeee83..e1a9088 100644
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -42,6 +42,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include "../platform/win32_compat.h"   /* SRWLOCK (s_job_ls copy) */
+ 
+ extern uint8_t* vm_base;
+ extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
+@@ -122,12 +123,31 @@ static uint8_t  s_job_ls[SPU_LS_SIZE];
+ static int      s_job_ls_valid;
+ uint32_t        g_spurs_job_ls_handle;   /* set by the chain walker */
+ 
++/* Chain handles the PPU has polled this way. A job run from a parallel
++ * JOBLIST (g_spurs_job_in_list, set by cellSpurs.c's pool) only stores its
++ * local store for one of these: copying 256 KB under a lock after every
++ * geometry job serialised the pool, and nothing reads those chains' stores. */
++#define SPURS_POLLED_MAX 16
++static volatile uint32_t s_polled[SPURS_POLLED_MAX];
++
+ const uint8_t* spurs_job_ls_for_handle(uint32_t handle)
+ {
++    if (handle) {
++        int seen = 0;
++        for (int i = 0; i < SPURS_POLLED_MAX && s_polled[i]; i++) if (s_polled[i] == handle) seen = 1;
++        for (int i = 0; !seen && i < SPURS_POLLED_MAX; i++)
++            if (!s_polled[i]) { s_polled[i] = handle; break; }
++    }
+     if (!s_job_ls_valid || !handle || handle != g_spurs_job_ls_handle) return 0;
+     return s_job_ls;
+ }
+ 
++static int spurs_job_handle_polled(uint32_t handle)
++{
++    for (int i = 0; i < SPURS_POLLED_MAX && s_polled[i]; i++) if (s_polled[i] == handle) return 1;
++    return 0;
++}
++
+ /* Last outbound mailbox posted by a finished job (see below). */
+ /* THREAD-LOCAL. A job's answer is read back by the completion event that
+  * follows it, and jc_execute signals immediately after each job -- but the walk
+@@ -154,6 +174,8 @@ SPURS_JOB_TLS int g_spurs_job_mbox_valid;
+  * 16, whose queue is ONE deep, and a synthetic zero-payload event racing the
+  * real one made modules register with sizes of 0 (sgxbus "failed to regist"). */
+ SPURS_JOB_TLS int g_spurs_job_sent_event;
++/* Set while this thread runs a job of a parallel JOBLIST (cellSpurs.c). */
++SPURS_JOB_TLS int g_spurs_job_in_list;
+ 
+ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+                       uint32_t job_ea, uint32_t job_desc_size)
+@@ -179,8 +201,14 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+         return -1;
+     }
+ 
+-    uint8_t* ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
+-    if (!ls) return -1;
++    /* The job's local store is built straight into its context's: init zeroes
++     * it, as the calloc'd staging store this used to be (then copied whole into
++     * the context, and freed) was. That was a 256 KB allocation, page faults
++     * and two 256 KB copies per job, ~20% of a job thread's time in Tokyo
++     * Jungle gameplay (mg5-st1). */
++    spu_context ctx;
++    spu_context_init(&ctx, 0);
++    uint8_t* ls = ctx.ls;
+ 
+     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
+     memcpy(ls, vm_base + ea_bin, size_bin);
+@@ -370,10 +398,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+     }
+ 
+     /* ---- enter the job -------------------------------------------------- */
+-    spu_context ctx;
+-    spu_context_init(&ctx, 0);
+     ctx.image_id = image_id;
+-    memcpy(ctx.ls, ls, SPU_LS_SIZE);
+     /* SPU stack grows down from the top of the scratch+stack block, and may
+      * use everything above the scratch buffer. Word 1 of r1 (available stack)
+      * matters: left at 0, Tokyo Jungle's geometry and animation jobs
+@@ -418,8 +443,15 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+      * comment here claimed they carried the title's bus counts; they do not,
+      * and feeding them into the completion event turned 0x40000000 into a 1 GB
+      * allocation request. Kept because the printf service needs them. */
+-    memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
+-    s_job_ls_valid = 1;
++    /* Jobs of one JOBLIST now run on several threads at once
++     * (cellSpurs.c jl_run_parallel): one copy at a time, so the retained
++     * store is one job's, not a mix of two. */
++    if (!g_spurs_job_in_list || spurs_job_handle_polled(g_spurs_job_ls_handle))
++    { static SRWLOCK s_job_ls_lock = SRWLOCK_INIT;
++      AcquireSRWLockExclusive(&s_job_ls_lock);
++      memcpy(s_job_ls, ctx.ls, SPU_LS_SIZE);   /* keep the store readable */
++      s_job_ls_valid = 1;
++      ReleaseSRWLockExclusive(&s_job_ls_lock); }
+ 
+     g_spurs_job_mbox      = spu_channel_has_data(&ctx.ch_out_mbox)
+                           ? ctx.ch_out_mbox.value : 0;
+@@ -453,6 +485,5 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+ 
+     spu_mfc_release(&ctx);
+     spu_coh_unregister(&ctx);   /* stack local: out of the reserver set */
+-    free(ls);
+     return 0;
+ }

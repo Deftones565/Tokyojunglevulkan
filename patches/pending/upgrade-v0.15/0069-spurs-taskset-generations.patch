@@ -1,0 +1,167 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 53ededb..f6232af 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -866,6 +866,14 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+ 
+     if (!spurs_guest_range_valid(taskset_ea, taskset_size))
+         return (s32)0x8041090Du; /* host backing safety, before writes */
++
++    /* A taskset created where an earlier one lived (Tokyo Jungle re-creates its
++     * two tasksets at the same addresses for Story after Survival shut them
++     * down): that one's task threads are stale from here on and must not take
++     * this taskset's signals (spu_workload.c, taskset generations). */
++    { extern void spu_taskset_new_generation(uint32_t);
++      spu_taskset_new_generation(taskset_ea); }
++
+     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
+     memset(taskset, 0, taskset_size);
+ 
+@@ -914,11 +922,17 @@ s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
+ 
+ s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
+ {
++    const uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
+     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
+     if (!taskset)
+         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+ 
+-    printf("[cellSpurs] ShutdownTaskset()\n");
++    /* Its tasks never run again: parked ones end their host threads, a running
++     * one at its next WAIT_SIGNAL. This was a no-op, and the stale threads
++     * later raced a taskset re-created at the same address for its signals. */
++    { extern void spu_taskset_new_generation(uint32_t);
++      spu_taskset_new_generation(taskset_ea); }
++    printf("[cellSpurs] ShutdownTaskset(0x%08X)\n", taskset_ea);
+     return CELL_OK;
+ }
+ 
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index c57030a..8ed24d1 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -527,8 +527,56 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
+     ts_unlock();
+ }
+ 
++/* ---- taskset generations ------------------------------------------------
++ * cellSpursShutdownTaskset/JoinTaskset used to be no-ops, so a shut-down
++ * taskset's task threads stayed parked in WAIT_SIGNAL forever. When the title
++ * then creates a taskset at the SAME address (Tokyo Jungle: Survival game over
++ * shuts down its two tasksets, Story re-creates both at 0x441D0B00/0x441D3E80),
++ * the old and the new task threads parked on the same (taskset, task) keys and
++ * raced for its signals: an old thread could consume a signal and resume a
++ * dead task's loop on the re-initialised taskset, the round never reported
++ * done, and the PPU spun forever (white screen after the Story intro movie).
++ *
++ * Each taskset address has a generation; ShutdownTaskset and CreateTaskset
++ * start a new one and wake every parked task. A task thread remembers the
++ * generation it was started in, and a task of an older generation leaves
++ * WAIT_SIGNAL by ending its host thread instead of taking a signal: on real
++ * SPURS a shut-down taskset's tasks never run again. */
++#define TS_GEN_MAX 32
++static struct { uint32_t ea; volatile uint32_t gen; } s_ts_gen[TS_GEN_MAX];
++static _Thread_local uint32_t t_task_ts;   /* taskset this thread's task belongs to */
++static _Thread_local uint32_t t_task_gen;  /* its generation when the task started */
++
++uint32_t spu_taskset_generation(uint32_t taskset_ea)
++{
++    for (int i = 0; i < TS_GEN_MAX; i++) if (s_ts_gen[i].ea == taskset_ea) return s_ts_gen[i].gen;
++    return 0;
++}
++
++static void spu_taskset_wake_all_parked(void);   /* below, with the signal channel */
++
++/* A new generation for the taskset at taskset_ea: its current tasks are stale. */
++void spu_taskset_new_generation(uint32_t taskset_ea)
++{
++    if (!taskset_ea) return;
++    int i;
++    for (i = 0; i < TS_GEN_MAX && s_ts_gen[i].ea != taskset_ea; i++) {}
++    if (i == TS_GEN_MAX)
++        for (i = 0; i < TS_GEN_MAX && s_ts_gen[i].ea; i++) {}
++    if (i == TS_GEN_MAX) return;
++    s_ts_gen[i].ea = taskset_ea;
++    __atomic_add_fetch(&s_ts_gen[i].gen, 1u, __ATOMIC_SEQ_CST);
++    ts_lock();
++    uint8_t* run = ts_running(taskset_ea);   /* none of the new tasks runs yet */
++    if (run) memset(run, 0, 16);
++    ts_unlock();
++    spu_taskset_wake_all_parked();
++}
++
+ static void spu_async_run(spu_async_job* j)
+ {
++    t_task_ts  = j->taskset_ea;
++    t_task_gen = spu_taskset_generation(j->taskset_ea);
+     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
+     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
+      * back to a fresh per-dispatch LS when disabled / no taskset. */
+@@ -1145,6 +1193,39 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
+       } }
+ }
+ 
++static void spu_taskset_wake_all_parked(void)
++{
++#ifdef _WIN32
++    AcquireSRWLockExclusive(&s_sig_lock);
++    WakeAllConditionVariable(&s_sig_cv);
++    ReleaseSRWLockExclusive(&s_sig_lock);
++#else
++    pthread_mutex_lock(&s_sig_lock);
++    pthread_cond_broadcast(&s_sig_cv);
++    pthread_mutex_unlock(&s_sig_lock);
++#endif
++}
++
++/* The calling task belongs to a shut-down (or re-created) taskset: end its
++ * host thread. Called from WAIT_SIGNAL with no lock held. */
++static int spu_task_is_stale(uint32_t taskset_ea)
++{
++    return t_task_ts && t_task_ts == taskset_ea && spu_taskset_generation(taskset_ea) != t_task_gen;
++}
++static void spu_task_exit_stale(uint32_t taskset_ea, uint32_t taskId)
++{
++    extern void spu_taskset_parked_del(uint32_t, uint32_t);
++    spu_taskset_parked_del(taskset_ea, taskId);
++    { static int _n = 0; if (_n++ < 16)
++        fprintf(stderr, "[spu_workload] task %u of shut-down taskset 0x%08X: ending its thread\n",
++                taskId, taskset_ea); }
++#ifdef _WIN32
++    ExitThread(0);
++#else
++    pthread_exit(NULL);
++#endif
++}
++
+ /* A successful PUTLLC/PUTLLUC committed the 128-byte guest line `line`.
+  *
+  * A task signalling another task does it on the SPU, as libspurs does: a
+@@ -1234,8 +1315,13 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+      * run (and possibly signal us); re-acquired before returning to resume. */
+     spu_serial_release();
+ #ifdef _WIN32
++    if (spu_task_is_stale(taskset_ea)) spu_task_exit_stale(taskset_ea, taskId);
+     AcquireSRWLockExclusive(&s_sig_lock);
+     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
++        if (spu_task_is_stale(taskset_ea)) {
++            ReleaseSRWLockExclusive(&s_sig_lock);
++            spu_task_exit_stale(taskset_ea, taskId);
++        }
+         if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
+             static int _n = 0;
+             if (++secs && _n < 16) { _n++;
+@@ -1247,8 +1333,13 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+     if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
+     ReleaseSRWLockExclusive(&s_sig_lock);
+ #else
++    if (spu_task_is_stale(taskset_ea)) spu_task_exit_stale(taskset_ea, taskId);
+     pthread_mutex_lock(&s_sig_lock);
+     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
++        if (spu_task_is_stale(taskset_ea)) {
++            pthread_mutex_unlock(&s_sig_lock);
++            spu_task_exit_stale(taskset_ea, taskId);
++        }
+         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
+         if (pthread_cond_timedwait(&s_sig_cv, &s_sig_lock, &ts) != 0) {
+             static int _n = 0;

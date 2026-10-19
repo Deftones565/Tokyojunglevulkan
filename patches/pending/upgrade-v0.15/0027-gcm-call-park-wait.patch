@@ -1,0 +1,52 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 151a39a..410db9a 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1505,24 +1505,42 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
+  * stall. Try GCM_PARK_WAIT_MS=500. */
+ static int gcm_park_should_wait(u32 park, u32 w, u32 put)
+ {
+-    static long wait_ms = -1;
++    static long wait_ms = -1, call_wait_ms = -1;
+     if (wait_ms < 0) { const char* e = getenv("GCM_PARK_WAIT_MS");
+                        wait_ms = e ? atol(e) : 0; }
+-    if (wait_ms <= 0 || s_jump_src == GCM_NO_OFF) return 0;
+-    if ((s_jump_src >> 20) != (put >> 20) || (park >> 20) == (put >> 20)) return 0;
++    /* A park reached inside a CALL, in a region other than the ring's write
++     * head, is a segment the title CALLs before its producer has filled it:
++     * Tokyo Jungle's ring CALLs SPU geometry segments whose header the PPU
++     * wrote, ending in a park that the SPU job overwrites with the draws and a
++     * RET. The RSX waits there. Resyncing to `put` instead skips the whole
++     * segment -- every character and shadow-caster draw. Waiting is safe: the
++     * pass just ends (the walker never blocks the present thread), and past
++     * GCM_CALL_PARK_WAIT_MS (default 200, 0 = off) it resyncs as before. */
++    if (call_wait_ms < 0) { const char* e = getenv("GCM_CALL_PARK_WAIT_MS");
++                            call_wait_ms = e ? atol(e) : 200; }
++    long lim;
++    if (s_fifo_calloff && (park >> 20) != (put >> 20)) {
++        lim = call_wait_ms;
++        if (lim <= 0) return 0;
++    } else {
++        lim = wait_ms;
++        if (lim <= 0 || s_jump_src == GCM_NO_OFF) return 0;
++        if ((s_jump_src >> 20) != (put >> 20) || (park >> 20) == (put >> 20)) return 0;
++    }
+ 
+     const unsigned long long now = ps3_ms_now();
+     if (park != s_park_io || w != s_park_word) {
+         s_park_io = park; s_park_word = w; s_park_t0 = now;
+         return 1;
+     }
+-    if (now - s_park_t0 < (unsigned long long)wait_ms) return 1;
++    if (now - s_park_t0 < (unsigned long long)lim) return 1;
+ 
+     static unsigned n = 0;
+     if (n++ < 32 || (n % 256) == 0)
+         fprintf(stderr, "[cellGcmSys] park 0x%08X (entered from 0x%08X) unpatched after "
+                 "%llu ms -- resync to put 0x%08X (#%u)\n",
+-                park, s_jump_src, now - s_park_t0, put, n);
++                park, s_fifo_calloff ? s_fifo_calloff - 4 : s_jump_src,
++                now - s_park_t0, put, n);
+     return 0;
+ }
+ 

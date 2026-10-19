@@ -1,0 +1,162 @@
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index db9ea00..2126a2e 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -326,11 +326,53 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
+  * lwmutex. The CRT and (newly) libsre's cellSpurs create/wait/signal these. Like
+  * sys_lwmutex above, model it directly in guest memory so the args stay GUEST
+  * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
+- * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
+- * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
+- * handshakes, not long-term blocking. sys_lwcond_t is 8 bytes: +0x00 u32
+- * lwmutex EA, +0x04 u32 lwcond queue id. Titles read +0x00 themselves (an
+- * lwcond whose lwmutex reads 0 is treated as invalid). */
++ * deref'd them as host pointers -> AV during cellSpurs init).
++ * sys_lwcond_t is 8 bytes: +0x00 lwmutex EA (be32), +0x04 lwcond_queue id
++ * (be32). It used to be written as a be64 lwmutex plus an id at +0x08, four
++ * bytes past the end of the guest's struct -- libsail keeps its own state
++ * right after its lwcond, and that word was being overwritten.
++ *
++ * A REAL condition variable. The wait used to be a poll (release the lwmutex,
++ * Sleep(1), reacquire, return OK) with no-op signals, on the theory that every
++ * waiter loops on its own predicate. Firmware does not: libsail's source-fs
++ * setup (Tokyo Jungle's loading movies) creates its worker thread under the
++ * lwmutex and waits ONCE for the worker's signal that its parameter block is
++ * published. The poll woke it after 1 ms whether or not the worker had run; on
++ * a loaded host the creator then read the block pointer as 0, the worker opened
++ * path pointer 0x0000000C, cellFsOpen answered EISDIR, the movie never started
++ * and the game hung after the Survival map loaded (about 1 run in 6). lv2's
++ * lwcond has no spurious wakeups, so neither does this one.
++ *
++ * A signal wakes a thread that is ALREADY waiting -- the oldest -- and only
++ * that thread: each waiter queues its own record and sleeps until a signal
++ * marks it. (A wake-token count is not enough: libsail's worker signals the
++ * creator and then waits on the same lwcond itself, and took the creator's
++ * token.) A waiter is queued under the host lock BEFORE it releases the guest
++ * lwmutex, so a signal sent the moment the lwmutex is free still finds it.
++ * The lwmutex stays the semaphore above. PS3_LWCOND_POLL=1 restores the poll. */
++#include <chrono>
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <unordered_map>
++struct LwcWaiter { uint32_t tid; bool signalled; };
++/* sleepers: threads inside sys_lwcond_wait, queued or already signalled but
++ * not yet running again; the state is only freed when there are none. */
++struct LwcState { std::condition_variable cv; std::deque<LwcWaiter*> q; uint32_t sleepers = 0; };
++static std::mutex g_lwc_mu;
++static std::unordered_map<uint32_t, LwcState*> g_lwc;   /* guest lwcond EA -> state */
++static LwcState* lwc_get(uint32_t lwcond)   /* g_lwc_mu held */
++{
++    LwcState*& st = g_lwc[lwcond];
++    if (!st) st = new LwcState();
++    return st;
++}
++static int lwc_poll_mode(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("PS3_LWCOND_POLL"); v = (e && e[0] == '1') ? 1 : 0; }
++    return v;
++}
+ static void sys_lwcond_create(ppu_context* ctx)
+ {
+     static uint32_t s_lwcond_id = 0x4C000000u;
+@@ -340,31 +382,83 @@ static void sys_lwcond_create(ppu_context* ctx)
+     vm_write32(lwcond + 0x04, ++s_lwcond_id);
+     ctx->gpr[3] = 0;
+ }
+-static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
+-/* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
+- * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
+- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
+- * common single (non-recursive) hold. */
++static void sys_lwcond_destroy(ppu_context* ctx)
++{
++    uint32_t lwcond = (uint32_t)ctx->gpr[3];
++    std::lock_guard<std::mutex> lk(g_lwc_mu);
++    auto it = g_lwc.find(lwcond);
++    if (it != g_lwc.end()) {
++        if (!it->second->q.empty()) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Au; return; } /* EBUSY */
++        /* A thread still on its way out of a wait keeps the entry alive; it is
++         * never freed then, and a lwcond re-created at this EA reuses it. */
++        if (!it->second->sleepers) { delete it->second; g_lwc.erase(it); }
++    }
++    ctx->gpr[3] = 0;
++}
++/* Wake the oldest waiter, or every waiter. With nobody waiting this is a
++ * no-op that returns OK, as sysPrxForUser's does. */
++static void lwc_wake(uint32_t lwcond, int all)
++{
++    std::lock_guard<std::mutex> lk(g_lwc_mu);
++    auto it = g_lwc.find(lwcond);
++    if (it == g_lwc.end() || it->second->q.empty()) return;
++    LwcState* st = it->second;
++    do {
++        st->q.front()->signalled = true;
++        st->q.pop_front();
++    } while (all && !st->q.empty());
++    st->cv.notify_all();
++}
++static void sys_lwcond_signal(ppu_context* ctx)     { lwc_wake((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
++static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_wake((uint32_t)ctx->gpr[3], 1); ctx->gpr[3] = 0; }
++/* signal_to(lwcond, ppu_thread_id) should wake that thread; waking the oldest
++ * waiter is close enough until a title needs the targeted form. */
++static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_wake((uint32_t)ctx->gpr[3], 0); ctx->gpr[3] = 0; }
++/* sys_lwcond_wait(lwcond, timeout µs, 0 = forever): release the paired lwmutex
++ * (all recursion levels), sleep until signalled or timed out, reacquire it,
++ * and return OK or ETIMEDOUT. */
+ static void sys_lwcond_wait(ppu_context* ctx)
+ {
+     uint32_t lwcond  = (uint32_t)ctx->gpr[3];
++    uint64_t timeout = ctx->gpr[4];
+     uint32_t lwmutex = vm_read32(lwcond + 0x00);
+     HANDLE s = lwm_sem(lwmutex);
+-    if (s) {
+-        uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+-        uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
++    if (!s) { ctx->gpr[3] = 0; return; }
++    uint32_t own = vm_read32(lwmutex + LWM_OWNER);
++    uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
++    int ok = 1;
++    if (lwc_poll_mode()) {
+         vm_write32(lwmutex + LWM_RECUR, 0);
+         vm_write32(lwmutex + LWM_OWNER, 0);
+         ReleaseSemaphore(s, 1, NULL);
+         Sleep(1);
+-        WaitForSingleObject(s, INFINITE);
+-        vm_write32(lwmutex + LWM_OWNER, own);
+-        vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
++    } else {
++        LwcWaiter me = { (uint32_t)ctx->thread_id, false };
++        std::unique_lock<std::mutex> lk(g_lwc_mu);
++        LwcState* st = lwc_get(lwcond);
++        st->q.push_back(&me);
++        st->sleepers++;
++        vm_write32(lwmutex + LWM_RECUR, 0);
++        vm_write32(lwmutex + LWM_OWNER, 0);
++        ReleaseSemaphore(s, 1, NULL);
++        auto signalled = [&me] { return me.signalled; };
++        /* Past 2^40 µs (12 days) the wait is forever: chrono's now() + a
++         * guest value near UINT64_MAX overflows and wait_for times out at once. */
++        if (timeout == 0 || timeout > (1ull << 40)) st->cv.wait(lk, signalled);
++        else ok = st->cv.wait_for(lk, std::chrono::microseconds(timeout), signalled) ? 1 : 0;
++        /* wait_for re-checks the predicate on expiry, so a signal that landed
++         * as the timeout fired counts and the wait reports OK. A real timeout
++         * takes this waiter out of the queue so no later signal is spent on it. */
++        if (!ok) {
++            for (auto it = st->q.begin(); it != st->q.end(); ++it)
++                if (*it == &me) { st->q.erase(it); break; }
++        }
++        st->sleepers--;
+     }
+-    ctx->gpr[3] = 0;
++    WaitForSingleObject(s, INFINITE);
++    vm_write32(lwmutex + LWM_OWNER, own);
++    vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
++    ctx->gpr[3] = ok ? 0 : (uint64_t)(int64_t)(int32_t)0x8001000Bu;   /* ETIMEDOUT */
+ }
+ 
+ /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.

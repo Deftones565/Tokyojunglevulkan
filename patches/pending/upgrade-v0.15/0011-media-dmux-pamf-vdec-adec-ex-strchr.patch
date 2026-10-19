@@ -1,0 +1,2474 @@
+diff --git a/libs/codec/adec_ffmpeg.c b/libs/codec/adec_ffmpeg.c
+new file mode 100644
+index 0000000..0d3bc68
+--- /dev/null
++++ b/libs/codec/adec_ffmpeg.c
+@@ -0,0 +1,150 @@
++/*
++ * ps3recomp - cellAdec's libavcodec path. See adec_ffmpeg.h.
++ *
++ * Only AC3 for now: it is what PAMF movies carry next to MPEG-2 video. The
++ * ATRAC family has its own decoder in this tree (cellAdecAtrac3p.c).
++ */
++
++#include "adec_ffmpeg.h"
++#include "cellAdec.h"
++
++#ifdef PS3RECOMP_FFMPEG_RUNTIME
++
++#include "ffmpeg_runtime.h"
++#include <libavutil/channel_layout.h>
++#include <libavutil/samplefmt.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++struct AdecFf {
++    const PS3FFmpeg* ff;
++    AVCodecContext* ctx;
++    AVPacket* pkt;
++    AVFrame* frame;
++    u8* buf;
++    u32 buf_cap;
++    float* conv;               /* planar float copy when FFmpeg's isn't */
++    size_t conv_cap;
++};
++
++AdecFf* adec_ff_open(u32 codec_type)
++{
++    if (codec_type != CELL_ADEC_TYPE_AC3) return NULL;
++    const PS3FFmpeg* ff = ps3_ffmpeg_get();
++    if (!ff) return NULL;
++    const AVCodec* codec = ff->avcodec_find_decoder(AV_CODEC_ID_AC3);
++    if (!codec) {
++        printf("[cellAdec] libavcodec has no AC3 decoder\n");
++        return NULL;
++    }
++    AdecFf* d = (AdecFf*)calloc(1, sizeof *d);
++    if (!d) return NULL;
++    d->ff = ff;
++    d->ctx = ff->avcodec_alloc_context3(codec);
++    d->pkt = ff->av_packet_alloc();
++    d->frame = ff->av_frame_alloc();
++    if (!d->ctx || !d->pkt || !d->frame || ff->avcodec_open2(d->ctx, codec, NULL) < 0) {
++        printf("[cellAdec] could not open the libavcodec AC3 decoder\n");
++        adec_ff_close(d);
++        return NULL;
++    }
++    return d;
++}
++
++void adec_ff_close(AdecFf* d)
++{
++    if (!d) return;
++    if (d->ctx) d->ff->avcodec_free_context(&d->ctx);
++    if (d->pkt) d->ff->av_packet_free(&d->pkt);
++    if (d->frame) d->ff->av_frame_free(&d->frame);
++    free(d->buf);
++    free(d->conv);
++    free(d);
++}
++
++void adec_ff_reset(AdecFf* d)
++{
++    if (d) d->ff->avcodec_flush_buffers(d->ctx);
++}
++
++/* Planar float view of a frame in whatever sample format it came in. */
++static int to_planar_float(AdecFf* d, const AVFrame* f, AdecFfFrame* out)
++{
++    const int nch = f->ch_layout.nb_channels, n = f->nb_samples;
++    if (nch <= 0 || nch > 8 || n <= 0) return 0;
++    out->channels = nch;
++    out->samples = n;
++    out->rate = f->sample_rate;
++    out->mask = f->ch_layout.order == AV_CHANNEL_ORDER_NATIVE ? f->ch_layout.u.mask : 0;
++    if (f->format == AV_SAMPLE_FMT_FLTP) {
++        for (int c = 0; c < nch; c++) out->plane[c] = (const float*)f->extended_data[c];
++        return 1;
++    }
++    size_t need = (size_t)nch * n;
++    if (need > d->conv_cap) {
++        float* nb = (float*)realloc(d->conv, need * sizeof(float));
++        if (!nb) return 0;
++        d->conv = nb; d->conv_cap = need;
++    }
++    for (int c = 0; c < nch; c++) {
++        float* o = d->conv + (size_t)c * n;
++        out->plane[c] = o;
++        for (int i = 0; i < n; i++) {
++            switch (f->format) {
++            case AV_SAMPLE_FMT_FLT:  o[i] = ((const float*)f->data[0])[i * nch + c]; break;
++            case AV_SAMPLE_FMT_S16P: o[i] = ((const int16_t*)f->extended_data[c])[i] / 32768.0f; break;
++            case AV_SAMPLE_FMT_S16:  o[i] = ((const int16_t*)f->data[0])[i * nch + c] / 32768.0f; break;
++            case AV_SAMPLE_FMT_S32P: o[i] = ((const int32_t*)f->extended_data[c])[i] / 2147483648.0f; break;
++            default: return 0;
++            }
++        }
++    }
++    return 1;
++}
++
++static void receive(AdecFf* d, adec_ff_emit_fn emit, void* ctx)
++{
++    for (;;) {
++        AVFrame* f = d->frame;
++        if (d->ff->avcodec_receive_frame(d->ctx, f) < 0) return;
++        AdecFfFrame fr;
++        memset(&fr, 0, sizeof fr);
++        if (to_planar_float(d, f, &fr)) emit(ctx, &fr);
++        d->ff->av_frame_unref(f);
++    }
++}
++
++int adec_ff_decode(AdecFf* d, const u8* au, u32 size, adec_ff_emit_fn emit, void* ctx)
++{
++    if (!size) return 0;
++    if (size + AV_INPUT_BUFFER_PADDING_SIZE > d->buf_cap) {
++        u8* nb = (u8*)realloc(d->buf, size + AV_INPUT_BUFFER_PADDING_SIZE);
++        if (!nb) return AVERROR(ENOMEM);
++        d->buf = nb;
++        d->buf_cap = size + AV_INPUT_BUFFER_PADDING_SIZE;
++    }
++    memcpy(d->buf, au, size);
++    memset(d->buf + size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
++    d->pkt->data = d->buf;
++    d->pkt->size = (int)size;
++    int r = d->ff->avcodec_send_packet(d->ctx, d->pkt);
++    if (r == AVERROR(EAGAIN)) {
++        receive(d, emit, ctx);
++        r = d->ff->avcodec_send_packet(d->ctx, d->pkt);
++    }
++    d->pkt->data = NULL;
++    d->pkt->size = 0;
++    receive(d, emit, ctx);
++    return r < 0 ? r : 0;
++}
++
++#else /* !PS3RECOMP_FFMPEG_RUNTIME */
++
++AdecFf* adec_ff_open(u32 codec_type) { (void)codec_type; return NULL; }
++void adec_ff_close(AdecFf* d) { (void)d; }
++void adec_ff_reset(AdecFf* d) { (void)d; }
++int adec_ff_decode(AdecFf* d, const u8* au, u32 size, adec_ff_emit_fn emit, void* ctx)
++{ (void)d; (void)au; (void)size; (void)emit; (void)ctx; return -1; }
++
++#endif
+diff --git a/libs/codec/adec_ffmpeg.h b/libs/codec/adec_ffmpeg.h
+new file mode 100644
+index 0000000..c863d28
+--- /dev/null
++++ b/libs/codec/adec_ffmpeg.h
+@@ -0,0 +1,41 @@
++/*
++ * ps3recomp - cellAdec's libavcodec path (see ffmpeg_runtime.h)
++ *
++ * Decodes one access unit and hands each decoded frame back as planar float
++ * samples in [-1, 1], with the channels identified by an FFmpeg native-order
++ * channel mask. Without PS3RECOMP_FFMPEG_RUNTIME, adec_ff_open returns NULL
++ * and cellAdec keeps its silence-only behaviour.
++ */
++#ifndef PS3RECOMP_ADEC_FFMPEG_H
++#define PS3RECOMP_ADEC_FFMPEG_H
++
++#include "ps3emu/ps3types.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct AdecFf AdecFf;
++
++typedef struct {
++    const float* plane[8];     /* one per channel, `samples` long */
++    int channels;
++    int samples;
++    int rate;
++    u64 mask;                  /* FFmpeg native channel mask, 0 if unknown */
++} AdecFfFrame;
++
++typedef void (*adec_ff_emit_fn)(void* ctx, const AdecFfFrame* f);
++
++AdecFf* adec_ff_open(u32 codec_type);
++void    adec_ff_close(AdecFf* d);
++void    adec_ff_reset(AdecFf* d);
++/* Returns 0, or a negative FFmpeg error when the AU did not decode. */
++int     adec_ff_decode(AdecFf* d, const u8* au, u32 size,
++                       adec_ff_emit_fn emit, void* ctx);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* PS3RECOMP_ADEC_FFMPEG_H */
+diff --git a/libs/codec/cellAdec.c b/libs/codec/cellAdec.c
+index 3da7017..7e4dfe2 100644
+--- a/libs/codec/cellAdec.c
++++ b/libs/codec/cellAdec.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "cellAdec.h"
++#include "adec_ffmpeg.h"
+ #include <stdio.h>
+ #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
+ #include <string.h>
+@@ -73,8 +74,26 @@ typedef struct {
+     u32 pcmEa;          /* guest EA of the PCM buffer it points at    */
+     int hasPcm;
+     u32 auCount;        /* total AUs decoded */
++    /* Decoder path (libavcodec AC3): decoded frames wait in a queue of
++     * PCM items laid out in the caller's work memory (Open's resource). */
++    AdecFf* ff;
++    u32 workEa, slots;
++    u32 qHead, qCount, newPcm;
++    u8  wordSize;       /* AC3 param: 0 int16, 1 float */
++    u8  outputMode;     /* AC3 param: 1 = 1/0 (mono), 2 = 2/0, ... 7 = 3/2 */
++    u8  lfeOn;          /* AC3 param: append the LFE channel */
++    u8  chanPtr[6];     /* AC3 param: output channel k carries input chanPtr[k] */
++    u32 curAu;          /* guest EA of the AU being decoded */
++    u64 lastPts;        /* PTS of the last PCM item, for AUs that carry none */
+ } AdecSlot;
+ 
++/* One queued PCM item: [0x000 CellAdecPcmItem][0x040 CellAdecBsiAc3]
++ * [0x100 samples], sized for one AC3 frame (1536 samples) of 5.1 float. */
++#define ADEC_Q_SLOT      0x9100u
++#define ADEC_Q_PCM_OFF   0x100u
++#define ADEC_Q_BSI_OFF   0x40u
++#define ADEC_Q_MAX       16u
++
+ static AdecSlot s_adec[MAX_ADEC];
+ 
+ /* Fire one guest callback.
+@@ -106,6 +125,123 @@ static void adec_notify(CellAdecHandle handle, u32 msg_type, s32 msg_data)
+                        (u64)(s64)msg_data, (u64)a->cbArg, 0, 0, 0, 0);
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Decoder path: one decoded frame -> one queued PCM item
++ * -----------------------------------------------------------------------*/
++
++/* AC3 bit rates in kbit/s by frmsizecod >> 1 (ATSC A/52). */
++static const u16 k_ac3_kbps[19] = { 32, 40, 48, 56, 64, 80, 96, 112, 128, 160,
++                                    192, 224, 256, 320, 384, 448, 512, 576, 640 };
++
++/* Full-bandwidth channels per AC3 output mode (acmod numbering): 1/0 C,
++ * 2/0 L R, 3/0 L C R, 2/1 L R s, 3/1 L C R s, 2/2 L R l r, 3/2 L C R l r. */
++static const u8 k_mode_channels[8] = { 2, 1, 2, 3, 3, 4, 4, 5 };
++
++/* The decoder's input channels in AC3 order (L, C, R, l, r, s = LFE) taken
++ * from FFmpeg's native order (FL FR FC LFE BL BR FLC FRC BC SL SR); a
++ * channel the stream does not carry reads as silence. */
++static float ac3_input(const AdecFfFrame* f, int i, int which)
++{
++    static const signed char k_bits[6][2] = {
++        { 0, -1 }, { 2, -1 }, { 1, -1 }, { 9, 4 }, { 10, 5 }, { 3, -1 } };
++    if (!f->mask) {                       /* unknown layout: take them in order */
++        return which < f->channels ? f->plane[which][i] : 0.0f;
++    }
++    for (int alt = 0; alt < 2; alt++) {
++        const int bit = k_bits[which][alt];
++        if (bit < 0 || !(f->mask & (1ull << bit))) continue;
++        int c = 0;
++        for (int b = 0; b < bit; b++) if (f->mask & (1ull << b)) c++;
++        return f->plane[c][i];
++    }
++    if (f->channels == 1 && which == 1) return f->plane[0][i];   /* mono = C */
++    return 0.0f;
++}
++
++static void adec_on_frame(void* ctx, const AdecFfFrame* f)
++{
++    AdecSlot* a = (AdecSlot*)ctx;
++    if (a->qCount >= a->slots) {
++        printf("[cellAdec] PCM queue full; dropping a frame\n");
++        return;
++    }
++    const u32 idx  = (a->qHead + a->qCount) % a->slots;
++    const u32 slot = a->workEa + idx * ADEC_Q_SLOT;
++    const u32 pcm  = slot + ADEC_Q_PCM_OFF, bsi = slot + ADEC_Q_BSI_OFF;
++    const int full = k_mode_channels[a->outputMode & 7];
++    const int nch  = full + (a->lfeOn ? 1 : 0);
++    const u32 bps  = a->wordSize ? 4u : 2u;
++    int n = f->samples;
++    if ((u32)n * nch * bps > ADEC_Q_SLOT - ADEC_Q_PCM_OFF)
++        n = (int)((ADEC_Q_SLOT - ADEC_Q_PCM_OFF) / (nch * bps));
++    u8* o = vm_base + pcm;
++    for (int i = 0; i < n; i++) {
++        for (int c = 0; c < nch; c++) {
++            float v = ac3_input(f, i, a->chanPtr[c]);
++            if (v > 1.0f) v = 1.0f; else if (v < -1.0f) v = -1.0f;
++            if (a->wordSize) {
++                u32 bits; memcpy(&bits, &v, 4);
++                o[0] = (u8)(bits >> 24); o[1] = (u8)(bits >> 16);
++                o[2] = (u8)(bits >> 8);  o[3] = (u8)bits; o += 4;
++            } else {
++                s16 s16v = (s16)(v * 32767.0f);
++                o[0] = (u8)((u16)s16v >> 8); o[1] = (u8)s16v; o += 2;
++            }
++        }
++    }
++    const u32 bytes = (u32)n * nch * bps;
++
++    /* CellAdecBsiAc3: what was decoded, from the AU's sync frame header. */
++    const u32 au = a->curAu, au_start = vm_read32(au + 0x00), au_size = vm_read32(au + 0x04);
++    const u8* h = vm_base + au_start;
++    for (u32 k = 0; k < 0x50; k += 4) vm_write32(bsi + k, 0);
++    vm_write32(bsi + 0x00, CELL_ADEC_TYPE_AC3);
++    vm_write32(bsi + 0x0C, a->auCount + 1);              /* totalCallNum */
++    if (au_size >= 7 && h[0] == 0x0B && h[1] == 0x77) {
++        const u8 fscod = h[4] >> 6, frm = h[4] & 0x3F;
++        if (frm < 38) vm_write32(bsi + 0x10, k_ac3_kbps[frm >> 1] * 1000u);
++        vm_write8(bsi + 0x23, fscod);                    /* fsIndex */
++        vm_write16(bsi + 0x30, frm);                     /* frmSizeCod */
++        vm_write8(bsi + 0x32, h[6] >> 5);                /* acmod */
++        vm_write8(bsi + 0x3A, h[5] & 7);                 /* bsmod */
++        vm_write8(bsi + 0x3B, h[5] >> 3);                /* bsid */
++    }
++    vm_write32(bsi + 0x14, bytes);                       /* pcmSize */
++    vm_write32(bsi + 0x18, au_size * 8);                 /* esSizeBit */
++    vm_write8(bsi + 0x21, 1);                            /* validity */
++    vm_write8(bsi + 0x22, (u8)nch);                      /* channelValue */
++    vm_write8(bsi + 0x24, a->wordSize);                  /* outputQuantization */
++    vm_write8(bsi + 0x25, a->outputMode);                /* outputChannel */
++    vm_write8(bsi + 0x26, nch == 1);                     /* monoFlag */
++
++    /* CellAdecPcmItem, echoing the AU it came from */
++    vm_write32(slot + PCMITEM_PCM_HANDLE, idx);
++    vm_write32(slot + PCMITEM_STATUS, 0);
++    vm_write32(slot + PCMITEM_START_ADDR, pcm);
++    vm_write32(slot + PCMITEM_SIZE, bytes);
++    vm_write32(slot + PCMITEM_BSI_INFO, bsi);
++    vm_write32(slot + PCMITEM_AU_START, au_start);
++    vm_write32(slot + PCMITEM_AU_SIZE, au_size);
++    /* An AU without a timestamp continues from the previous frame, the way
++     * the firmware decoder corrects it: one frame of samples at 90 kHz
++     * (2880 for a 1536-sample AC3 frame at 48 kHz). The movie player builds
++     * its audio clock from these, and an all-invalid run never starts it. */
++    u64 pts = ((u64)vm_read32(au + 0x08) << 32) | vm_read32(au + 0x0C);
++    if (pts == ~0ull && a->lastPts != ~0ull && f->rate > 0)
++        pts = a->lastPts + (u64)f->samples * 90000u / (u32)f->rate;
++    a->lastPts = pts;
++    vm_write32(slot + PCMITEM_AU_PTS_HI, (u32)(pts >> 32));
++    vm_write32(slot + PCMITEM_AU_PTS_LO, (u32)pts);
++    vm_write32(slot + PCMITEM_AU_USERDATA, vm_read32(au + 0x10));
++    vm_write32(slot + PCMITEM_AU_USERDATA + 4, vm_read32(au + 0x14));
++
++    a->qCount++;
++    a->newPcm++;
++    { static int k = 0;
++      if (k++ < 3) printf("[cellAdec] AC3 frame: %d ch %d Hz %d samples -> %u bytes\n",
++                          f->channels, f->rate, f->samples, bytes); }
++}
++
+ /* ---------------------------------------------------------------------------
+  * API implementations
+  * -----------------------------------------------------------------------*/
+@@ -163,6 +299,19 @@ s32 cellAdecOpen(const CellAdecType* type, const CellAdecResource* res,
+              * once already. */
+             s_adec[i].itemEa = ADEC_ITEM_EA(i);
+             s_adec[i].pcmEa  = ADEC_PCM_EA(i);
++            /* CellAdecResource and ...ResourceEx both start
++             * { u32 totalMemSize; u32 startAddr; }. */
++            { const u32 r = (u32)(uintptr_t)res;
++              const u32 total = r ? vm_read32(r + 0) : 0, start = r ? vm_read32(r + 4) : 0;
++              u32 n = total / ADEC_Q_SLOT;
++              if (n > ADEC_Q_MAX) n = ADEC_Q_MAX;
++              if (start && n >= 2 && (s_adec[i].ff = adec_ff_open(codec_type))) {
++                  s_adec[i].workEa = (start + 0x7F) & ~0x7Fu;
++                  s_adec[i].slots = (total - (s_adec[i].workEa - start)) / ADEC_Q_SLOT;
++                  if (s_adec[i].slots > ADEC_Q_MAX) s_adec[i].slots = ADEC_Q_MAX;
++                  printf("[cellAdec] decoding with libavcodec, %u PCM slots at 0x%08X\n",
++                         s_adec[i].slots, s_adec[i].workEa);
++              } }
+             vm_write32(handle_ea, (u32)i);
+             printf("[cellAdec] Open -> handle=%u item=0x%08X pcm=0x%08X\n",
+                    i, s_adec[i].itemEa, s_adec[i].pcmEa);
+@@ -172,6 +321,22 @@ s32 cellAdecOpen(const CellAdecType* type, const CellAdecResource* res,
+     return (s32)CELL_ADEC_ERROR_BUSY;
+ }
+ 
++/* cellAdecOpenEx / cellAdecOpenExt(type, resourceEx, cb, handle): libsail
++ * opens its decoder with OpenExt. The extended resource only adds SPURS
++ * placement, which a host-side decoder has no use for. Unregistered, the
++ * handle out-param was never written and every later call got handle 0. */
++s32 cellAdecOpenEx(const CellAdecType* type, const void* resourceEx,
++                   const CellAdecCb* cb, CellAdecHandle* handle)
++{
++    return cellAdecOpen(type, (const CellAdecResource*)resourceEx, cb, handle);
++}
++
++s32 cellAdecOpenExt(const CellAdecType* type, const void* resourceEx,
++                    const CellAdecCb* cb, CellAdecHandle* handle)
++{
++    return cellAdecOpen(type, (const CellAdecResource*)resourceEx, cb, handle);
++}
++
+ s32 cellAdecClose(CellAdecHandle handle)
+ {
+     printf("[cellAdec] Close(handle=%u)\n", handle);
+@@ -179,13 +344,31 @@ s32 cellAdecClose(CellAdecHandle handle)
+     if (handle >= MAX_ADEC || !s_adec[handle].in_use)
+         return (s32)CELL_ADEC_ERROR_ARG;
+ 
++    adec_ff_close(s_adec[handle].ff);
++    s_adec[handle].ff = NULL;
+     s_adec[handle].in_use = 0;
+     return CELL_OK;
+ }
+ 
+ s32 cellAdecStartSeq(CellAdecHandle handle, void* param)
+ {
+-    (void)param;
++    if (handle < MAX_ADEC && s_adec[handle].in_use && s_adec[handle].ff) {
++        const u32 p = (u32)(uintptr_t)param;
++        /* CellAdecParamAc3: u8 wordSize @0, outputMode @1, outLfeOn @2,
++         * ..., s32 channelPointer0..5 @0x18 */
++        s_adec[handle].wordSize   = p ? vm_read8(p + 0) : 1;
++        s_adec[handle].outputMode = p ? vm_read8(p + 1) : 2;
++        s_adec[handle].lfeOn      = p ? vm_read8(p + 2) : 0;
++        for (u32 k = 0; k < 6; k++) {
++            u32 v = p ? vm_read32(p + 0x18 + 4 * k) : k;
++            s_adec[handle].chanPtr[k] = (u8)(v < 6 ? v : k);
++        }
++        s_adec[handle].qHead = s_adec[handle].qCount = 0;
++        s_adec[handle].lastPts = ~0ull;
++        adec_ff_reset(s_adec[handle].ff);
++        printf("[cellAdec] AC3 output: %s, mode %u\n",
++               s_adec[handle].wordSize ? "float" : "int16", s_adec[handle].outputMode);
++    }
+     printf("[cellAdec] StartSeq(handle=%u)\n", handle);
+ 
+     if (handle >= MAX_ADEC || !s_adec[handle].in_use)
+@@ -233,6 +416,21 @@ s32 cellAdecDecodeAu(CellAdecHandle handle, const CellAdecAuInfo* auInfo)
+ 
+     AdecSlot* a = &s_adec[handle];
+ 
++    if (a->ff) {
++        if (a->qCount >= a->slots)
++            return (s32)CELL_ADEC_ERROR_BUSY;          /* title must take PCM */
++        const u32 au = GUEST_EA(auInfo);
++        const u32 start = vm_read32(au + 0x00), size = vm_read32(au + 0x04);
++        a->curAu = au;
++        a->newPcm = 0;
++        if (size) adec_ff_decode(a->ff, vm_base + start, size, adec_on_frame, a);
++        a->auCount++;
++        adec_notify(handle, CELL_ADEC_MSG_TYPE_AUDONE, (s32)au);
++        for (u32 k = a->newPcm; k; k--)
++            adec_notify(handle, CELL_ADEC_MSG_TYPE_PCMOUT, CELL_OK);
++        return CELL_OK;
++    }
++
+     printf("[cellAdec] DecodeAu(handle=%u, addr=0x%X, size=%u)\n",
+            handle, vm_read32(GUEST_EA(auInfo) + (u32)offsetof(CellAdecAuInfo, startAddr)),
+            vm_read32(GUEST_EA(auInfo) + (u32)offsetof(CellAdecAuInfo, size)));
+@@ -291,6 +489,17 @@ s32 cellAdecGetPcm(CellAdecHandle handle, void* outBuffer)
+     if (handle >= MAX_ADEC || !s_adec[handle].in_use)
+         return (s32)CELL_ADEC_ERROR_ARG;
+ 
++    if (s_adec[handle].ff) {
++        AdecSlot* a = &s_adec[handle];
++        if (!a->qCount) return (s32)CELL_ADEC_ERROR_EMPTY;
++        const u32 slot = a->workEa + a->qHead * ADEC_Q_SLOT;
++        const u32 out = GUEST_EA(outBuffer);
++        if (out) memcpy(vm_base + out, vm_base + slot + ADEC_Q_PCM_OFF, vm_read32(slot + PCMITEM_SIZE));
++        a->qHead = (a->qHead + 1) % a->slots;
++        a->qCount--;
++        return CELL_OK;
++    }
++
+     if (!s_adec[handle].hasPcm)
+         return (s32)CELL_ADEC_ERROR_EMPTY;
+ 
+@@ -312,6 +521,13 @@ s32 cellAdecGetPcmItem(CellAdecHandle handle, const CellAdecPcmItem** pcmItem)
+     if (handle >= MAX_ADEC || !s_adec[handle].in_use)
+         return (s32)CELL_ADEC_ERROR_ARG;
+ 
++    if (s_adec[handle].ff) {
++        const AdecSlot* a = &s_adec[handle];
++        if (!a->qCount) return (s32)CELL_ADEC_ERROR_EMPTY;
++        if (pcmItem) vm_write32(GUEST_EA(pcmItem), a->workEa + a->qHead * ADEC_Q_SLOT);
++        return CELL_OK;
++    }
++
+     if (!s_adec[handle].hasPcm)
+         return (s32)CELL_ADEC_ERROR_EMPTY;
+ 
+diff --git a/libs/codec/cellDmux.c b/libs/codec/cellDmux.c
+index b055385..605489d 100644
+--- a/libs/codec/cellDmux.c
++++ b/libs/codec/cellDmux.c
+@@ -1,290 +1,1010 @@
+ /*
+- * ps3recomp - cellDmux HLE implementation
++ * ps3recomp - cellDmux HLE: PAMF (MPEG-2 program stream) demultiplexer
+  *
+- * Stub demuxer that accepts PAMF data and reports AU-found callbacks.
+- * Without real MPEG-TS parsing, this provides the API surface games
+- * expect while the video pipeline is built out.
++ * What the firmware does, natively: libdmux plus libdmuxpamf take a buffer of
++ * MPEG-2 program stream packs, pull the enabled elementary streams out of
++ * their PES packets, cut each stream into access units (AUs), and hand every
++ * AU to the caller through its ES callback. The caller takes AUs with
++ * GetAu/PeekAu and gives their memory back with ReleaseAu, oldest first.
++ *
++ * It is asynchronous on the console, and callers depend on that: SetStream
++ * returns at once, and AU_FOUND / DEMUX_DONE / FLUSH_DONE arrive later from
++ * the demuxer's own thread. libsail reacts to DEMUX_DONE by feeding the next
++ * chunk, so doing the work inside SetStream would recurse once per chunk.
++ * Each demuxer therefore runs one host worker thread, which calls the guest
++ * callbacks through g_ps3_guest_caller (its own guest stack and thread id,
++ * patch 0010).
++ *
++ * Where things live:
++ *   - demuxer handle = the 16-byte-aligned start of the caller's demuxer
++ *     memory; its first 0x10 bytes hold the CellDmuxMsg passed to callbacks.
++ *   - ES handle = the 16-byte-aligned start of the caller's ES memory, laid
++ *     out as [msg 0x10][AU info slots][AU specific-info slots][AU data ring].
++ *     The AU info and data the caller reads via GetAu are in that guest
++ *     memory; all bookkeeping is host-side, keyed by those addresses.
++ *
++ * AU framing follows libdmuxpamf (behaviour per RPCS3's cellDmuxPamf, written
++ * from scratch here): MPEG-2 video AUs run from a picture start code or a
++ * sequence header to the next one of those (a sequence end code stays in the
++ * AU it ends); AVC AUs are split at access unit delimiters; AC3 AUs are whole
++ * sync frames (0x0B77, size from fscod/frmsizecod). Audio in private stream 1
++ * carries a 4-byte sub-stream header that is not part of the AU. A PES
++ * packet's PTS/DTS belongs to the first AU that begins in its payload.
++ *
++ * LPCM, ATRAC3plus and user-data streams are accepted by EnableEs but not cut
++ * into AUs yet: no title here plays them. Their packets are skipped.
+  */
+ 
+ #include "cellDmux.h"
++#include "ps3emu/guest_call.h"
++#include "../../runtime/ppu/ppu_memory.h"
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+-#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+-#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
++
++#ifdef _WIN32
++  #include <windows.h>
++  #include <process.h>
++  typedef HANDLE dmx_thread_t;
++  typedef CRITICAL_SECTION dmx_mutex_t;
++  typedef CONDITION_VARIABLE dmx_cond_t;
++  #define dmx_mutex_init(m)   InitializeCriticalSection(m)
++  #define dmx_mutex_lock(m)   EnterCriticalSection(m)
++  #define dmx_mutex_unlock(m) LeaveCriticalSection(m)
++  #define dmx_mutex_fini(m)   DeleteCriticalSection(m)
++  #define dmx_cond_init(c)    InitializeConditionVariable(c)
++  #define dmx_cond_wait(c, m) SleepConditionVariableCS(c, m, INFINITE)
++  #define dmx_cond_bcast(c)   WakeAllConditionVariable(c)
++  #define dmx_cond_fini(c)    ((void)0)
++#else
++  #include <pthread.h>
++  typedef pthread_t dmx_thread_t;
++  typedef pthread_mutex_t dmx_mutex_t;
++  typedef pthread_cond_t dmx_cond_t;
++  #define dmx_mutex_init(m)   pthread_mutex_init(m, NULL)
++  #define dmx_mutex_lock(m)   pthread_mutex_lock(m)
++  #define dmx_mutex_unlock(m) pthread_mutex_unlock(m)
++  #define dmx_mutex_fini(m)   pthread_mutex_destroy(m)
++  #define dmx_cond_init(c)    pthread_cond_init(c, NULL)
++  #define dmx_cond_wait(c, m) pthread_cond_wait(c, m)
++  #define dmx_cond_bcast(c)   pthread_cond_broadcast(c)
++  #define dmx_cond_fini(c)    pthread_cond_destroy(c)
++#endif
++
++#define DMUX_MAX          4
++#define DMUX_MAX_ES       8        /* per demuxer; libdmuxpamf allows 64 */
++#define DMUX_VER_UPPER    0x260000u
++#define DMUX_HANDLE_MEM   0x40u    /* what QueryAttr asks for: the msg block */
++#define ES_MSG_SIZE       0x10u
++#define AU_INFO_SIZE      0x28u
++#define AU_INFO_STRIDE    0x30u
++#define AU_SPEC_STRIDE    0x10u
++#define TS_INVALID        0xFFFFFFFFFFFFFFFFull
++
++enum { ES_M2V, ES_AVC, ES_AC3, ES_ATRACX, ES_LPCM, ES_USER, ES_BAD };
++
++/* AU queue depth and buffer sizes per stream kind, as libdmuxpamf sizes them
++ * (titles size their allocators to these numbers). */
++static u32 es_queue_max(int kind) { return kind == ES_LPCM ? 0x100 : 0x40; }
++
++static u32 es_au_max(int kind, u32 m2v_profile_level, u32 avc_level)
++{
++    switch (kind) {
++    case ES_M2V: return m2v_profile_level > 1 ? 0x12a800u : 0x38000u;
++    case ES_AVC:
++        switch (avc_level) {
++        case 21: return 0x12900u;  case 30: return 0x25f80u;
++        case 31: return 0x54600u;  case 32: return 0x78000u;
++        case 41: return 0xc0000u;  default: return 0xcc000u;
++        }
++    case ES_AC3:    return 0xf00u;
++    case ES_ATRACX: return 0x1008u;
++    case ES_USER:   return 0xa0000u;
++    default:        return 0x8000u;
++    }
++}
++
++static u32 es_ring_size(int kind, u32 m2v_profile_level, u32 avc_level)
++{
++    switch (kind) {
++    case ES_M2V: return m2v_profile_level > 1 ? 0x255000u : 0x70000u;
++    case ES_AVC:
++        switch (avc_level) {
++        case 21: return 0xb00c0u;  case 30: return 0x19f2e0u;
++        case 31: return 0x260120u; case 32: return 0x35f6c0u;
++        case 41: return 0x45e870u; default: return 0x46a870u;
++        }
++    case ES_AC3:    return 0xa000u;
++    case ES_ATRACX: return 0x6400u;
++    case ES_USER:   return 0x160000u;
++    default:        return 0x104380u;
++    }
++}
++
++static int es_kind(u32 stream_id, u32 private_id, u32 is_avc)
++{
++    if ((stream_id & 0xf0) == 0xe0) return is_avc ? ES_AVC : ES_M2V;
++    if (stream_id != 0xbd) return ES_BAD;
++    switch (private_id & 0xf0) {
++    case 0x00: return ES_ATRACX;
++    case 0x20: return ES_USER;
++    case 0x30: return ES_AC3;
++    case 0x40: return ES_LPCM;
++    default:   return ES_BAD;
++    }
++}
++
++/* ES memory the caller must provide: the message block, the AU info and
++ * specific-info slots (one spare for the flush AU), the AU ring, and room to
++ * align the handle. */
++static u32 es_mem_size(int kind, u32 m2v_pl, u32 avc_level)
++{
++    u32 n = es_queue_max(kind) + 1;
++    return ES_MSG_SIZE + n * (AU_INFO_STRIDE + AU_SPEC_STRIDE) +
++           es_ring_size(kind, m2v_pl, avc_level) + 0x80;
++}
+ 
+ /* ---------------------------------------------------------------------------
+- * Internal state
++ * State
+  * -----------------------------------------------------------------------*/
+ 
++typedef struct { u32 off, size; } AuBlock;
++
+ typedef struct {
+-    int in_use;
+-    CellDmuxCbMsg cbFunc;
+-    void* cbArg;
+-    u32 streamType;
+-    /* Stream data tracking for demux processing */
+-    u32 streamAddr;
+-    u32 streamSize;
+-    u64 userData;
+-    u32 auSeqNo;        /* running AU sequence counter */
+-} DmuxSlot;
++    int used;
++    u32 ea;                       /* ES handle (guest) */
++    u32 sid, psid;
++    int kind;
++    u32 cb_func, cb_arg;
++    u32 info_base, spec_base;     /* guest slot arrays */
++    u32 ring_base, ring_size;     /* guest AU data ring */
++    u32 au_max;
++    u32 qmax;
++    /* AU queue: entries [first .. first+alloc) are allocated (not yet
++     * released); the last `avail` of them have not been taken by GetAu. */
++    u32 first, alloc, avail;
++    AuBlock blk[0x101];
++    /* AU assembly: payload bytes not yet cut into AUs */
++    u8* acc;
++    u32 acc_len, acc_cap;
++    u32 scan;                     /* bytes of acc already searched */
++    int au_open;                  /* an AU started at acc[0] */
++    int m2v_seq;                  /* M2V AU opened by a sequence header */
++    u32 ac3_need;                 /* AC3 frame size once its header is seen */
++    u64 au_pts, au_dts;           /* timestamps of the AU at acc[0] */
++    /* PES timestamps waiting for an AU to start at or after `at` (an offset
++     * into acc). Several PES packets are appended between two cuts, so this
++     * has to be a queue: one slot let each packet overwrite the last, and
++     * almost every AU came out with no timestamp. */
++    struct { u32 at; u64 pts, dts; } ts[64];
++    u32 ts_n;
++    int flush_req, reset_req;
++} DmuxEs;
+ 
+ typedef struct {
+-    int in_use;
+-    u32 dmuxId;
+-    CellDmuxEsFilterId filterId;
+-    CellDmuxCbEsMsg esCbFunc;
+-    void* esCbArg;
+-    CellDmuxAuInfo currentAu;
+-    int hasAu;
+-} DmuxEsSlot;
+-
+-static DmuxSlot s_dmux[CELL_DMUX_MAX_HANDLES];
+-static DmuxEsSlot s_es[CELL_DMUX_MAX_ES];
++    int used;
++    u32 ea;                       /* demuxer handle (guest) */
++    u32 cb_func, cb_arg;
++    dmx_mutex_t mtx;
++    dmx_cond_t cv;
++    dmx_thread_t thr;
++    int quit;
++    /* the stream being demuxed */
++    int running;                  /* set by SetStream until DEMUX_DONE */
++    u32 s_ea, s_size, s_pos;
++    u64 user_data;
++    int reset_req;
++    int busy_cb;                  /* worker is inside a guest callback */
++    u8 buf[0x20000];              /* staged stream bytes not yet parsed; a pack
++                                     split across two SetStream calls stays here */
++    u32 buf_len;
++    DmuxEs es[DMUX_MAX_ES];
++} Dmux;
++
++static Dmux s_dmux[DMUX_MAX];
++static dmx_mutex_t s_table_mtx;
++static int s_table_init = 0;
++
++static void table_lock(void)
++{
++    if (!s_table_init) { dmx_mutex_init(&s_table_mtx); s_table_init = 1; }
++    dmx_mutex_lock(&s_table_mtx);
++}
++
++/* A guest callback runs on the worker; anything it calls must not wait for
++ * the worker. */
++static int on_worker(const Dmux* d)
++{
++#ifdef _WIN32
++    return GetThreadId(d->thr) == GetCurrentThreadId();
++#else
++    return pthread_equal(d->thr, pthread_self());
++#endif
++}
++
++static Dmux* find_dmux(u32 ea)
++{
++    for (int i = 0; i < DMUX_MAX; i++)
++        if (s_dmux[i].used && s_dmux[i].ea == ea) return &s_dmux[i];
++    return NULL;
++}
++
++static DmuxEs* find_es(u32 ea, Dmux** owner)
++{
++    for (int i = 0; i < DMUX_MAX; i++) {
++        if (!s_dmux[i].used) continue;
++        for (int j = 0; j < DMUX_MAX_ES; j++)
++            if (s_dmux[i].es[j].used && s_dmux[i].es[j].ea == ea) {
++                if (owner) *owner = &s_dmux[i];
++                return &s_dmux[i].es[j];
++            }
++    }
++    return NULL;
++}
+ 
+ /* ---------------------------------------------------------------------------
+- * Demuxer lifecycle
++ * Guest callbacks (worker thread, demuxer mutex NOT held)
+  * -----------------------------------------------------------------------*/
+ 
+-s32 cellDmuxOpen(const CellDmuxType* type, const CellDmuxResource* res,
+-                  CellDmuxCbMsg cbFunc, void* cbArg, CellDmuxHandle* handle)
++static void notify_dmux(Dmux* d, s32 type, u64 info)
+ {
+-    (void)res;
++    if (!d->cb_func || !g_ps3_guest_caller) return;
++    vm_write32(d->ea + 0, (u32)type);
++    vm_write32(d->ea + 4, 0);
++    vm_write64(d->ea + 8, info);
++    g_ps3_guest_caller(d->cb_func, d->ea, d->ea, d->cb_arg, 0, 0, 0, 0, 0);
++}
+ 
+-    printf("[cellDmux] Open(streamType=%u)\n",
+-           type ? vm_read32(GUEST_EA(type)) : 0);   /* streamType */
++static void notify_es(Dmux* d, DmuxEs* e, s32 type, u64 info)
++{
++    if (!e->cb_func || !g_ps3_guest_caller) return;
++    vm_write32(e->ea + 0, (u32)type);
++    vm_write32(e->ea + 4, 0);
++    vm_write64(e->ea + 8, info);
++    g_ps3_guest_caller(e->cb_func, d->ea, e->ea, e->ea, e->cb_arg, 0, 0, 0, 0);
++}
+ 
+-    if (!type || !handle)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++/* ---------------------------------------------------------------------------
++ * AU queue (demuxer mutex held)
++ * -----------------------------------------------------------------------*/
+ 
+-    for (int i = 0; i < CELL_DMUX_MAX_HANDLES; i++) {
+-        if (!s_dmux[i].in_use) {
+-            s_dmux[i].in_use = 1;
+-            s_dmux[i].cbFunc = cbFunc;
+-            s_dmux[i].cbArg = cbArg;
+-            s_dmux[i].streamType = vm_read32(GUEST_EA(type));
+-            s_dmux[i].streamAddr = 0;
+-            s_dmux[i].streamSize = 0;
+-            s_dmux[i].userData = 0;
+-            s_dmux[i].auSeqNo = 0;
+-            vm_write32((u32)(uintptr_t)handle, (u32)i);
+-            printf("[cellDmux] Open -> handle=%u\n", i);
+-            return CELL_OK;
+-        }
++static void es_reset_queue(DmuxEs* e)
++{
++    e->first = e->alloc = e->avail = 0;
++    e->acc_len = e->scan = 0;
++    e->au_open = e->m2v_seq = 0;
++    e->ac3_need = 0;
++    e->ts_n = 0;
++    e->au_pts = e->au_dts = TS_INVALID;
++}
++
++/* Where an AU of `size` bytes can go in the ring, or ~0u if it cannot yet
++ * (blocks are allocated in order and released oldest first). */
++static u32 ring_place(const DmuxEs* e, u32 size)
++{
++    if (size > e->ring_size) return ~0u;
++    if (!e->alloc) return 0;
++    const AuBlock* oldest = &e->blk[e->first];
++    const AuBlock* newest = &e->blk[(e->first + e->alloc - 1) % e->qmax];
++    u32 wr = newest->off + newest->size;
++    if (newest->off >= oldest->off) {
++        /* live data is [oldest.off, wr): free space after wr, then before oldest */
++        if (wr + size <= e->ring_size) return wr;
++        if (size <= oldest->off) return 0;
++        return ~0u;
+     }
+-    return (s32)CELL_DMUX_ERROR_BUSY;
++    /* wrapped: live data is [oldest.off, end) + [0, wr): free is [wr, oldest.off) */
++    if (wr + size <= oldest->off) return wr;
++    return ~0u;
+ }
+ 
+-s32 cellDmuxClose(CellDmuxHandle handle)
++static int es_can_commit(const DmuxEs* e, u32 size)
+ {
+-    printf("[cellDmux] Close(handle=%u)\n", handle);
++    /* one slot stays free for the AU a flush produces */
++    if (e->alloc + 1 >= e->qmax && !e->flush_req) return 0;
++    if (e->alloc >= e->qmax) return 0;
++    return ring_place(e, size) != ~0u;
++}
+ 
+-    if (handle >= CELL_DMUX_MAX_HANDLES || !s_dmux[handle].in_use)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++/* Copies acc[0, size) into the ring as the next AU and fills its info slot. */
++static void es_commit(Dmux* d, DmuxEs* e, u32 size, int rap)
++{
++    u32 off = ring_place(e, size);
++    u32 idx = (e->first + e->alloc) % e->qmax;
++    e->blk[idx].off = off;
++    e->blk[idx].size = size;
++    memcpy(vm_base + e->ring_base + off, e->acc, size);
++
++    u32 info = e->info_base + idx * AU_INFO_STRIDE;
++    vm_write32(info + 0x00, e->ring_base + off);
++    vm_write32(info + 0x04, size);
++    vm_write32(info + 0x08, e->au_max);
++    vm_write8 (info + 0x0C, (u8)(rap ? 1 : 0));
++    vm_write8 (info + 0x0D, 0); vm_write16(info + 0x0E, 0);
++    vm_write64(info + 0x10, d->user_data);
++    vm_write64(info + 0x18, e->au_pts);
++    vm_write64(info + 0x20, e->au_dts);
++    for (u32 k = 0; k < AU_SPEC_STRIDE; k += 4)
++        vm_write32(e->spec_base + idx * AU_SPEC_STRIDE + k, 0);
++
++    e->alloc++;
++    e->avail++;
++}
+ 
+-    /* Close associated ES handles */
+-    for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+-        if (s_es[i].in_use && s_es[i].dmuxId == handle)
+-            s_es[i].in_use = 0;
+-    }
++/* Drops acc[0, n) after an AU was cut there. */
++static void acc_consume(DmuxEs* e, u32 n)
++{
++    memmove(e->acc, e->acc + n, e->acc_len - n);
++    e->acc_len -= n;
++    e->scan = e->scan > n ? e->scan - n : 0;
++    for (u32 k = 0; k < e->ts_n; k++)
++        e->ts[k].at = e->ts[k].at > n ? e->ts[k].at - n : 0;
++}
+ 
+-    s_dmux[handle].in_use = 0;
+-    return CELL_OK;
++/* The AU now starting at acc[0] takes the waiting PES timestamps if they
++ * belong to a packet whose payload begins at or before it. */
++static void au_begin(DmuxEs* e)
++{
++    /* acc[0] is the AU start: it takes the newest timestamp whose packet
++     * payload began at or before it, and every such entry is used up. */
++    e->au_open = 1;
++    e->au_pts = e->au_dts = TS_INVALID;
++    u32 used = 0;
++    while (used < e->ts_n && e->ts[used].at == 0) {
++        e->au_pts = e->ts[used].pts;
++        e->au_dts = e->ts[used].dts;
++        used++;
++    }
++    memmove(e->ts, e->ts + used, (e->ts_n - used) * sizeof e->ts[0]);
++    e->ts_n -= used;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * ES management
++ * AU cutting. Returns 1 and the AU length in *out when a complete AU sits at
++ * acc[0]; 0 when more data is needed. Bytes before the first AU are dropped.
+  * -----------------------------------------------------------------------*/
+ 
+-s32 cellDmuxEnableEs(CellDmuxHandle handle, const CellDmuxEsFilterId* esFilterId,
+-                      const CellDmuxEsResource* esRes,
+-                      CellDmuxCbEsMsg esCbFunc, void* esCbArg,
+-                      CellDmuxEsHandle* esHandle)
++static int cut_video(DmuxEs* e, u32* out, int* rap)
+ {
+-    (void)esRes;
+-
+-    printf("[cellDmux] EnableEs(dmux=%u, major=%u, minor=%u)\n",
+-           handle,
+-           esFilterId ? vm_read32(GUEST_EA(esFilterId)
+-                        + (u32)offsetof(CellDmuxEsFilterId, filterIdMajor)) : 0,
+-           esFilterId ? vm_read32(GUEST_EA(esFilterId)
+-                        + (u32)offsetof(CellDmuxEsFilterId, filterIdMinor)) : 0);
++    const int avc = e->kind == ES_AVC;
++    u32 i = e->scan;
++    for (; i + 4 <= e->acc_len; i++) {
++        const u8* p = e->acc + i;
++        if (p[0] || p[1] || p[2] != 1) continue;
++        const u8 c = p[3];
++        const int pic = avc ? (c & 0x1f) == 9 : c == 0x00;
++        const int seq = !avc && c == 0xB3;
++        const int end = !avc && c == 0xB7;
++        if (!pic && !seq && !end) continue;
++        if (!e->au_open) {
++            if (end) continue;
++            acc_consume(e, i);
++            i = 0;
++            au_begin(e);
++            e->m2v_seq = seq;
++            continue;
++        }
++        if (i == 0) continue;
++        if (!avc && e->m2v_seq && pic) { e->m2v_seq = 0; continue; }
++        u32 len = end ? i + 4 : i;
++        e->scan = len;
++        *out = len;
++        *rap = avc ? 0 : (e->acc[3] == 0xB3);
++        return 1;
++    }
++    if (!e->au_open && e->acc_len > 3) {
++        acc_consume(e, e->acc_len - 3);
++        i = 0;
++    }
++    e->scan = i;
++    return 0;
++}
+ 
+-    if (handle >= CELL_DMUX_MAX_HANDLES || !s_dmux[handle].in_use)
+-        return (s32)CELL_DMUX_ERROR_ARG;
+-    if (!esFilterId || !esHandle)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++/* AC3 frame size in 16-bit words, by [fscod][frmsizecod] (ATSC A/52 table). */
++static const u16 k_ac3_words[3][38] = {
++    { 64, 64, 80, 80, 96, 96, 112, 112, 128, 128, 160, 160, 192, 192, 224, 224,
++      256, 256, 320, 320, 384, 384, 448, 448, 512, 512, 640, 640, 768, 768,
++      896, 896, 1024, 1024, 1152, 1152, 1280, 1280 },
++    { 69, 70, 87, 88, 104, 105, 121, 122, 139, 140, 174, 175, 208, 209, 243, 244,
++      278, 279, 348, 349, 417, 418, 487, 488, 557, 558, 696, 697, 835, 836,
++      975, 976, 1114, 1115, 1253, 1254, 1393, 1394 },
++    { 96, 96, 120, 120, 144, 144, 168, 168, 192, 192, 240, 240, 288, 288, 336, 336,
++      384, 384, 480, 480, 576, 576, 672, 672, 768, 768, 960, 960, 1152, 1152,
++      1344, 1344, 1536, 1536, 1728, 1728, 1920, 1920 },
++};
++
++static int cut_ac3(DmuxEs* e, u32* out, int* rap)
++{
++    for (;;) {
++        if (!e->au_open) {
++            u32 i = 0;
++            while (i + 1 < e->acc_len && !(e->acc[i] == 0x0B && e->acc[i + 1] == 0x77)) i++;
++            acc_consume(e, i);
++            if (e->acc_len < 2) return 0;
++            au_begin(e);
++            e->ac3_need = 0;
++        }
++        if (!e->ac3_need) {
++            if (e->acc_len < 5) return 0;
++            const u8 fscod = e->acc[4] >> 6, frm = e->acc[4] & 0x3f;
++            if (fscod >= 3 || frm >= 38) {          /* not a frame: resync */
++                e->au_open = 0;
++                acc_consume(e, 1);
++                continue;
++            }
++            e->ac3_need = k_ac3_words[fscod][frm] * 2u;
++        }
++        if (e->acc_len < e->ac3_need) return 0;
++        *out = e->ac3_need;
++        *rap = 1;
++        return 1;
++    }
++}
+ 
+-    for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+-        if (!s_es[i].in_use) {
+-            s_es[i].in_use = 1;
+-            s_es[i].dmuxId = handle;
+-            guest_struct_load(&s_es[i].filterId, GUEST_EA(esFilterId),
+-                              (u32)sizeof(s_es[i].filterId));
+-            s_es[i].esCbFunc = esCbFunc;
+-            s_es[i].esCbArg = esCbArg;
+-            s_es[i].hasAu = 0;
+-            memset(&s_es[i].currentAu, 0, sizeof(CellDmuxAuInfo));
+-            vm_write32((u32)(uintptr_t)esHandle, (u32)i);
+-            return CELL_OK;
++/* Cuts every complete AU out of acc. Returns 0 when it stopped because the
++ * queue is full (the worker then waits for ReleaseAu), 1 otherwise. */
++static int es_drain(Dmux* d, DmuxEs* e, int* found)
++{
++    for (;;) {
++        u32 len = 0; int rap = 0, have = 0;
++        if (e->kind == ES_M2V || e->kind == ES_AVC) have = cut_video(e, &len, &rap);
++        else if (e->kind == ES_AC3)                 have = cut_ac3(e, &len, &rap);
++        else { e->acc_len = e->scan = 0; return 1; }
++        if (!have) return 1;
++        if (len > e->au_max) {                      /* oversized: drop it */
++            fprintf(stderr, "[cellDmux] es 0x%08X: %u-byte AU exceeds %u, dropped\n",
++                    e->ea, len, e->au_max);
++            e->au_open = 0;
++            acc_consume(e, len);
++            continue;
+         }
++        if (!es_can_commit(e, len)) return 0;
++        es_commit(d, e, len, rap);
++        (*found)++;
++        e->au_open = 0;
++        e->ac3_need = 0;
++        acc_consume(e, len);
++        /* the next AU starts right here for video (its delimiter is at 0) */
+     }
+-    return (s32)CELL_DMUX_ERROR_BUSY;
+ }
+ 
+-s32 cellDmuxDisableEs(CellDmuxEsHandle esHandle)
++static void acc_append(DmuxEs* e, const u8* p, u32 n)
+ {
+-    printf("[cellDmux] DisableEs(es=%u)\n", esHandle);
++    if (e->acc_len + n > e->acc_cap) {
++        u32 cap = e->acc_cap ? e->acc_cap : 0x10000;
++        while (cap < e->acc_len + n) cap *= 2;
++        e->acc = (u8*)realloc(e->acc, cap);
++        e->acc_cap = cap;
++    }
++    memcpy(e->acc + e->acc_len, p, n);
++    e->acc_len += n;
++}
+ 
+-    if (esHandle >= CELL_DMUX_MAX_ES || !s_es[esHandle].in_use)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++/* ---------------------------------------------------------------------------
++ * Program stream parsing
++ * -----------------------------------------------------------------------*/
+ 
+-    s_es[esHandle].in_use = 0;
+-    return CELL_OK;
++static u64 read_ts(const u8* p)
++{
++    return ((u64)((p[0] >> 1) & 7) << 30) | ((u64)p[1] << 22) |
++           ((u64)(p[2] >> 1) << 15) | ((u64)p[3] << 7) | (p[4] >> 1);
++}
++
++/* Length of the pack/packet at p (n bytes available), 0 if incomplete, or
++ * ~0u if p is not at a start code (resync by one byte). */
++static u32 ps_unit_len(const u8* p, u32 n)
++{
++    if (n < 4) return 0;
++    if (p[0] || p[1] || p[2] != 1) return ~0u;
++    const u8 c = p[3];
++    if (c == 0xBA) {                               /* MPEG-2 pack header */
++        if (n < 14) return 0;
++        return 14u + (p[13] & 7);
++    }
++    if (c == 0xB9) return 4;                       /* program end */
++    if (c < 0xBB) return ~0u;
++    if (n < 6) return 0;
++    return 6u + ((u32)p[4] << 8 | p[5]);
++}
++
++/* Routes one PES packet to its ES. Returns 1 if that ES got data. */
++static int ps_pes(Dmux* d, const u8* p, u32 len)
++{
++    const u8 sid = p[3];
++    if (sid != 0xBD && (sid & 0xf0) != 0xe0) return 0;
++    if (len < 9 || (p[6] & 0xC0) != 0x80) return 0;
++    const u32 hdr = 9u + p[8];
++    if (hdr > len) return 0;
++    const u8* pay = p + hdr;
++    u32 n = len - hdr;
++    u8 psid = 0;
++    if (sid == 0xBD) {
++        if (n < 4) return 0;
++        psid = pay[0];
++        pay += 4; n -= 4;                          /* sub-stream header */
++    }
++    for (int j = 0; j < DMUX_MAX_ES; j++) {
++        DmuxEs* e = &d->es[j];
++        if (!e->used || e->sid != sid || (sid == 0xBD && e->psid != psid)) continue;
++        if (p[7] & 0x80) {                         /* PTS (and maybe DTS) */
++            if (e->ts_n == sizeof e->ts / sizeof e->ts[0]) {   /* keep the newest */
++                memmove(e->ts, e->ts + 1, (e->ts_n - 1) * sizeof e->ts[0]);
++                e->ts_n--;
++            }
++            e->ts[e->ts_n].pts = read_ts(p + 9);
++            e->ts[e->ts_n].dts = (p[7] & 0x40) ? read_ts(p + 14) : e->ts[e->ts_n].pts;
++            e->ts[e->ts_n].at = e->acc_len;      /* first AU starting from here on */
++            e->ts_n++;
++        }
++        acc_append(e, pay, n);
++        return 1;
++    }
++    return 0;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * Data feeding
++ * Worker
+  * -----------------------------------------------------------------------*/
+ 
+-s32 cellDmuxSetStream(CellDmuxHandle handle, u32 streamAddr, u32 streamSize,
+-                       b8 discontinuity, u64 userData)
++#ifdef _WIN32
++static unsigned __stdcall dmux_worker(void* arg)
++#else
++static void* dmux_worker(void* arg)
++#endif
+ {
+-    printf("[cellDmux] SetStream(handle=%u, addr=0x%X, size=%u, discont=%d)\n",
+-           handle, streamAddr, streamSize, discontinuity);
+-
+-    if (handle >= CELL_DMUX_MAX_HANDLES || !s_dmux[handle].in_use)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++    Dmux* d = (Dmux*)arg;
++    dmx_mutex_lock(&d->mtx);
++    for (;;) {
++        if (d->quit) break;
++
++        /* ES-level requests: reset (drop everything), flush (emit the
++         * partial AU, then FLUSH_DONE) */
++        int did = 0;
++        for (int j = 0; j < DMUX_MAX_ES && !did; j++) {
++            DmuxEs* e = &d->es[j];
++            if (!e->used) continue;
++            if (e->reset_req) { es_reset_queue(e); e->reset_req = 0; dmx_cond_bcast(&d->cv); }
++            if (e->flush_req) {
++                int found = 0;
++                es_drain(d, e, &found);
++                if (e->au_open && e->acc_len && es_can_commit(e, e->acc_len) &&
++                    e->acc_len <= e->au_max) {
++                    es_commit(d, e, e->acc_len, 0);
++                    found++;
++                    e->au_open = 0;
++                    acc_consume(e, e->acc_len);
++                }
++                e->flush_req = 0;
++                d->busy_cb = 1;
++                dmx_mutex_unlock(&d->mtx);
++                for (int k = 0; k < found; k++) notify_es(d, e, CELL_DMUX_ES_MSG_TYPE_AU_FOUND, d->user_data);
++                notify_es(d, e, CELL_DMUX_ES_MSG_TYPE_FLUSH_DONE, d->user_data);
++                dmx_mutex_lock(&d->mtx);
++                d->busy_cb = 0;
++                dmx_cond_bcast(&d->cv);
++                did = 1;
++            }
++        }
++        if (did) continue;
++
++        if (d->reset_req) {
++            d->reset_req = 0;
++            d->buf_len = 0;
++            const int was = d->running;
++            d->running = 0;
++            if (was) {
++                d->busy_cb = 1;
++                dmx_mutex_unlock(&d->mtx);
++                notify_dmux(d, CELL_DMUX_MSG_TYPE_DEMUX_DONE, d->user_data);
++                dmx_mutex_lock(&d->mtx);
++                d->busy_cb = 0;
++            }
++            dmx_cond_bcast(&d->cv);
++            continue;
++        }
+ 
+-    DmuxSlot* dmux = &s_dmux[handle];
++        if (!d->running) { dmx_cond_wait(&d->cv, &d->mtx); continue; }
++
++        /* First empty whatever is already cut; a full queue stalls here
++         * until the caller releases AUs. */
++        int stalled = 0;
++        for (int j = 0; j < DMUX_MAX_ES; j++) {
++            DmuxEs* e = &d->es[j];
++            if (!e->used) continue;
++            int found = 0;
++            if (!es_drain(d, e, &found)) stalled = 1;
++            if (found) {
++                d->busy_cb = 1;
++                dmx_mutex_unlock(&d->mtx);
++                for (int k = 0; k < found; k++) notify_es(d, e, CELL_DMUX_ES_MSG_TYPE_AU_FOUND, d->user_data);
++                dmx_mutex_lock(&d->mtx);
++                d->busy_cb = 0;
++                did = 1;
++            }
++        }
++        if (did) continue;
++        if (stalled) { dmx_cond_wait(&d->cv, &d->mtx); continue; }
++
++        /* Stage the next stream bytes, then parse every complete pack or
++         * packet at the front of the stage. What is left is an incomplete
++         * unit, kept for the next pass or the next SetStream. */
++        int prog_end = 0;
++        {
++            u32 room = (u32)sizeof d->buf - d->buf_len;
++            u32 take = d->s_size - d->s_pos;
++            if (take > room) take = room;
++            if (take > 0x8000) take = 0x8000;
++            memcpy(d->buf + d->buf_len, vm_base + d->s_ea + d->s_pos, take);
++            d->buf_len += take;
++            d->s_pos += take;
++            u32 at = 0;
++            for (;;) {
++                u32 ul = ps_unit_len(d->buf + at, d->buf_len - at);
++                if (ul == 0) break;
++                if (ul == ~0u) { at++; continue; }     /* resync on the next start code */
++                if (ul > d->buf_len - at) {
++                    if (ul > sizeof d->buf) at++;      /* cannot be a real packet */
++                    break;
++                }
++                const u8* u = d->buf + at;
++                if (u[3] == 0xB9) prog_end = 1;
++                else if (u[3] != 0xBA) ps_pes(d, u, ul);
++                at += ul;
++            }
++            memmove(d->buf, d->buf + at, d->buf_len - at);
++            d->buf_len -= at;
++        }
+ 
+-    /* Track the stream data */
+-    dmux->streamAddr = streamAddr;
+-    dmux->streamSize = streamSize;
+-    dmux->userData = userData;
++        if (prog_end) {
++            d->busy_cb = 1;
++            dmx_mutex_unlock(&d->mtx);
++            notify_dmux(d, CELL_DMUX_MSG_TYPE_PROG_END_CODE, d->user_data);
++            dmx_mutex_lock(&d->mtx);
++            d->busy_cb = 0;
++        }
+ 
+-    if (discontinuity) {
+-        /* On discontinuity, reset AU sequence and clear pending AUs */
+-        dmux->auSeqNo = 0;
+-        for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+-            if (s_es[i].in_use && s_es[i].dmuxId == handle)
+-                s_es[i].hasAu = 0;
++        if (d->s_pos >= d->s_size) {
++            /* Whole buffer parsed. DEMUX_DONE only once every AU it held
++             * has been cut and queued. */
++            int pending = 0;
++            for (int j = 0; j < DMUX_MAX_ES; j++) {
++                DmuxEs* e = &d->es[j];
++                if (!e->used) continue;
++                int found = 0;
++                if (!es_drain(d, e, &found)) pending = 1;
++                if (found) {
++                    d->busy_cb = 1;
++                    dmx_mutex_unlock(&d->mtx);
++                    for (int k = 0; k < found; k++) notify_es(d, e, CELL_DMUX_ES_MSG_TYPE_AU_FOUND, d->user_data);
++                    dmx_mutex_lock(&d->mtx);
++                    d->busy_cb = 0;
++                }
++            }
++            if (pending) { dmx_cond_wait(&d->cv, &d->mtx); continue; }
++            d->running = 0;
++            d->busy_cb = 1;
++            dmx_mutex_unlock(&d->mtx);
++            notify_dmux(d, CELL_DMUX_MSG_TYPE_DEMUX_DONE, d->user_data);
++            dmx_mutex_lock(&d->mtx);
++            d->busy_cb = 0;
++            dmx_cond_bcast(&d->cv);
+         }
+     }
++    dmx_mutex_unlock(&d->mtx);
++#ifdef _WIN32
++    return 0;
++#else
++    return NULL;
++#endif
++}
+ 
+-    /*
+-     * Synthesize one AU per enabled ES from the entire stream buffer.
+-     * Real demux would parse PES/MPEG-TS headers; here we present the
+-     * whole input as a single Access Unit per elementary stream, which
+-     * is sufficient for games that simply shuttle data through the
+-     * demux -> vdec/adec pipeline.
+-     */
+-    for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+-        if (!s_es[i].in_use || s_es[i].dmuxId != handle)
+-            continue;
++/* ---------------------------------------------------------------------------
++ * API
++ * -----------------------------------------------------------------------*/
+ 
+-        DmuxEsSlot* es = &s_es[i];
+-
+-        /* Fill in AU info — treat entire stream as one AU */
+-        es->currentAu.auAddr = streamAddr;
+-        es->currentAu.auSize = streamSize;
+-        es->currentAu.pts    = (u64)dmux->auSeqNo * 3003; /* ~29.97 fps tick */
+-        es->currentAu.dts    = es->currentAu.pts;
+-        es->currentAu.userData = userData;
+-        es->currentAu.isRap  = (dmux->auSeqNo == 0) ? 1 : 0;
+-        es->currentAu.reserved = 0;
+-        es->hasAu = 1;
+-
+-        printf("[cellDmux] ES %d: AU_FOUND (addr=0x%X, size=%u, pts=%llu)\n",
+-               i, streamAddr, streamSize, (unsigned long long)es->currentAu.pts);
+-
+-        /* Fire AU_FOUND callback */
+-        if (es->esCbFunc)
+-            es->esCbFunc(handle, (u32)i,
+-                         CELL_DMUX_ES_MSG_TYPE_AU_FOUND,
+-                         0, es->esCbArg);
+-    }
++static u32 ea_of(const void* p) { return (u32)(uintptr_t)p; }
+ 
+-    dmux->auSeqNo++;
++s32 cellDmuxQueryAttr(const void* demuxerType, void* demuxerAttr)
++{
++    u32 t = ea_of(demuxerType), a = ea_of(demuxerAttr);
++    if (!t || !a || (s32)vm_read32(t) != CELL_DMUX_STREAM_TYPE_PAMF)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    vm_write32(a + 0, DMUX_HANDLE_MEM + 0xF);
++    vm_write32(a + 4, DMUX_VER_UPPER);
++    vm_write32(a + 8, 0);
++    return CELL_OK;
++}
+ 
+-    /* Signal demux completion after all ES callbacks have fired */
+-    if (dmux->cbFunc)
+-        dmux->cbFunc(handle, CELL_DMUX_MSG_TYPE_DEMUX_DONE,
+-                     0, dmux->cbArg);
++static s32 dmux_open(u32 type, u32 mem_addr, u32 mem_size, u32 cb, u32 out)
++{
++    if (!type || (s32)vm_read32(type) != CELL_DMUX_STREAM_TYPE_PAMF || !mem_addr ||
++        !cb || !vm_read32(cb) || !out)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    const u32 ea = (mem_addr + 0xF) & ~0xFu;
++    if (ea + DMUX_HANDLE_MEM > mem_addr + mem_size)
++        return (s32)CELL_DMUX_ERROR_ARG;
+ 
++    table_lock();
++    Dmux* d = NULL;
++    for (int i = 0; i < DMUX_MAX; i++)
++        if (!s_dmux[i].used) { d = &s_dmux[i]; break; }
++    if (!d) { dmx_mutex_unlock(&s_table_mtx); return (s32)CELL_DMUX_ERROR_FATAL; }
++    memset(d, 0, sizeof *d);
++    d->used = 1;
++    d->ea = ea;
++    d->cb_func = vm_read32(cb);
++    d->cb_arg = vm_read32(cb + 4);
++    dmx_mutex_init(&d->mtx);
++    dmx_cond_init(&d->cv);
++#ifdef _WIN32
++    d->thr = (HANDLE)_beginthreadex(NULL, 0, dmux_worker, d, 0, NULL);
++#else
++    pthread_create(&d->thr, NULL, dmux_worker, d);
++#endif
++    dmx_mutex_unlock(&s_table_mtx);
++
++    vm_write32(out, ea);
++    printf("[cellDmux] Open -> handle 0x%08X\n", ea);
+     return CELL_OK;
+ }
+ 
+-s32 cellDmuxResetStream(CellDmuxHandle handle)
++s32 cellDmuxOpen(const void* demuxerType, const void* demuxerResource,
++                 const void* demuxerCb, u32* demuxerHandle)
+ {
+-    printf("[cellDmux] ResetStream(handle=%u)\n", handle);
++    u32 r = ea_of(demuxerResource);
++    if (!r) return (s32)CELL_DMUX_ERROR_ARG;
++    return dmux_open(ea_of(demuxerType), vm_read32(r), vm_read32(r + 4),
++                     ea_of(demuxerCb), ea_of(demuxerHandle));
++}
+ 
+-    if (handle >= CELL_DMUX_MAX_HANDLES || !s_dmux[handle].in_use)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++s32 cellDmuxOpenEx(const void* demuxerType, const void* demuxerResourceEx,
++                   const void* demuxerCb, u32* demuxerHandle)
++{
++    return cellDmuxOpen(demuxerType, demuxerResourceEx, demuxerCb, demuxerHandle);
++}
+ 
+-    /* Clear pending AUs from all ES handles and reset stream tracking */
+-    for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+-        if (s_es[i].in_use && s_es[i].dmuxId == handle)
+-            s_es[i].hasAu = 0;
+-    }
+-    s_dmux[handle].streamAddr = 0;
+-    s_dmux[handle].streamSize = 0;
+-    s_dmux[handle].auSeqNo = 0;
++s32 cellDmuxOpenExt(const void* demuxerType, const void* demuxerResourceEx,
++                    const void* demuxerCb, u32* demuxerHandle)
++{
++    return cellDmuxOpen(demuxerType, demuxerResourceEx, demuxerCb, demuxerHandle);
++}
+ 
++s32 cellDmuxClose(u32 demuxerHandle)
++{
++    Dmux* d = find_dmux(demuxerHandle);
++    if (!d) return (s32)CELL_DMUX_ERROR_ARG;
++    dmx_mutex_lock(&d->mtx);
++    d->quit = 1;
++    dmx_cond_bcast(&d->cv);
++    dmx_mutex_unlock(&d->mtx);
++#ifdef _WIN32
++    WaitForSingleObject(d->thr, INFINITE);
++    CloseHandle(d->thr);
++#else
++    pthread_join(d->thr, NULL);
++#endif
++    table_lock();
++    for (int j = 0; j < DMUX_MAX_ES; j++) free(d->es[j].acc);
++    dmx_cond_fini(&d->cv);
++    dmx_mutex_fini(&d->mtx);
++    d->used = 0;
++    dmx_mutex_unlock(&s_table_mtx);
++    printf("[cellDmux] Close(0x%08X)\n", demuxerHandle);
+     return CELL_OK;
+ }
+ 
+-s32 cellDmuxResetStreamAndWaitDone(CellDmuxHandle handle)
++s32 cellDmuxSetStream(u32 demuxerHandle, u32 streamAddress, u32 streamSize,
++                      u32 discontinuity, u64 userData)
+ {
+-    return cellDmuxResetStream(handle);
++    Dmux* d = find_dmux(demuxerHandle);
++    if (!d || !streamAddress || !streamSize || streamSize == 0xFFFFFFFFu)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    dmx_mutex_lock(&d->mtx);
++    if (d->running || d->reset_req) {
++        dmx_mutex_unlock(&d->mtx);
++        return (s32)CELL_DMUX_ERROR_BUSY;
++    }
++    if (discontinuity & 0xFF) {
++        d->buf_len = 0;
++        for (int j = 0; j < DMUX_MAX_ES; j++) {
++            DmuxEs* e = &d->es[j];
++            if (!e->used) continue;
++            e->acc_len = e->scan = 0;
++            e->au_open = e->m2v_seq = 0;
++            e->ac3_need = 0;
++            e->ts_n = 0;
++        }
++    }
++    d->s_ea = streamAddress;
++    d->s_size = streamSize;
++    d->s_pos = 0;
++    d->user_data = userData;
++    d->running = 1;
++    dmx_cond_bcast(&d->cv);
++    dmx_mutex_unlock(&d->mtx);
++    return CELL_OK;
+ }
+ 
+-/* ---------------------------------------------------------------------------
+- * AU retrieval
+- * -----------------------------------------------------------------------*/
++s32 cellDmuxResetStream(u32 demuxerHandle)
++{
++    Dmux* d = find_dmux(demuxerHandle);
++    if (!d) return (s32)CELL_DMUX_ERROR_ARG;
++    dmx_mutex_lock(&d->mtx);
++    if (d->running) {
++        d->reset_req = 1;
++        dmx_cond_bcast(&d->cv);
++    }
++    dmx_mutex_unlock(&d->mtx);
++    return CELL_OK;
++}
+ 
+-s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, CellDmuxAuInfo** auInfo, u32* auInfoNum)
++s32 cellDmuxResetStreamAndWaitDone(u32 demuxerHandle)
+ {
+-    if (esHandle >= CELL_DMUX_MAX_ES || !s_es[esHandle].in_use)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++    Dmux* d = find_dmux(demuxerHandle);
++    if (!d) return (s32)CELL_DMUX_ERROR_ARG;
++    cellDmuxResetStream(demuxerHandle);
++    dmx_mutex_lock(&d->mtx);
++    while ((d->reset_req || d->running) && !on_worker(d)) dmx_cond_wait(&d->cv, &d->mtx);
++    dmx_mutex_unlock(&d->mtx);
++    return CELL_OK;
++}
+ 
+-    if (!s_es[esHandle].hasAu)
+-        return (s32)CELL_DMUX_ERROR_EMPTY;
++/* The ES-specific info the caller passes picks the AU and buffer sizes:
++ * M2V { u32 profileLevel }, AVC { u32 level }. */
++static void es_levels(int kind, u32 info, u32* m2v_pl, u32* avc_level)
++{
++    *m2v_pl = 0xFF; *avc_level = 0;
++    if (!info) return;
++    if (kind == ES_M2V) *m2v_pl = vm_read32(info);
++    if (kind == ES_AVC) *avc_level = vm_read32(info);
++}
+ 
+-    if (auInfo)
+-        *auInfo = &s_es[esHandle].currentAu;
+-    if (auInfoNum)
+-        vm_write32((u32)(uintptr_t)auInfoNum, (u32)1);
++s32 cellDmuxQueryEsAttr(const void* demuxerType, const void* esFilterId,
++                        const void* esSpecificInfo, void* esAttr)
++{
++    u32 t = ea_of(demuxerType), f = ea_of(esFilterId), a = ea_of(esAttr);
++    if (!t || !f || !a || (s32)vm_read32(t) != CELL_DMUX_STREAM_TYPE_PAMF)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    int kind = es_kind(vm_read32(f), vm_read32(f + 4), vm_read32(f + 8));
++    if (kind == ES_BAD) return (s32)CELL_DMUX_ERROR_ARG;
++    u32 pl, lv;
++    es_levels(kind, ea_of(esSpecificInfo), &pl, &lv);
++    vm_write32(a, es_mem_size(kind, pl, lv));
++    return CELL_OK;
++}
+ 
++s32 cellDmuxEnableEs(u32 demuxerHandle, const void* esFilterId,
++                     const void* esResourceInfo, const void* esCb,
++                     const void* esSpecificInfo, u32* esHandle)
++{
++    Dmux* d = find_dmux(demuxerHandle);
++    u32 f = ea_of(esFilterId), r = ea_of(esResourceInfo), cb = ea_of(esCb), out = ea_of(esHandle);
++    if (!d || !f || !r || !vm_read32(r) || !cb || !vm_read32(cb) || !out)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    const u32 sid = vm_read32(f), psid = vm_read32(f + 4);
++    int kind = es_kind(sid, psid, vm_read32(f + 8));
++    if (kind == ES_BAD) return (s32)CELL_DMUX_ERROR_ARG;
++    u32 pl, lv;
++    es_levels(kind, ea_of(esSpecificInfo), &pl, &lv);
++
++    const u32 mem = vm_read32(r), size = vm_read32(r + 4);
++    const u32 ea = (mem + 0xF) & ~0xFu;
++    const u32 qmax = es_queue_max(kind) + 1;
++    const u32 info_base = ea + ES_MSG_SIZE;
++    const u32 spec_base = info_base + qmax * AU_INFO_STRIDE;
++    const u32 ring_base = (spec_base + qmax * AU_SPEC_STRIDE + 0x7F) & ~0x7Fu;
++    if (ring_base >= mem + size) return (s32)CELL_DMUX_ERROR_ARG;
++
++    dmx_mutex_lock(&d->mtx);
++    DmuxEs* e = NULL;
++    for (int j = 0; j < DMUX_MAX_ES; j++) {
++        if (d->es[j].used && d->es[j].sid == sid && (sid != 0xBD || d->es[j].psid == psid)) {
++            dmx_mutex_unlock(&d->mtx);
++            return (s32)CELL_DMUX_ERROR_ARG;           /* already enabled */
++        }
++        if (!d->es[j].used && !e) e = &d->es[j];
++    }
++    if (!e) { dmx_mutex_unlock(&d->mtx); return (s32)CELL_DMUX_ERROR_ARG; }
++    u8* keep = e->acc; u32 keep_cap = e->acc_cap;
++    memset(e, 0, sizeof *e);
++    e->acc = keep; e->acc_cap = keep_cap;
++    e->used = 1;
++    e->ea = ea;
++    e->sid = sid; e->psid = psid;
++    e->kind = kind;
++    e->cb_func = vm_read32(cb);
++    e->cb_arg = vm_read32(cb + 4);
++    e->info_base = info_base;
++    e->spec_base = spec_base;
++    e->ring_base = ring_base;
++    e->ring_size = mem + size - ring_base;
++    e->au_max = es_au_max(kind, pl, lv);
++    e->qmax = qmax;
++    es_reset_queue(e);
++    dmx_mutex_unlock(&d->mtx);
++
++    vm_write32(out, ea);
++    printf("[cellDmux] EnableEs(0x%08X, sid=0x%02X psid=0x%02X) -> 0x%08X ring=%u au_max=%u\n",
++           demuxerHandle, sid, psid, ea, e->ring_size, e->au_max);
+     return CELL_OK;
+ }
+ 
+-s32 cellDmuxPeekAu(CellDmuxEsHandle esHandle, CellDmuxAuInfo** auInfo, u32* auInfoNum)
++s32 cellDmuxDisableEs(u32 esHandle)
+ {
+-    return cellDmuxGetAu(esHandle, auInfo, auInfoNum);
++    Dmux* d = NULL;
++    DmuxEs* e = find_es(esHandle, &d);
++    if (!e) return (s32)CELL_DMUX_ERROR_ARG;
++    dmx_mutex_lock(&d->mtx);
++    while (d->busy_cb && !on_worker(d)) dmx_cond_wait(&d->cv, &d->mtx);
++    e->used = 0;
++    dmx_cond_bcast(&d->cv);
++    dmx_mutex_unlock(&d->mtx);
++    return CELL_OK;
+ }
+ 
+-s32 cellDmuxReleaseAu(CellDmuxEsHandle esHandle)
++s32 cellDmuxResetEs(u32 esHandle)
+ {
+-    if (esHandle >= CELL_DMUX_MAX_ES || !s_es[esHandle].in_use)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++    Dmux* d = NULL;
++    DmuxEs* e = find_es(esHandle, &d);
++    if (!e) return (s32)CELL_DMUX_ERROR_ARG;
++    dmx_mutex_lock(&d->mtx);
++    e->reset_req = 1;
++    dmx_cond_bcast(&d->cv);
++    dmx_mutex_unlock(&d->mtx);
++    return CELL_OK;
++}
+ 
+-    s_es[esHandle].hasAu = 0;
++s32 cellDmuxFlushEs(u32 esHandle)
++{
++    Dmux* d = NULL;
++    DmuxEs* e = find_es(esHandle, &d);
++    if (!e) return (s32)CELL_DMUX_ERROR_ARG;
++    dmx_mutex_lock(&d->mtx);
++    e->flush_req = 1;
++    dmx_cond_bcast(&d->cv);
++    dmx_mutex_unlock(&d->mtx);
+     return CELL_OK;
+ }
+ 
+-s32 cellDmuxFlushEs(CellDmuxEsHandle esHandle)
++static s32 take_au(u32 esHandle, u32 info_out, u32 spec_out, int peek)
+ {
+-    printf("[cellDmux] FlushEs(es=%u)\n", esHandle);
++    Dmux* d = NULL;
++    DmuxEs* e = find_es(esHandle, &d);
++    if (!e) return (s32)CELL_DMUX_ERROR_ARG;
++    dmx_mutex_lock(&d->mtx);
++    if (!e->avail) { dmx_mutex_unlock(&d->mtx); return (s32)CELL_DMUX_ERROR_EMPTY; }
++    u32 idx = (e->first + e->alloc - e->avail) % e->qmax;
++    if (info_out) vm_write32(info_out, e->info_base + idx * AU_INFO_STRIDE);
++    if (spec_out) vm_write32(spec_out, e->spec_base + idx * AU_SPEC_STRIDE);
++    if (!peek) e->avail--;
++    dmx_mutex_unlock(&d->mtx);
++    return CELL_OK;
++}
+ 
+-    if (esHandle >= CELL_DMUX_MAX_ES || !s_es[esHandle].in_use)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++s32 cellDmuxGetAu(u32 esHandle, u32* auInfo, u32* auSpecificInfo)
++{ return take_au(esHandle, ea_of(auInfo), ea_of(auSpecificInfo), 0); }
+ 
+-    s_es[esHandle].hasAu = 0;
++s32 cellDmuxPeekAu(u32 esHandle, u32* auInfo, u32* auSpecificInfo)
++{ return take_au(esHandle, ea_of(auInfo), ea_of(auSpecificInfo), 1); }
+ 
+-    if (s_es[esHandle].esCbFunc)
+-        s_es[esHandle].esCbFunc(s_es[esHandle].dmuxId, esHandle,
+-                                 CELL_DMUX_ES_MSG_TYPE_FLUSH_DONE,
+-                                 0, s_es[esHandle].esCbArg);
++s32 cellDmuxGetAuEx(u32 esHandle, u32* auInfoEx, u32* auSpecificInfo)
++{ return take_au(esHandle, ea_of(auInfoEx), ea_of(auSpecificInfo), 0); }
+ 
++s32 cellDmuxPeekAuEx(u32 esHandle, u32* auInfoEx, u32* auSpecificInfo)
++{ return take_au(esHandle, ea_of(auInfoEx), ea_of(auSpecificInfo), 1); }
++
++s32 cellDmuxReleaseAu(u32 esHandle)
++{
++    Dmux* d = NULL;
++    DmuxEs* e = find_es(esHandle, &d);
++    if (!e) return (s32)CELL_DMUX_ERROR_ARG;
++    dmx_mutex_lock(&d->mtx);
++    if (!e->alloc) { dmx_mutex_unlock(&d->mtx); return (s32)CELL_DMUX_ERROR_SEQ; }
++    /* Releasing an AU nobody took also takes it off the available list. */
++    if (e->avail == e->alloc) e->avail--;
++    e->first = (e->first + 1) % e->qmax;
++    e->alloc--;
++    dmx_cond_bcast(&d->cv);
++    dmx_mutex_unlock(&d->mtx);
+     return CELL_OK;
+ }
+diff --git a/libs/codec/cellDmux.h b/libs/codec/cellDmux.h
+index 8f1ecf3..21b680e 100644
+--- a/libs/codec/cellDmux.h
++++ b/libs/codec/cellDmux.h
+@@ -1,10 +1,12 @@
+ /*
+- * ps3recomp - cellDmux HLE
++ * ps3recomp - cellDmux HLE: PAMF (MPEG-2 program stream) demultiplexer
+  *
+- * AV stream demultiplexer. Splits multiplexed PAMF streams into
+- * individual elementary streams (ES) for feeding to cellVdec/cellAdec.
++ * Every pointer argument below is a GUEST address carried in a host pointer
++ * type (the HLE bridge passes r3..r10 through unchanged), and every structure
++ * lives in guest memory in big-endian. Offsets are listed beside each layout;
++ * code reads and writes them with vm_read/vm_write, never through a host
++ * struct. Layouts per RPCS3's cellDmux.h / cellPamf.h (field order and sizes).
+  */
+-
+ #ifndef PS3RECOMP_CELL_DMUX_H
+ #define PS3RECOMP_CELL_DMUX_H
+ 
+@@ -15,25 +17,14 @@
+ extern "C" {
+ #endif
+ 
+-/* ---------------------------------------------------------------------------
+- * Error codes
+- * -----------------------------------------------------------------------*/
+ #define CELL_DMUX_ERROR_ARG            0x80610201
+ #define CELL_DMUX_ERROR_SEQ            0x80610202
+ #define CELL_DMUX_ERROR_BUSY           0x80610203
+ #define CELL_DMUX_ERROR_EMPTY          0x80610204
+ #define CELL_DMUX_ERROR_FATAL          0x80610205
+ 
+-/* ---------------------------------------------------------------------------
+- * Constants
+- * -----------------------------------------------------------------------*/
+-#define CELL_DMUX_MAX_HANDLES          8
+-#define CELL_DMUX_MAX_ES               16
+-
+-/* Demux types */
+-#define CELL_DMUX_TYPE_PAMF            0
++#define CELL_DMUX_STREAM_TYPE_PAMF     1
+ 
+-/* ES message types (delivered via callback) */
+ #define CELL_DMUX_MSG_TYPE_DEMUX_DONE      0
+ #define CELL_DMUX_MSG_TYPE_FATAL_ERR       1
+ #define CELL_DMUX_MSG_TYPE_PROG_END_CODE   2
+@@ -41,92 +32,57 @@ extern "C" {
+ #define CELL_DMUX_ES_MSG_TYPE_AU_FOUND     0
+ #define CELL_DMUX_ES_MSG_TYPE_FLUSH_DONE   1
+ 
+-/* ---------------------------------------------------------------------------
+- * Types
+- * -----------------------------------------------------------------------*/
+-
+-typedef u32 CellDmuxHandle;
+-typedef u32 CellDmuxEsHandle;
+-
+-typedef struct CellDmuxType {
+-    u32 streamType;
+-    u32 reserved[3];
+-} CellDmuxType;
+-
+-typedef struct CellDmuxResource {
+-    u32 memAddr;
+-    u32 memSize;
+-    u32 ppuThreadPrio;
+-    u32 ppuThreadStackSize;
+-    u32 spuThreadPrio;
+-    u32 numOfSpus;
+-} CellDmuxResource;
+-
+-typedef struct CellDmuxEsFilterId {
+-    u8 filterIdMajor;
+-    u8 filterIdMinor;
+-    u8 supplementalInfo1;
+-    u8 supplementalInfo2;
+-} CellDmuxEsFilterId;
+-
+-typedef struct CellDmuxEsResource {
+-    u32 memAddr;
+-    u32 memSize;
+-} CellDmuxEsResource;
+-
+-typedef struct CellDmuxAuInfo {
+-    u32 auAddr;
+-    u32 auSize;
+-    u64 pts;
+-    u64 dts;
+-    u64 userData;
+-    u32 isRap;       /* random access point */
+-    u32 reserved;
+-} CellDmuxAuInfo;
+-
+-typedef struct CellDmuxAuInfoEx {
+-    u32 auAddr;
+-    u32 auSize;
+-    u64 pts;
+-    u64 dts;
+-    u64 userData;
+-    u32 isRap;
+-    u32 reserved;
+-    u32 auSpecificInfo;
+-} CellDmuxAuInfoEx;
+-
+-/* Callback types */
+-typedef u32 (*CellDmuxCbMsg)(u32 handle, u32 msgType, u32 msgData, void* cbArg);
+-typedef u32 (*CellDmuxCbEsMsg)(u32 handle, u32 esHandle, u32 msgType,
+-                                 u32 msgData, void* cbArg);
+-
+-/* ---------------------------------------------------------------------------
+- * Functions
+- * -----------------------------------------------------------------------*/
+-
+-/* Demuxer lifecycle */
+-s32 cellDmuxOpen(const CellDmuxType* type, const CellDmuxResource* res,
+-                  CellDmuxCbMsg cbFunc, void* cbArg, CellDmuxHandle* handle);
+-s32 cellDmuxClose(CellDmuxHandle handle);
+-
+-/* ES management */
+-s32 cellDmuxEnableEs(CellDmuxHandle handle, const CellDmuxEsFilterId* esFilterId,
+-                      const CellDmuxEsResource* esRes,
+-                      CellDmuxCbEsMsg esCbFunc, void* esCbArg,
+-                      CellDmuxEsHandle* esHandle);
+-s32 cellDmuxDisableEs(CellDmuxEsHandle esHandle);
+-
+-/* Data feeding */
+-s32 cellDmuxSetStream(CellDmuxHandle handle, u32 streamAddr, u32 streamSize,
+-                       b8 discontinuity, u64 userData);
+-s32 cellDmuxResetStream(CellDmuxHandle handle);
+-s32 cellDmuxResetStreamAndWaitDone(CellDmuxHandle handle);
+-
+-/* AU retrieval */
+-s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, CellDmuxAuInfo** auInfo, u32* auInfoNum);
+-s32 cellDmuxPeekAu(CellDmuxEsHandle esHandle, CellDmuxAuInfo** auInfo, u32* auInfoNum);
+-s32 cellDmuxReleaseAu(CellDmuxEsHandle esHandle);
+-s32 cellDmuxFlushEs(CellDmuxEsHandle esHandle);
++/* Guest layouts (big-endian):
++ *
++ *   CellDmuxType        { s32 streamType; s32 reserved1; s32 reserved2; }
++ *   CellDmuxResource    { u32 memAddr; u32 memSize; u32 ppuThreadPriority;
++ *                         u32 ppuThreadStackSize; u32 spuThreadPriority;
++ *                         u32 numOfSpus; }
++ *   CellDmuxResourceEx  { u32 memAddr; u32 memSize; u32 ppuThreadPriority;
++ *                         u32 ppuThreadStackSize; u32 spurs; u64 priority
++ *                         (unaligned, +0x14); u32 maxContention; }
++ *   CellDmuxCb/EsCb     { u32 cbFunc (OPD); u32 cbArg; }
++ *   CellDmuxAttr        { u32 memSize; u32 demuxerVerUpper; u32 demuxerVerLower; }
++ *   CellDmuxEsAttr      { u32 memSize; }
++ *   CellCodecEsFilterId { u32 filterIdMajor; u32 filterIdMinor;
++ *                         u32 supplementalInfo1; u32 supplementalInfo2; }
++ *   CellDmuxEsResource  { u32 memAddr; u32 memSize; }
++ *   CellDmuxMsg/EsMsg   { s32 msgType; u32 pad; u64 supplementalInfo; }   0x10
++ *   CellDmuxAuInfo      { u32 auAddr; u32 auSize; u32 auMaxSize; u8 isRap;
++ *                         pad; u64 userData @0x10; {u32 upper, lower} pts @0x18;
++ *                         dts @0x20; }                                      0x28
++ *
++ * Callbacks: msg(demuxerHandle, CellDmuxMsg*, cbArg) and
++ *            esMsg(demuxerHandle, esHandle, CellDmuxEsMsg*, cbArg). */
++
++s32 cellDmuxQueryAttr(const void* demuxerType, void* demuxerAttr);
++s32 cellDmuxOpen(const void* demuxerType, const void* demuxerResource,
++                 const void* demuxerCb, u32* demuxerHandle);
++s32 cellDmuxOpenEx(const void* demuxerType, const void* demuxerResourceEx,
++                   const void* demuxerCb, u32* demuxerHandle);
++s32 cellDmuxOpenExt(const void* demuxerType, const void* demuxerResourceEx,
++                    const void* demuxerCb, u32* demuxerHandle);
++s32 cellDmuxClose(u32 demuxerHandle);
++
++s32 cellDmuxSetStream(u32 demuxerHandle, u32 streamAddress, u32 streamSize,
++                      u32 discontinuity, u64 userData);
++s32 cellDmuxResetStream(u32 demuxerHandle);
++s32 cellDmuxResetStreamAndWaitDone(u32 demuxerHandle);
++
++s32 cellDmuxQueryEsAttr(const void* demuxerType, const void* esFilterId,
++                        const void* esSpecificInfo, void* esAttr);
++s32 cellDmuxEnableEs(u32 demuxerHandle, const void* esFilterId,
++                     const void* esResourceInfo, const void* esCb,
++                     const void* esSpecificInfo, u32* esHandle);
++s32 cellDmuxDisableEs(u32 esHandle);
++s32 cellDmuxResetEs(u32 esHandle);
++s32 cellDmuxFlushEs(u32 esHandle);
++
++s32 cellDmuxGetAu(u32 esHandle, u32* auInfo, u32* auSpecificInfo);
++s32 cellDmuxPeekAu(u32 esHandle, u32* auInfo, u32* auSpecificInfo);
++s32 cellDmuxGetAuEx(u32 esHandle, u32* auInfoEx, u32* auSpecificInfo);
++s32 cellDmuxPeekAuEx(u32 esHandle, u32* auInfoEx, u32* auSpecificInfo);
++s32 cellDmuxReleaseAu(u32 esHandle);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
+index a411dbd..7c72ae2 100644
+--- a/libs/codec/cellVdec.c
++++ b/libs/codec/cellVdec.c
+@@ -52,6 +52,11 @@ typedef struct {
+     u32 qHead, qCount;
+     CellVdecAuInfo aus[VDEC_AU_RING];   /* by auCount % VDEC_AU_RING */
+     u32 newPics;        /* pictures queued by the current decode call */
++    /* MPEG-2 sequence parameters, from the last sequence header and
++     * sequence extension seen in the stream (CellVdecMpeg2Info). */
++    u16 m2vWidth, m2vHeight;
++    u8  m2vAspect, m2vFrameRate, m2vProgressive;
++    u64 lastPicPts;     /* display-order PTS of the last picture queued */
+ } VdecSlot;
+ 
+ static VdecSlot s_vdec[MAX_VDEC];
+@@ -85,6 +90,38 @@ static void vdec_queue_clear(VdecSlot* v)
+ /* vdec_ff_emit_fn: queue a decoded picture under the item of the AU it was
+  * decoded from. Pictures leave the decoder in display order, so with B-frames
+  * that is not the AU just submitted; the token is that AU's auCount. */
++/* 90 kHz ticks per frame by MPEG-2 frame_rate_code (1 = 24000/1001 ...
++ * 8 = 60); 30000/1001 when the stream has not said. */
++static u64 vdec_frame_ticks(const VdecSlot* v)
++{
++    static const u16 k_ticks[9] = { 3003, 3754, 3750, 3600, 3003, 3000, 1800, 1502, 1500 };
++    return k_ticks[v->m2vFrameRate <= 8 ? v->m2vFrameRate : 0];
++}
++
++/* Picks the sequence parameters out of an MPEG-2 access unit: the sequence
++ * header (00 00 01 B3: 12-bit width and height, aspect ratio and frame rate
++ * codes) and the sequence extension (00 00 01 B5, id 1: progressive_sequence
++ * and the size extension bits). */
++static void vdec_scan_m2v_headers(VdecSlot* v, const u8* p, u32 n)
++{
++    for (u32 i = 0; i + 10 <= n; i++) {
++        if (p[i] || p[i + 1] || p[i + 2] != 1) continue;
++        const u8* h = p + i + 4;
++        if (p[i + 3] == 0xB3) {
++            v->m2vWidth     = (u16)((h[0] << 4) | (h[1] >> 4));
++            v->m2vHeight    = (u16)(((h[1] & 0x0F) << 8) | h[2]);
++            v->m2vAspect    = h[3] >> 4;
++            v->m2vFrameRate = h[3] & 0x0F;
++        } else if (p[i + 3] == 0xB5 && (h[0] >> 4) == 1) {
++            v->m2vProgressive = (h[1] >> 3) & 1;
++            v->m2vWidth  = (u16)((v->m2vWidth & 0xFFF) | (((h[1] & 1) << 1 | h[2] >> 7) << 12));
++            v->m2vHeight = (u16)((v->m2vHeight & 0xFFF) | (((h[2] >> 5) & 3) << 12));
++        } else if (p[i + 3] == 0x00) {
++            break;                                     /* picture data follows */
++        }
++    }
++}
++
+ static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
+ {
+     VdecSlot* v = (VdecSlot*)ctx;
+@@ -104,7 +141,15 @@ static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
+     q->item.startAddr = au->startAddr;
+     q->item.size      = au->size;
+     q->item.auNum     = pic->token;
+-    q->item.pts       = au->pts;
++    /* A picture whose AU carried no timestamp follows the previous one by a
++     * frame period, as the firmware decoder corrects it: PAMF video puts a
++     * PTS on only some PES packets, and the movie player schedules every
++     * picture by its PTS. */
++    u64 pts = au->pts;
++    if (pts == ~0ull && v->lastPicPts != ~0ull)
++        pts = v->lastPicPts + vdec_frame_ticks(v);
++    if (pts != ~0ull) v->lastPicPts = pts;
++    q->item.pts       = pts;
+     q->item.dts       = au->dts;
+     q->item.userData  = au->userData;
+     q->item.status    = 0;
+@@ -120,6 +165,8 @@ static void vdec_notify_new_pics(CellVdecHandle handle)
+ {
+     u32 n = s_vdec[handle].newPics;
+     s_vdec[handle].newPics = 0;
++    { static int k = 0;
++      if (n && k++ < 4) printf("[cellVdec] PICOUT x%u (queued %u)\n", n, s_vdec[handle].qCount); }
+     while (n--)
+         vdec_notify(handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
+ }
+@@ -173,6 +220,7 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
+             s_vdec[i].cbFunc = cb_ea ? vm_read32(cb_ea + 0) : 0;
+             s_vdec[i].cbArg  = cb_ea ? vm_read32(cb_ea + 4) : 0;
+             s_vdec[i].ff = vdec_ff_open(codec_type);
++            s_vdec[i].lastPicPts = ~0ull;
+             vm_write32((u32)(uintptr_t)handle, (u32)i);
+             printf("[cellVdec] Open -> handle=%u\n", i);
+             if (s_vdec[i].ff)
+@@ -183,6 +231,23 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
+     return (s32)CELL_VDEC_ERROR_BUSY;
+ }
+ 
++/* cellVdecQueryAttrEx / cellVdecOpenEx: libsail's entry points. CellVdecTypeEx
++ * is CellVdecType plus a trailing codecSpecificInfo pointer, and
++ * CellVdecResourceEx only adds SPURS placement, which a host-side decoder has
++ * no use for; both forward. Unregistered, QueryAttrEx left memSize unfilled
++ * and libsail failed its allocation with CELL_SAIL_ERROR_MEMORY. */
++s32 cellVdecQueryAttrEx(const void* typeEx, void* attr)
++{
++    return cellVdecQueryAttr((const CellVdecType*)typeEx, attr);
++}
++
++s32 cellVdecOpenEx(const void* typeEx, const void* resourceEx,
++                   const CellVdecCb* cb, CellVdecHandle* handle)
++{
++    return cellVdecOpen((const CellVdecType*)typeEx,
++                        (const CellVdecResource*)resourceEx, cb, handle);
++}
++
+ s32 cellVdecClose(CellVdecHandle handle)
+ {
+     printf("[cellVdec] Close(handle=%u)\n", handle);
+@@ -266,6 +331,8 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
+     if (v->ff) {
+         if (v->qCount >= VDEC_BUSY_AT)
+             return (s32)CELL_VDEC_ERROR_BUSY;  /* title must take pictures */
++        if (v->codecType == CELL_VDEC_CODEC_TYPE_MPEG2 && au.size >= 12)
++            vdec_scan_m2v_headers(v, vm_ptr8(au.startAddr), au.size);
+         v->auCount++;
+         v->aus[v->auCount % VDEC_AU_RING] = au;
+         v->newPics = 0;
+@@ -343,6 +410,20 @@ static void vdec_write_item(CellVdecHandle handle, const CellVdecPicItem* p)
+     vm_write32(it + 0x48, info);
+     vm_write16(info + 0, p->width);
+     vm_write16(info + 2, p->height);
++    if (v->codecType == CELL_VDEC_CODEC_TYPE_MPEG2) {
++        /* CellVdecMpeg2Info: +4 aspect_ratio_information, +5
++         * frame_rate_code, +6 progressive_sequence, +0x14/0x15
++         * picture_structure (3 = frame), +0x18 progressive_frame,
++         * +0x26/+0x28 display size. */
++        vm_write8 (info + 0x04, v->m2vAspect);
++        vm_write8 (info + 0x05, v->m2vFrameRate);
++        vm_write8 (info + 0x06, v->m2vProgressive);
++        vm_write8 (info + 0x14, 3);
++        vm_write8 (info + 0x15, 3);
++        vm_write8 (info + 0x18, 1);
++        vm_write16(info + 0x26, p->width);
++        vm_write16(info + 0x28, p->height);
++    }
+ }
+ 
+ /* The decoder path also reports the picture type.
+@@ -373,6 +454,8 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
+     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !out)
+         return (s32)CELL_VDEC_ERROR_ARG;
+     const VdecSlot* v = &s_vdec[handle];
++    { static int k = 0;
++      if (k++ < 4 || (k % 50) == 0) printf("[cellVdec] GetPicItem#%d(h=%u) queued=%u\n", k, handle, v->qCount); }
+     if (v->ff) {
+         if (!v->qCount)
+             return (s32)CELL_VDEC_ERROR_EMPTY;
+@@ -462,6 +545,10 @@ s32 cellVdecGetPictureExt(CellVdecHandle handle, const void* format,
+ {
+     (void)arg4;
+     u32 fmt_ea = (u32)(uintptr_t)format, dst = (u32)(uintptr_t)outBuff;
++    { static int k = 0;
++      if ((k++ < 4 || (k % 50) == 0) && fmt_ea)
++          printf("[cellVdec] GetPictureExt(h=%u fmt=%u colorMatrix=%u out=0x%08X)\n",
++                 handle, vm_read32(fmt_ea + 0), vm_read32(fmt_ea + 4), dst); }
+     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !s_vdec[handle].ff)
+         return CELL_OK;
+     if (!fmt_ea)
+diff --git a/libs/codec/cellVpost.c b/libs/codec/cellVpost.c
+index 4627934..b742aec 100644
+--- a/libs/codec/cellVpost.c
++++ b/libs/codec/cellVpost.c
+@@ -1,81 +1,196 @@
+ /*
+- * ps3recomp - cellVpost HLE implementation
++ * ps3recomp - cellVpost HLE: video post-processing
+  *
+- * Stub. Init/end manage handles, Exec returns success without
+- * actual video processing. Query reports minimal memory needs.
++ * libsail runs every decoded movie picture through cellVpost before handing
++ * it to the title's graphics adapter: planar YUV 4:2:0 in, interleaved RGBA
++ * (or YUV 4:2:0 again, scaled) out, with the output alpha taken from the
++ * control parameters. On the console this runs on SPU; here it is a plain
++ * host conversion. The in/out windows and the interlace/scaler modes are not
++ * modelled: the whole input picture is scaled bilinearly to the whole output
++ * size, which is what progressive movies (PAMF M2V/AVC) use.
+  */
+ 
+ #include "cellVpost.h"
+ #include <stdio.h>
+ #include <string.h>
+-#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+-#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
++#include "../../runtime/ppu/ppu_memory.h"
+ 
+-/* Internal state */
++#define VPOST_MAX 8
+ 
+ typedef struct {
+     int in_use;
+-    CellVpostCfgParam cfg;
+-} VpostHandle;
++    s32 outPicFmt;
++} VpostSlot;
+ 
+-static VpostHandle s_handles[CELL_VPOST_HANDLE_MAX];
++static VpostSlot s_vpost[VPOST_MAX];
+ 
+-/* API */
++static u32 ea_of(const void* p) { return (u32)(uintptr_t)p; }
+ 
+-s32 cellVpostQuery(const CellVpostCfgParam* cfgParam, u32* memSize)
++s32 cellVpostQueryAttr(const void* cfgParam, void* attr)
+ {
+-    (void)cfgParam;
+-    if (!memSize) return (s32)CELL_VPOST_ERROR_INVALID_ARGUMENT;
+-    /* Report a reasonable working buffer size */
+-    vm_write32((u32)(uintptr_t)memSize, (u32)1024 * 1024); /* 1 MB */
++    u32 cfg = ea_of(cfgParam), a = ea_of(attr);
++    if (!cfg) return (s32)CELL_VPOST_ERROR_Q_ARG_CFG_NULL;
++    if (!a)   return (s32)CELL_VPOST_ERROR_Q_ARG_ATTR_NULL;
++    vm_write32(a + 0x0, 0x40000);       /* memSize: unused by the host path */
++    vm_write8 (a + 0x4, 0);             /* delay: output is immediate */
++    vm_write32(a + 0x8, 0x00030000);    /* vpostVerUpper */
++    vm_write32(a + 0xC, 0);             /* vpostVerLower */
+     return CELL_OK;
+ }
+ 
+-s32 cellVpostInit(const CellVpostCfgParam* cfgParam,
+-                    const CellVpostResource* resource,
+-                    CellVpostHandle* handle)
++static s32 vpost_open(u32 cfg, u32 res, u32 out)
+ {
+-    (void)resource;
+-    printf("[cellVpost] Init()\n");
+-
+-    if (!cfgParam || !handle)
+-        return (s32)CELL_VPOST_ERROR_INVALID_ARGUMENT;
+-
+-    for (int i = 0; i < CELL_VPOST_HANDLE_MAX; i++) {
+-        if (!s_handles[i].in_use) {
+-            memset(&s_handles[i], 0, sizeof(VpostHandle));
+-            s_handles[i].in_use = 1;
+-            guest_struct_load(&s_handles[i].cfg, GUEST_EA(cfgParam),
+-                              (u32)sizeof(s_handles[i].cfg));
+-            vm_write32((u32)(uintptr_t)handle, (u32)i);
+-            return CELL_OK;
+-        }
++    if (!cfg) return (s32)CELL_VPOST_ERROR_O_ARG_CFG_NULL;
++    if (!res) return (s32)CELL_VPOST_ERROR_O_ARG_RSRC_NULL;
++    if (!out) return (s32)CELL_VPOST_ERROR_O_ARG_HDL_NULL;
++    for (u32 i = 0; i < VPOST_MAX; i++) {
++        if (s_vpost[i].in_use) continue;
++        s_vpost[i].in_use = 1;
++        s_vpost[i].outPicFmt = (s32)vm_read32(cfg + 0x1C);
++        /* Handles start at 1: callers test for a zero handle. */
++        vm_write32(out, i + 1);
++        printf("[cellVpost] Open -> %u (in max %ux%u, out max %ux%u fmt %d)\n", i + 1,
++               vm_read32(cfg + 0x0), vm_read32(cfg + 0x4),
++               vm_read32(cfg + 0x10), vm_read32(cfg + 0x14), s_vpost[i].outPicFmt);
++        return CELL_OK;
+     }
+-    return (s32)CELL_VPOST_ERROR_OUT_OF_MEMORY;
++    return (s32)CELL_VPOST_ERROR_O_FATAL_QUERY_FAIL;
++}
++
++s32 cellVpostOpen(const void* cfgParam, const void* resource, u32* handle)
++{
++    return vpost_open(ea_of(cfgParam), ea_of(resource), ea_of(handle));
+ }
+ 
+-s32 cellVpostEnd(CellVpostHandle handle)
++s32 cellVpostOpenEx(const void* cfgParam, const void* resourceEx, u32* handle)
+ {
+-    printf("[cellVpost] End(%u)\n", handle);
+-    if (handle >= CELL_VPOST_HANDLE_MAX || !s_handles[handle].in_use)
+-        return (s32)CELL_VPOST_ERROR_HANDLE_NOT_FOUND;
+-    s_handles[handle].in_use = 0;
++    return vpost_open(ea_of(cfgParam), ea_of(resourceEx), ea_of(handle));
++}
++
++s32 cellVpostClose(u32 handle)
++{
++    if (handle == 0 || handle > VPOST_MAX || !s_vpost[handle - 1].in_use)
++        return (s32)CELL_VPOST_ERROR_C_ARG_HDL_INVALID;
++    s_vpost[handle - 1].in_use = 0;
+     return CELL_OK;
+ }
+ 
+-s32 cellVpostExec(CellVpostHandle handle,
+-                    const void* inPicBuf,
+-                    const CellVpostPictureInfo* picInfo,
+-                    void* outPicBuf,
+-                    const CellVpostCtrlParam* ctrlParam)
++static inline u8 clamp8(int v) { return (u8)(v < 0 ? 0 : v > 255 ? 255 : v); }
++
++/* Bilinear sample of an 8-bit plane at 16.16 fixed-point (fx, fy). */
++static inline int sample(const u8* p, u32 pw, u32 ph, u32 stride, u32 fx, u32 fy)
++{
++    u32 x0 = fx >> 16, y0 = fy >> 16;
++    u32 x1 = x0 + 1 < pw ? x0 + 1 : x0, y1 = y0 + 1 < ph ? y0 + 1 : y0;
++    u32 ax = (fx >> 8) & 0xFF, ay = (fy >> 8) & 0xFF;
++    int top = p[y0 * stride + x0] * (256 - ax) + p[y0 * stride + x1] * ax;
++    int bot = p[y1 * stride + x0] * (256 - ax) + p[y1 * stride + x1] * ax;
++    return (top * (256 - ay) + bot * ay + (1 << 15)) >> 16;
++}
++
++/* Coordinate of output pixel `o` in an input of `in` pixels, 16.16, centre-
++ * aligned and clamped to the last sample. */
++static inline u32 map_coord(u32 o, u32 in, u32 out)
+ {
+-    (void)inPicBuf; (void)outPicBuf;
+-    if (handle >= CELL_VPOST_HANDLE_MAX || !s_handles[handle].in_use)
+-        return (s32)CELL_VPOST_ERROR_HANDLE_NOT_FOUND;
+-    if (!picInfo || !ctrlParam)
+-        return (s32)CELL_VPOST_ERROR_INVALID_ARGUMENT;
+-
+-    /* Stub: no actual processing — just return success.
+-       A real impl would do color conversion / scaling here. */
++    if (out <= 1 || in <= 1) return 0;
++    long long v = ((long long)(2 * o + 1) * in * 65536 / (2 * out)) - 32768;
++    long long hi = (long long)(in - 1) << 16;
++    return (u32)(v < 0 ? 0 : v > hi ? hi : v);
++}
++
++s32 cellVpostExec(u32 handle, const void* inPicBuff, const void* ctrlParam,
++                  void* outPicBuff, void* picInfo)
++{
++    if (handle == 0 || handle > VPOST_MAX || !s_vpost[handle - 1].in_use)
++        return (s32)CELL_VPOST_ERROR_E_ARG_HDL_INVALID;
++    const u32 in = ea_of(inPicBuff), ctl = ea_of(ctrlParam);
++    const u32 out = ea_of(outPicBuff), info = ea_of(picInfo);
++    if (!in)   return (s32)CELL_VPOST_ERROR_E_ARG_INPICBUF_NULL;
++    if (!ctl)  return (s32)CELL_VPOST_ERROR_E_ARG_CTRL_NULL;
++    if (!out)  return (s32)CELL_VPOST_ERROR_E_ARG_OUTPICBUF_NULL;
++    if (!info) return (s32)CELL_VPOST_ERROR_E_ARG_PICINFO_NULL;
++
++    const u32 w  = vm_read32(ctl + 0x0C), h  = vm_read32(ctl + 0x10);
++    const s32 chroma = (s32)vm_read32(ctl + 0x14);
++    const s32 quant  = (s32)vm_read32(ctl + 0x18);   /* 0 full, 1 broadcast */
++    const s32 matrix = (s32)vm_read32(ctl + 0x1C);   /* 0 BT.601, 1 BT.709 */
++    const u32 ow = vm_read32(ctl + 0x30), oh = vm_read32(ctl + 0x34);
++    const u8  alpha  = vm_read8(ctl + 0x48);
++    const u64 user   = vm_read64(ctl + 0x50);
++    const s32 fmt    = s_vpost[handle - 1].outPicFmt;
++    if (!w || !h || !ow || !oh || (w & 1) || (h & 1))
++        return (s32)CELL_VPOST_ERROR_E_ARG_CTRL_INVALID;
++
++    const u8* Y = vm_base + in;
++    const u8* U = Y + w * h;
++    const u8* V = U + (w / 2) * (h / 2);
++    u8* dst = vm_base + out;
++
++    if (fmt == CELL_VPOST_PIC_FMT_OUT_YUV420_PLANAR) {
++        u8* dY = dst; u8* dU = dY + ow * oh; u8* dV = dU + (ow / 2) * (oh / 2);
++        for (u32 y = 0; y < oh; y++)
++            for (u32 x = 0; x < ow; x++)
++                dY[y * ow + x] = (u8)sample(Y, w, h, w, map_coord(x, w, ow), map_coord(y, h, oh));
++        for (u32 y = 0; y < oh / 2; y++)
++            for (u32 x = 0; x < ow / 2; x++) {
++                u32 fx = map_coord(x, w / 2, ow / 2), fy = map_coord(y, h / 2, oh / 2);
++                dU[y * (ow / 2) + x] = (u8)sample(U, w / 2, h / 2, w / 2, fx, fy);
++                dV[y * (ow / 2) + x] = (u8)sample(V, w / 2, h / 2, w / 2, fx, fy);
++            }
++    } else {
++        /* YCbCr -> RGB in 8.8 fixed point. Broadcast range expands Y from
++         * 16..235 and chroma from 16..240; full range uses them as they are. */
++        const int bt709 = matrix == 1;
++        const int crv = bt709 ? 403 : 359, cbu = bt709 ? 475 : 454;
++        const int cgu = bt709 ? 48 : 88,   cgv = bt709 ? 120 : 183;
++        const int ys  = quant == 1 ? 298 : 256, yo = quant == 1 ? 16 : 0;
++        const int cs  = quant == 1 ? 292 : 256;   /* 255/224 for chroma */
++        for (u32 y = 0; y < oh; y++) {
++            const u32 fy  = map_coord(y, h, oh);
++            const u32 fcy = map_coord(y, h / 2, oh);
++            u8* row = dst + (size_t)y * ow * 4;
++            for (u32 x = 0; x < ow; x++) {
++                const u32 fx = map_coord(x, w, ow);
++                /* chroma position type A sits between luma columns, B on them */
++                const u32 fcx = chroma == 1 ? fx / 2 : map_coord(x, w / 2, ow);
++                int yy = (sample(Y, w, h, w, fx, fy) - yo) * ys >> 8;
++                int u  = ((sample(U, w / 2, h / 2, w / 2, fcx, fcy) - 128) * cs) >> 8;
++                int v  = ((sample(V, w / 2, h / 2, w / 2, fcx, fcy) - 128) * cs) >> 8;
++                row[x * 4 + 0] = clamp8(yy + ((crv * v) >> 8));
++                row[x * 4 + 1] = clamp8(yy - ((cgu * u + cgv * v) >> 8));
++                row[x * 4 + 2] = clamp8(yy + ((cbu * u) >> 8));
++                row[x * 4 + 3] = alpha;
++            }
++        }
++    }
++
++    /* What was done: the input as described, the output in the configured
++     * format, progressive frame in and out. */
++    vm_write32(info + 0x00, w);
++    vm_write32(info + 0x04, h);
++    vm_write32(info + 0x08, 0);           /* depth 8 */
++    vm_write32(info + 0x0C, 0);           /* progressive */
++    vm_write32(info + 0x10, 0);           /* YUV420 planar */
++    vm_write32(info + 0x14, (u32)chroma);
++    vm_write32(info + 0x18, 0);           /* frame */
++    vm_write32(info + 0x1C, (u32)quant);
++    vm_write32(info + 0x20, (u32)matrix);
++    vm_write32(info + 0x24, ow);
++    vm_write32(info + 0x28, oh);
++    vm_write32(info + 0x2C, 0);
++    vm_write32(info + 0x30, 0);
++    vm_write32(info + 0x34, (u32)fmt);
++    vm_write32(info + 0x38, (u32)chroma);
++    vm_write32(info + 0x3C, 0);
++    vm_write32(info + 0x40, (u32)quant);
++    vm_write32(info + 0x44, (u32)matrix);
++    vm_write64(info + 0x48, user);
++    vm_write32(info + 0x50, 0);
++    vm_write32(info + 0x54, 0);
++
++    { static int n = 0;
++      if (n++ < 3)
++          printf("[cellVpost] Exec(%u): %ux%u -> %ux%u fmt=%d matrix=%d range=%d\n",
++                 handle, w, h, ow, oh, fmt, matrix, quant); }
+     return CELL_OK;
+ }
+diff --git a/libs/codec/cellVpost.h b/libs/codec/cellVpost.h
+index f3eccbd..f983a53 100644
+--- a/libs/codec/cellVpost.h
++++ b/libs/codec/cellVpost.h
+@@ -1,10 +1,26 @@
+ /*
+- * ps3recomp - cellVpost HLE
++ * ps3recomp - cellVpost HLE: video post-processing (YUV420 -> RGBA / scale)
+  *
+- * Video post-processing: color conversion (YUV->RGB), scaling,
+- * deinterlacing, rotation. Stub — executes callbacks without actual processing.
++ * Pointer arguments are GUEST addresses; the structures are big-endian in
++ * guest memory and read field by field. Layouts per RPCS3's cellVpost.h:
++ *
++ *   CellVpostCfgParam   { u32 inMaxWidth, inMaxHeight; s32 inDepth, inPicFmt;
++ *                         u32 outMaxWidth, outMaxHeight; s32 outDepth, outPicFmt;
++ *                         u32 reserved1, reserved2; }
++ *   CellVpostAttr       { u32 memSize; u8 delay; u32 vpostVerUpper @8;
++ *                         u32 vpostVerLower @0xC; }
++ *   CellVpostCtrlParam  { s32 execType, scalerType, ipcType; u32 inWidth @0xC,
++ *                         inHeight; s32 inChromaPosType @0x14, inQuantRange,
++ *                         inColorMatrix; Window inWindow @0x20 (x,y,w,h);
++ *                         u32 outWidth @0x30, outHeight; Window outWindow @0x38;
++ *                         u8 outAlpha @0x48; u64 userData @0x50; u32 res[2]; }
++ *   CellVpostPictureInfo{ u32 inWidth, inHeight; s32 inDepth, inScanType,
++ *                         inPicFmt, inChromaPosType, inPicStruct, inQuantRange,
++ *                         inColorMatrix; u32 outWidth @0x24, outHeight; s32
++ *                         outDepth, outScanType, outPicFmt, outChromaPosType,
++ *                         outPicStruct, outQuantRange, outColorMatrix;
++ *                         u64 userData @0x48; u32 reserved1, reserved2; }
+  */
+-
+ #ifndef PS3RECOMP_CELL_VPOST_H
+ #define PS3RECOMP_CELL_VPOST_H
+ 
+@@ -15,79 +31,29 @@
+ extern "C" {
+ #endif
+ 
+-/* Error codes */
+-#define CELL_VPOST_ERROR_NOT_INITIALIZED     0x80610001
+-#define CELL_VPOST_ERROR_ALREADY_INITIALIZED 0x80610002
+-#define CELL_VPOST_ERROR_INVALID_ARGUMENT    0x80610003
+-#define CELL_VPOST_ERROR_OUT_OF_MEMORY       0x80610004
+-#define CELL_VPOST_ERROR_HANDLE_NOT_FOUND    0x80610005
+-
+-/* Constants */
+-#define CELL_VPOST_HANDLE_MAX    4
+-
+-/* Picture format */
+-#define CELL_VPOST_PIC_FMT_YUV420P    0
+-#define CELL_VPOST_PIC_FMT_YUV422P    1
+-#define CELL_VPOST_PIC_FMT_RGBA8888   2
+-#define CELL_VPOST_PIC_FMT_ARGB8888   3
+-
+-/* Scan type */
+-#define CELL_VPOST_SCAN_PROGRESSIVE  0
+-#define CELL_VPOST_SCAN_INTERLACE    1
+-
+-/* Types */
+-typedef u32 CellVpostHandle;
+-
+-typedef struct CellVpostCfgParam {
+-    u32 inMaxWidth;
+-    u32 inMaxHeight;
+-    u32 inPicFmt;
+-    u32 outMaxWidth;
+-    u32 outMaxHeight;
+-    u32 outPicFmt;
+-    u32 execThread;
+-    u32 reserved;
+-} CellVpostCfgParam;
+-
+-typedef struct CellVpostResource {
+-    void* memAddr;
+-    u32 memSize;
+-    s32 ppuThreadPriority;
+-    u32 ppuThreadStackSize;
+-} CellVpostResource;
+-
+-typedef struct CellVpostPictureInfo {
+-    u32 width;
+-    u32 height;
+-    u32 picFmt;
+-    u32 scanType;
+-    u32 codecType;
+-    u32 reserved[3];
+-} CellVpostPictureInfo;
+-
+-typedef struct CellVpostCtrlParam {
+-    u32 outWidth;
+-    u32 outHeight;
+-    u32 outPicFmt;
+-    u32 execType;
+-    u32 reserved[4];
+-} CellVpostCtrlParam;
+-
+-typedef void (*CellVpostExecCb)(u32 handle, s32 result, void* arg);
+-
+-/* Functions */
+-s32 cellVpostInit(const CellVpostCfgParam* cfgParam,
+-                    const CellVpostResource* resource,
+-                    CellVpostHandle* handle);
+-s32 cellVpostEnd(CellVpostHandle handle);
+-
+-s32 cellVpostExec(CellVpostHandle handle,
+-                    const void* inPicBuf,
+-                    const CellVpostPictureInfo* picInfo,
+-                    void* outPicBuf,
+-                    const CellVpostCtrlParam* ctrlParam);
+-
+-s32 cellVpostQuery(const CellVpostCfgParam* cfgParam, u32* memSize);
++#define CELL_VPOST_ERROR_Q_ARG_CFG_NULL      0x80610410
++#define CELL_VPOST_ERROR_Q_ARG_ATTR_NULL     0x80610412
++#define CELL_VPOST_ERROR_O_ARG_CFG_NULL      0x80610440
++#define CELL_VPOST_ERROR_O_ARG_RSRC_NULL     0x80610442
++#define CELL_VPOST_ERROR_O_ARG_HDL_NULL      0x80610444
++#define CELL_VPOST_ERROR_O_FATAL_QUERY_FAIL  0x80610460
++#define CELL_VPOST_ERROR_C_ARG_HDL_INVALID   0x80610471
++#define CELL_VPOST_ERROR_E_ARG_HDL_INVALID   0x806104A1
++#define CELL_VPOST_ERROR_E_ARG_INPICBUF_NULL 0x806104A2
++#define CELL_VPOST_ERROR_E_ARG_CTRL_NULL     0x806104A4
++#define CELL_VPOST_ERROR_E_ARG_CTRL_INVALID  0x806104A5
++#define CELL_VPOST_ERROR_E_ARG_OUTPICBUF_NULL 0x806104A6
++#define CELL_VPOST_ERROR_E_ARG_PICINFO_NULL  0x806104A8
++
++#define CELL_VPOST_PIC_FMT_OUT_RGBA_ILV       0
++#define CELL_VPOST_PIC_FMT_OUT_YUV420_PLANAR  1
++
++s32 cellVpostQueryAttr(const void* cfgParam, void* attr);
++s32 cellVpostOpen(const void* cfgParam, const void* resource, u32* handle);
++s32 cellVpostOpenEx(const void* cfgParam, const void* resourceEx, u32* handle);
++s32 cellVpostClose(u32 handle);
++s32 cellVpostExec(u32 handle, const void* inPicBuff, const void* ctrlParam,
++                  void* outPicBuff, void* picInfo);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/libs/system/sysPrxForUser.c b/libs/system/sysPrxForUser.c
+index f6e4e31..d5c4b85 100644
+--- a/libs/system/sysPrxForUser.c
++++ b/libs/system/sysPrxForUser.c
+@@ -376,6 +376,18 @@ s32 _sys_strncmp(const char* s1, const char* s2, u32 size)
+     return strncmp(a, b, size);
+ }
+ 
++/* Returns the GUEST pointer to the first `c` in `s` (the terminator counts, as
++ * in C), or NULL. libsail splits a stream URI's scheme from its path with
++ * _sys_strchr(uri, ':'); left unregistered, the faked CELL_OK came back as a
++ * NULL match and every "x-cell-fs://" movie failed with UNSUPPORTED_STREAM. */
++char* _sys_strchr(const char* s, s32 c)
++{
++    const char* h = (const char*)yz_g2h(s);
++    if (!h) return NULL;
++    const char* p = strchr(h, (char)c);
++    return p ? (char*)s + (p - h) : NULL;
++}
++
+ void* _sys_memset(void* dst, s32 val, u32 size)
+ {
+     void* d = yz_g2h(dst);

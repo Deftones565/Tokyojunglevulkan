@@ -1,0 +1,45 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index f2b4c11..e2714a7 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -448,6 +448,25 @@ static void pad_poll_backend(void)
+  * API implementations
+  * -----------------------------------------------------------------------*/
+ 
++/* Bring up the host input backend before any other thread touches SDL.
++ *
++ * The runner's frame-clock thread opens the window and calls SDL_PollEvent in
++ * a loop; cellPadInit runs later on the guest's main thread. Initialising the
++ * game-controller subsystem there, concurrently with that event pump, deadlocks
++ * SDL3 (as shipped behind sdl2-compat): each thread holds one of SDL's internal
++ * locks and waits for the other's. Tokyo Jungle hung at "[cellPad] Init" with a
++ * window open (headless runs never pump events, so they were fine). Called from
++ * main() before the frame clock starts, the init happens single-threaded and
++ * pad_init_backend then finds the subsystem already up. */
++void cellPad_host_init(void)
++{
++#if PAD_BACKEND_SDL2
++    if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0)
++        SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
++    s_sdl_inited = 1;
++#endif
++}
++
+ s32 cellPadInit(u32 max_connect)
+ {
+     printf("[cellPad] Init(max_connect=%u)\n", max_connect);
+diff --git a/libs/input/cellPad.h b/libs/input/cellPad.h
+index 89c58ab..0ced9a2 100644
+--- a/libs/input/cellPad.h
++++ b/libs/input/cellPad.h
+@@ -200,6 +200,10 @@ s32 cellPadClearBuf(u32 port_no);
+ /* Internal: call once per frame to update pad state from host input */
+ void cellPad_poll(void);
+ 
++/* Port setup (not a firmware call): initialise the host input backend from the
++ * main thread before any other thread uses SDL. See cellPad.c. */
++void cellPad_host_init(void);
++
+ #ifdef __cplusplus
+ }
+ #endif

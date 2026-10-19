@@ -1,0 +1,58 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 113793f..690000f 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -2655,6 +2655,26 @@ static void vk_dump_ppm(const unsigned char* rgba)
+     fclose(f);
+ }
+ 
++/* Benchmark-only gate. Cache the decision for one present so the engine's
++ * display blit and the following readback always agree, even if the driver
++ * creates/removes the pause file between the two calls. */
++static int vk_wants_dump(void)
++{
++    static const char* pause_file;
++    static int initialized, cached;
++    static u32 presented = ~0u;
++    if (!initialized) { pause_file = getenv("TJ_FRAME_DUMP_PAUSE_FILE"); initialized = 1; }
++    if (presented != s_vk.presented) {
++        presented = s_vk.presented;
++        cached = s_vk.dump_path && ((s_vk.presented + 1u) % s_vk.dump_every) == 0;
++        if (cached && pause_file && *pause_file) {
++            FILE* f = fopen(pause_file, "rb");
++            if (f) { fclose(f); cached = 0; }
++        }
++    }
++    return cached;
++}
++
+ static void vk_cb_present(void* ud, u32 buffer_id)
+ {
+     (void)ud; (void)buffer_id;
+@@ -2664,7 +2684,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
+      * each, for the PPM dump and the non-engine path's centre-pixel probe. On
+      * the engine path nothing reads the pixels unless this present is dumped
+      * (rsx_vulkan_backend_readback_center asks the engine), so skip it. */
+-    const int dump = s_vk.dump_path && ((s_vk.presented + 1u) % s_vk.dump_every) == 0;
++    const int dump = vk_wants_dump();
+     if (s_vk.eng_active && !dump) {
+         s_vk.presented++;
+         s_g.last_draws = s_g.draws;
+@@ -2697,7 +2717,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
+     s_vk.presented++;
+     s_g.last_draws = s_g.draws;
+     s_g.draws = 0;
+-    if (s_vk.dump_path && (s_vk.presented % s_vk.dump_every) == 0) vk_dump_ppm(px);
++    if (dump) vk_dump_ppm(px);
+     vk_present_window();
+ }
+ 
+@@ -3118,7 +3138,7 @@ static void vk_eng_present(void* user, u32 surface)
+      * back nothing else on the engine path), so the surface is copied into it
+      * only for a present that will be dumped; the window takes the frame
+      * straight from the surface. That copy was a submit-and-wait per frame. */
+-    const int dump = s_vk.dump_path && ((s_vk.presented + 1u) % s_vk.dump_every) == 0;
++    const int dump = vk_wants_dump();
+     if (o && dump && !vk_begin()) {
+         vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+         vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);

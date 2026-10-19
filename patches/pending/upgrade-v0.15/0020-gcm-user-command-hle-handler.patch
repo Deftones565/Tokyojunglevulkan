@@ -1,0 +1,35 @@
+diff --git a/libs/video/sys_rsx.c b/libs/video/sys_rsx.c
+index 2a64c8e..c83facb 100644
+--- a/libs/video/sys_rsx.c
++++ b/libs/video/sys_rsx.c
+@@ -209,6 +209,8 @@ static void rsx_send_event(uint64_t flags)
+  * on. A dropped 0xEB00 therefore parks the emulator permanently.
+  *
+  * Called from the FIFO walker in cellGcmSys.c. */
++extern uint32_t g_gcm_handler_mask;     /* cellGcmSys.c: bits per Set*Handler */
++
+ void rsx_raise_user_cmd(uint32_t arg)
+ {
+     { static unsigned long n = 0;
+@@ -222,7 +224,20 @@ void rsx_raise_user_cmd(uint32_t arg)
+           fprintf(stderr, "[usercmd] #%lu arg=0x%08X handlers=0x%X qid=%u\n",
+                   n, arg, mask, s_isr_qid); fflush(stderr); } }
+     vm_write32(RSX_DRIVER_INFO_EA + RSX_DI_USER_CMD_PARAM, arg);
+-    rsx_send_event(SYS_RSX_EVENT_USER_CMD);
++    if (s_isr_qid) {
++        rsx_send_event(SYS_RSX_EVENT_USER_CMD);
++        return;
++    }
++    /* No ISR queue: the title imports cellGcmSys instead of linking libgcm, so
++     * the HLE library is its interrupt thread. Same rule as the event path --
++     * nothing is raised unless cellGcmSetUserHandler set the 0x80 bit -- and
++     * the handler then runs from ppu_gcm_pump with the command's argument,
++     * like the flip and vblank handlers. Tokyo Jungle depends on it: it queues
++     * SET_USER_COMMAND 0xF5AAC0DE, its handler signals the SPURS tasks that
++     * finish the frame, and the main loop spins until they report back, so a
++     * dropped command stopped the main loop at the first menu pick. */
++    if (g_gcm_handler_mask & SYS_RSX_EVENT_USER_CMD)
++        cellGcmQueueUserCommand(arg);
+ }
+ 
+ static void rsx_isr_queue_bringup(void)

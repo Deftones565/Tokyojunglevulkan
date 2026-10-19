@@ -1,0 +1,163 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index cb63e81..a1dbbbf 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -1825,6 +1825,126 @@ static void vk_swapchain_lost(void)
+     if (vk_create_swapchain()) vk_window_drop("the swapchain could not be recreated");
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Text overlay on the window (rsx_vulkan_backend_set_overlay)
++ *
++ * A short line of text in the window's top-right corner: white 5x7 glyphs,
++ * scaled 3x, on a black box. It is copied into the swapchain image after the
++ * frame is blitted there (vkCmdCopyBufferToImage, so no pipeline or shader),
++ * which keeps it out of the guest's surfaces, the readback and frame dumps.
++ * White and black are the same bytes in every 8-bit four-channel format. The
++ * buffer is rewritten each present; vk_present_window waits for its fence, so
++ * the previous copy has finished.
++ * -------------------------------------------------------------------------*/
++#define OVL_SCALE  3
++#define OVL_MAXCH  24
++#define OVL_PAD    (2 * OVL_SCALE)
++#define OVL_W      (OVL_MAXCH * 6 * OVL_SCALE + 2 * OVL_PAD)
++#define OVL_H      (7 * OVL_SCALE + 2 * OVL_PAD)
++static char           s_ovl_text[OVL_MAXCH + 1];
++static VkBuffer       s_ovl_buf;
++static VkDeviceMemory s_ovl_mem;
++static u32*           s_ovl_px;
++
++/* 5x7 glyphs, one byte per row, bit 4 = leftmost column. */
++static const unsigned char* ovl_glyph(char c)
++{
++    static const unsigned char digits[10][7] = {
++        {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
++        {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},
++        {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
++        {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
++        {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},
++    };
++    static const unsigned char F[7]   = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10};
++    static const unsigned char P[7]   = {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10};
++    static const unsigned char S[7]   = {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E};
++    static const unsigned char dot[7] = {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C};
++    static const unsigned char dash[7]= {0x00,0x00,0x00,0x1F,0x00,0x00,0x00};
++    static const unsigned char none[7]= {0};
++    if (c >= '0' && c <= '9') return digits[c - '0'];
++    switch (c) {
++    case 'F': case 'f': return F;
++    case 'P': case 'p': return P;
++    case 'S': case 's': return S;
++    case '.': return dot;
++    case '-': return dash;
++    default:  return none;
++    }
++}
++
++void rsx_vulkan_backend_set_overlay(const char* text)
++{
++    snprintf(s_ovl_text, sizeof s_ovl_text, "%s", text ? text : "");
++}
++
++/* Record the overlay copy into s_vk.cmd; the image is in TRANSFER_DST_OPTIMAL. */
++static void vk_overlay_record(VkImage img)
++{
++    const size_t n = strlen(s_ovl_text);
++    if (!n || s_vk.sc_extent.width < OVL_W + 8 || s_vk.sc_extent.height < OVL_H + 8) return;
++    if (!s_ovl_buf) {
++        VkBufferCreateInfo bci = {
++            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)OVL_W * OVL_H * 4,
++            .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++        };
++        VkMemoryRequirements mr;
++        u32 type;
++        if (pvkCreateBuffer(s_vk.device, &bci, NULL, &s_ovl_buf) != VK_SUCCESS) { s_ovl_buf = VK_NULL_HANDLE; return; }
++        pvkGetBufferMemoryRequirements(s_vk.device, s_ovl_buf, &mr);
++        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size };
++        void* p = NULL;
++        if (vk_find_memory_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &type) ||
++            (mai.memoryTypeIndex = type,
++             pvkAllocateMemory(s_vk.device, &mai, NULL, &s_ovl_mem) != VK_SUCCESS) ||
++            pvkBindBufferMemory(s_vk.device, s_ovl_buf, s_ovl_mem, 0) != VK_SUCCESS ||
++            pvkMapMemory(s_vk.device, s_ovl_mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) {
++            VK_LOG("overlay buffer could not be created; no overlay\n");
++            s_ovl_text[0] = 0;
++            return;
++        }
++        s_ovl_px = (u32*)p;
++    }
++    /* Right-aligned box sized to the text. */
++    const u32 w = (u32)n * 6 * OVL_SCALE - OVL_SCALE + 2 * OVL_PAD;
++    for (u32 i = 0; i < w * OVL_H; i++) s_ovl_px[i] = 0xFF000000u;          /* black */
++    for (size_t ch = 0; ch < n; ch++) {
++        const unsigned char* g = ovl_glyph(s_ovl_text[ch]);
++        for (u32 row = 0; row < 7; row++)
++            for (u32 col = 0; col < 5; col++) {
++                if (!(g[row] & (0x10u >> col))) continue;
++                for (u32 dy = 0; dy < OVL_SCALE; dy++)
++                    for (u32 dx = 0; dx < OVL_SCALE; dx++) {
++                        const u32 x = OVL_PAD + ((u32)ch * 6 + col) * OVL_SCALE + dx;
++                        const u32 y = OVL_PAD + row * OVL_SCALE + dy;
++                        s_ovl_px[y * w + x] = 0xFFFFFFFFu;                    /* white */
++                    }
++            }
++    }
++    /* The blit just wrote this image: order the copy after it. */
++    VkMemoryBarrier mb = {
++        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++    };
++    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                          0, 1, &mb, 0, NULL, 0, NULL);
++    VkBufferImageCopy r = {
++        .bufferOffset = 0, .bufferRowLength = w, .bufferImageHeight = OVL_H,
++        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .imageOffset = { (int32_t)(s_vk.sc_extent.width - w - 8), 8, 0 },
++        .imageExtent = { w, OVL_H, 1 },
++    };
++    pvkCmdCopyBufferToImage(s_vk.cmd, s_ovl_buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
++}
++
++static void vk_overlay_destroy(void)
++{
++    if (s_ovl_buf) pvkDestroyBuffer(s_vk.device, s_ovl_buf, NULL);
++    if (s_ovl_mem) pvkFreeMemory(s_vk.device, s_ovl_mem, NULL);
++    s_ovl_buf = VK_NULL_HANDLE; s_ovl_mem = VK_NULL_HANDLE; s_ovl_px = NULL;
++}
++
+ /* Blit the offscreen target into the next swapchain image and present it. */
+ static void vk_present_window(void)
+ {
+@@ -1859,6 +1979,7 @@ static void vk_present_window(void)
+     pvkCmdBlitImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
+                     s_vk.sc_images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     1, &blit, VK_FILTER_LINEAR);
++    vk_overlay_record(s_vk.sc_images[idx]);
+     b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+     b.dstAccessMask = 0;
+     b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+@@ -3656,6 +3777,7 @@ void rsx_vulkan_backend_shutdown(void)
+     if (s_vk.windowed || s_vk.window) vk_window_drop(NULL);
+     if (s_vk.device) {
+         if (pvkDeviceWaitIdle) pvkDeviceWaitIdle(s_vk.device);
++        vk_overlay_destroy();
+         vk_guest_shutdown();
+         for (int i = 0; i < VK_PIPELINE_SLOTS; i++)
+             if (s_vk.pipelines[i]) pvkDestroyPipeline(s_vk.device, s_vk.pipelines[i], NULL);
+diff --git a/libs/video/rsx_vulkan_backend.h b/libs/video/rsx_vulkan_backend.h
+index 6f9408c..563d8dd 100644
+--- a/libs/video/rsx_vulkan_backend.h
++++ b/libs/video/rsx_vulkan_backend.h
+@@ -75,6 +75,11 @@ int  rsx_vulkan_backend_pump_messages(void);
+ /* Read the frame back to host memory (and to PS3RECOMP_VK_DUMP if set). */
+ void rsx_vulkan_backend_present(void);
+ 
++/* Draw a short line of text (digits . - F P S) in the window's top-right corner
++ * on every present until it is replaced; NULL or "" removes it. Window only:
++ * not in the guest's surfaces, the readback or frame dumps. */
++void rsx_vulkan_backend_set_overlay(const char* text);
++
+ /* The clear colour most recently set through the command stream, ARGB8888. */
+ u32  rsx_vulkan_backend_debug_color(void);
+ 

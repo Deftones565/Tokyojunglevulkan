@@ -1,0 +1,33 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index b81076c..8006314 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -3041,7 +3041,12 @@ static void vk_eng_present(void* user, u32 surface)
+ {
+     (void)user;
+     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+-    if (o && !vk_begin()) {
++    /* The display image is read only by a frame dump (vk_cb_present reads
++     * back nothing else on the engine path), so the surface is copied into it
++     * only for a present that will be dumped; the window takes the frame
++     * straight from the surface. That copy was a submit-and-wait per frame. */
++    const int dump = s_vk.dump_path && ((s_vk.presented + 1u) % s_vk.dump_every) == 0;
++    if (o && dump && !vk_begin()) {
+         vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+         vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+         VkImageBlit blit = {
+@@ -3056,10 +3061,10 @@ static void vk_eng_present(void* user, u32 surface)
+                                                                       : VK_FILTER_LINEAR);
+         vk_submit_and_wait();
+     }
+-    /* Scaled: the window takes the frame from the surface itself, at its full
+-     * size; the guest-sized display image above stays what the readback and
+-     * frame dumps see. */
+-    if (o && rs_on()) {
++    /* The window takes the frame from the surface itself, at its full size
++     * (the render scale's); the guest-sized display image stays what frame
++     * dumps see. */
++    if (o) {
+         s_disp.src = o->im.img; s_disp.src_w = o->iw; s_disp.src_h = o->ih;
+     }
+     vk_cb_present(&s_vk, 0);

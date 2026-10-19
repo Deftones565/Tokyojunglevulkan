@@ -1,0 +1,142 @@
+diff --git a/runtime/syscalls/sys_memory.c b/runtime/syscalls/sys_memory.c
+index bfbaac5..f3dc803 100644
+--- a/runtime/syscalls/sys_memory.c
++++ b/runtime/syscalls/sys_memory.c
+@@ -58,15 +58,11 @@ static void write_be32(uint32_t addr, uint32_t val)
+  * r4 = flags (page size)
+  * r5 = pointer to receive allocated address (u32*)
+  * -----------------------------------------------------------------------*/
+-int64_t sys_memory_allocate(ppu_context* ctx)
++/* The allocation itself, shared by sys_memory_allocate (main pool) and
++ * sys_memory_allocate_from_container (charged to container `cid`, already
++ * validated by the caller; 0 = main pool). */
++static int64_t mem_allocate(uint32_t size, uint32_t flags, int32_t cid, uint32_t addr_out)
+ {
+-    uint32_t size      = LV2_ARG_U32(ctx, 0);
+-    uint32_t flags     = LV2_ARG_U32(ctx, 1);
+-    uint32_t addr_out  = LV2_ARG_PTR(ctx, 2);
+-
+-    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X)\n",
+-            size, flags);
+-
+     /* Determine alignment based on page size flags */
+     uint32_t alignment;
+     if (flags & SYS_MEMORY_PAGE_SIZE_1M) {
+@@ -113,15 +109,19 @@ int64_t sys_memory_allocate(ppu_context* ctx)
+     a->active       = 1;       /* claim the slot before unlocking */
+     a->addr         = alloc_addr;
+     a->size         = size;
+-    a->container_id = 0;
++    a->container_id = cid;
+     a->page_size    = alignment;  /* 0x100000 (1M) or 0x10000 (64K) */
++    if (cid > 0) g_sys_mem_containers[cid - 1].used_size += size;
+ 
+     bump_unlock();
+ 
+     /* Commit the pages (window is outside the pre-committed main region);
+      * fresh commits are already zeroed by the OS */
+     if (vm_commit(alloc_addr, size) != CELL_OK) {
++        bump_lock();
++        if (cid > 0) g_sys_mem_containers[cid - 1].used_size -= size;
+         a->active = 0;
++        bump_unlock();
+         return (int64_t)(int32_t)CELL_ENOMEM;
+     }
+ 
+@@ -134,6 +134,62 @@ int64_t sys_memory_allocate(ppu_context* ctx)
+     return CELL_OK;
+ }
+ 
++int64_t sys_memory_allocate(ppu_context* ctx)
++{
++    uint32_t size      = LV2_ARG_U32(ctx, 0);
++    uint32_t flags     = LV2_ARG_U32(ctx, 1);
++    uint32_t addr_out  = LV2_ARG_PTR(ctx, 2);
++
++    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X)\n",
++            size, flags);
++    return mem_allocate(size, flags, 0, addr_out);
++}
++
++/* ---------------------------------------------------------------------------
++ * sys_memory_allocate_from_container (lv2 350)
++ *
++ * r3 = size, r4 = container id, r5 = flags (page size), r6 = u32* address out
++ *
++ * Was unregistered, so it fell through to the syscall stub: CELL_OK with the
++ * address never written. Tokyo Jungle allocates its 16 MB map-block pool this
++ * way (func_001518F0) and carves 32 x 512 KB slots from the address it gets
++ * back -- from 0. The tutorial's blocks landed on the original PPU code image
++ * (dead in a recompile, so nothing showed), the Survival map's sixth block on
++ * the BSS at 0x00C00000 holding the sound middleware's state: "sgxBmg unknown
++ * ID", "sgsFileGetResult unknown file handle", BROKEN_EXIT_HDDGAME, a white
++ * screen right after the tutorial.
++ *
++ * A container id we never handed out is answered like a valid one (allocated
++ * from the main pool, one log line) rather than ESRCH as lv2 would: the title
++ * may have its id from a system container we don't model, and failing the
++ * allocation would only move the breakage. A known container is charged and
++ * refuses to overflow (ENOMEM), as lv2 does.
++ * -----------------------------------------------------------------------*/
++int64_t sys_memory_allocate_from_container(ppu_context* ctx)
++{
++    uint32_t size     = LV2_ARG_U32(ctx, 0);
++    uint32_t cid      = LV2_ARG_U32(ctx, 1);
++    uint32_t flags    = LV2_ARG_U32(ctx, 2);
++    uint32_t addr_out = LV2_ARG_PTR(ctx, 3);
++
++    fprintf(stderr, "[sys_memory] allocate_from_container(size=0x%X, cid=%u, flags=0x%X)\n",
++            size, cid, flags);
++    int32_t charge = 0;
++    if (cid >= 1 && cid <= SYS_MEMORY_CONTAINER_MAX && g_sys_mem_containers[cid - 1].active) {
++        const uint32_t align = (flags & SYS_MEMORY_PAGE_SIZE_1M) ? 0x100000u : 0x10000u;
++        sys_mem_container_info* c = &g_sys_mem_containers[cid - 1];
++        if ((uint64_t)c->used_size + VM_ALIGN_UP(size, align) > c->total_size)
++            return (int64_t)(int32_t)CELL_ENOMEM;
++        charge = (int32_t)cid;
++    } else {
++        static int warned;
++        if (!warned++)
++            fprintf(stderr, "[sys_memory] allocate_from_container: container %u is not one we "
++                            "created; allocating from the main pool\n", cid);
++    }
++    return mem_allocate(size, flags, charge, addr_out);
++}
++
+ /* ---------------------------------------------------------------------------
+  * sys_memory_free
+  *
+@@ -145,8 +201,13 @@ int64_t sys_memory_free(ppu_context* ctx)
+ 
+     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
+         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
++            bump_lock();
+             s_total_allocated -= g_sys_mem_allocs[i].size;
++            const int32_t cid = g_sys_mem_allocs[i].container_id;
++            if (cid > 0 && cid <= SYS_MEMORY_CONTAINER_MAX)
++                g_sys_mem_containers[cid - 1].used_size -= g_sys_mem_allocs[i].size;
+             g_sys_mem_allocs[i].active = 0;
++            bump_unlock();
+             return CELL_OK;
+         }
+     }
+@@ -501,6 +562,7 @@ void sys_memory_init(lv2_syscall_table* tbl)
+ 
+     lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE,             sys_memory_allocate);
+     lv2_syscall_register(tbl, SYS_MEMORY_FREE,                 sys_memory_free);
++    lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE_FROM_CONTAINER, sys_memory_allocate_from_container);
+     lv2_syscall_register(tbl, SYS_MEMORY_GET_USER_MEMORY_SIZE, sys_memory_get_user_memory_size);
+     lv2_syscall_register(tbl, SYS_MEMORY_GET_PAGE_ATTRIBUTE,   sys_memory_get_page_attribute);
+     lv2_syscall_register(tbl, SYS_MEMORY_CONTAINER_CREATE,     sys_memory_container_create);
+diff --git a/runtime/syscalls/sys_memory.h b/runtime/syscalls/sys_memory.h
+index 7ae67ac..a8bb0fc 100644
+--- a/runtime/syscalls/sys_memory.h
++++ b/runtime/syscalls/sys_memory.h
+@@ -57,6 +57,7 @@ extern uint32_t                 g_sys_mem_bump_ptr;  /* bump allocator pointer *
+ 
+ /* Syscall handlers */
+ int64_t sys_memory_allocate(ppu_context* ctx);
++int64_t sys_memory_allocate_from_container(ppu_context* ctx);
+ int64_t sys_memory_free(ppu_context* ctx);
+ int64_t sys_memory_get_user_memory_size(ppu_context* ctx);
+ int64_t sys_memory_get_page_attribute(ppu_context* ctx);

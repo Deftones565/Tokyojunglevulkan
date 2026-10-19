@@ -1,0 +1,110 @@
+diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
+index e460af4..58111c4 100644
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -837,6 +837,37 @@ static u32 eng_zdepth_snapshot(u32 slot)
+ 
+ /* ---- textures ------------------------------------------------------------ */
+ 
++/* SET_FOG_PARAMS (two floats) and SET_FOG_MODE, for the FP's fog input
++ * (rsx_fog_value in the decompiled shader): out = p0, p1, mode, where mode is
++ * 1 linear, 2 exp, 3 exp2, 4 exp_abs, 5 exp2_abs, 6 linear_abs. A register
++ * never written reads 0, which is the reset state: linear. */
++#define M_FOG_MODE    0x08CCu
++#define M_FOG_PARAMS  0x08D0u
++static void eng_fog_params(float out[3])
++{
++    const u32 p0 = rsx_dsp_reg(&g.rsx, M_FOG_PARAMS);
++    const u32 p1 = rsx_dsp_reg(&g.rsx, M_FOG_PARAMS + 4u);
++    memcpy(&out[0], &p0, 4);
++    memcpy(&out[1], &p1, 4);
++    switch (rsx_dsp_reg(&g.rsx, M_FOG_MODE)) {
++    case 0x0800u: out[2] = 2.0f; break;     /* EXP       */
++    case 0x0801u: out[2] = 3.0f; break;     /* EXP2      */
++    case 0x0802u: out[2] = 4.0f; break;     /* EXP_ABS   */
++    case 0x0803u: out[2] = 5.0f; break;     /* EXP2_ABS  */
++    case 0x0804u: out[2] = 6.0f; break;     /* LINEAR_ABS */
++    default:      out[2] = 1.0f; break;     /* LINEAR (0x2601), reset */
++    }
++    /* RSX_ENGINE_FOG_LOG=1: each new fog state, once. */
++    static int log = -1;
++    static u32 last[3] = { ~0u, ~0u, ~0u };
++    if (log < 0) { const char* e = getenv("RSX_ENGINE_FOG_LOG"); log = e && e[0] == '1'; }
++    const u32 mode = rsx_dsp_reg(&g.rsx, M_FOG_MODE);
++    if (log && (mode != last[0] || p0 != last[1] || p1 != last[2])) {
++        fprintf(stderr, "[rsx engine] fog mode 0x%04X params %g %g\n", mode, out[0], out[1]);
++        last[0] = mode; last[1] = p0; last[2] = p1;
++    }
++}
++
+ static rsx_be_format eng_texfmt(rsx_texfmt f)
+ {
+     switch (f) {
+@@ -2357,7 +2388,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+         memcpy(g.fp_cb, g.fp_constants.values, g.fp_constants.count * 16u);
+     { float* alpha = (float*)(g.fp_cb + nslots * 16u);
+       alpha[0] = rsx_fp_alpha_ref(rs.alpha_ref_raw, rs.alpha_ref_format);
+-      alpha[1] = alpha[2] = alpha[3] = 0.0f; }
++      eng_fog_params(&alpha[1]); }
+ 
+     pd_note(targets, n_targets, zslot, &rs, pipeline, tex_mask);
+ 
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index 1b258b8..793c01f 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -344,7 +344,7 @@ static const char* input_expr(u32 input_src)
+      * Texture coordinates and the vertex output registers remain unbounded. */
+     case 0x1: return "saturate(input.col0)"; /* COL0 */
+     case 0x2: return "saturate(input.col1)"; /* COL1 */
+-    case 0x3: return "input.fog";      /* FOGC */
++    case 0x3: return "_rsx_fogc";      /* FOGC, after the fog equation */
+     default:
+         if (input_src >= 0x4 && input_src <= 0xB) return tc[input_src - 0x4]; /* TC0..7 */
+         if (input_src == 0xC) return "input.tc8";   /* TEX8: VP output o15 */
+@@ -1122,6 +1122,27 @@ static int rsx_fp_decompile_internal(
+             "};\n",
+             buffered_constant_count ? buffered_constant_count : 1u);
+         out_puts(&p, constants_decl);
++        /* The RSX hands the FP's FOGC input through its fixed-function fog
++         * unit: x is the coordinate the VP wrote (o5.x), y the fog factor
++         * from SET_FOG_MODE / SET_FOG_PARAMS, clamped to 0..1 (RPCS3's
++         * fetch_fog_value). Feeding the raw coordinate as the factor lets a
++         * lerp toward the fog colour extrapolate far past both ends -- Tokyo
++         * Jungle's streets came out white and cyan. The engine passes
++         * (p0, p1, mode) in fp_alpha.yzw; mode 0 means "not supplied" and
++         * keeps the raw input, as before, for callers that don't fill it. */
++        out_puts(&p,
++            "float4 rsx_fog_value(float4 f) {\n"
++            "    const float p0 = fp_alpha.y, p1 = fp_alpha.z;\n"
++            "    const int mode = (int)fp_alpha.w;\n"
++            "    const float x = (mode >= 4) ? abs(f.x) : f.x;\n"
++            "    const float e = p1 * x + p0;\n"
++            "    float y;\n"
++            "    if (mode == 1 || mode == 6) y = e - 1.0;\n"
++            "    else if (mode == 2 || mode == 4) y = exp(11.084 * (e - 1.5));\n"
++            "    else if (mode == 3 || mode == 5) { const float t = 4.709 * (e - 1.5); y = exp(-(t * t)); }\n"
++            "    else return f;\n"
++            "    return float4(f.x, saturate(y), 0.0, 0.0);\n"
++            "}\n");
+     }
+     if (shadow) for (u32 u = 0; u < 16; u++)
+         if ((sampled_units & (1u << u)) && shadow[u].enabled)
+@@ -1147,6 +1168,8 @@ static int rsx_fp_decompile_internal(
+         "float4 _rsx_srgb2lin(float4 cs) { float4 a = cs / 12.92; float4 b = pow(max(cs + 0.055, 0.0) / 1.055, 2.4); return (cs > 0.04045) ? b : a; }\n");
+     if (targets == 1 && !depth_export) {
+         out_puts(&p, "float4 main(PSInput input) : SV_TARGET {\n");
++        out_puts(&p, buffered ? "    const float4 _rsx_fogc = rsx_fog_value(input.fog);\n"
++                              : "    const float4 _rsx_fogc = input.fog;\n");
+     } else {
+         out_puts(&p, "struct PSOutput {\n");
+         for (u32 t = 0; t < targets; t++) {
+@@ -1159,6 +1182,8 @@ static int rsx_fp_decompile_internal(
+             out_puts(&p, "    float depth : SV_Depth;\n");
+         out_puts(&p, "};\n"
+                      "PSOutput main(PSInput input) {\n");
++        out_puts(&p, buffered ? "    const float4 _rsx_fogc = rsx_fog_value(input.fog);\n"
++                              : "    const float4 _rsx_fogc = input.fog;\n");
+     }
+ 
+     if (!o.ok || !p.ok) return -1;

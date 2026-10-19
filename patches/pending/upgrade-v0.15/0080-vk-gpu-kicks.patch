@@ -1,0 +1,162 @@
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index 8006314..113793f 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -585,6 +585,78 @@ static void vk_pass_end(void)
+     s_pass.open = 0;
+ }
+ 
++/* GPU kicks. The batch used to reach the GPU only when something needed a
++ * result back (a readback, a present, a destroy): the whole frame's draws
++ * then ran in one go while the FIFO thread waited, and between those bursts
++ * the GPU idled and clocked down (P5), so every wait was long -- and the
++ * game's main thread waits on the FIFO thread (0055/0065). Now the open batch
++ * is also submitted, without waiting, every PS3RECOMP_VK_KICK_DRAWS draws
++ * (default 48) and at the end of each drain pass (rsx_vulkan_backend_kick),
++ * and recording carries on in the next of VK_KICK_MAX command buffers. The
++ * batch stays open: its rings, staging, descriptor pool and graveyard are only
++ * recycled after a full wait, exactly as before, so nothing a kicked buffer
++ * uses is reused early. Submission order on the one queue plus the global
++ * barrier every recorded operation starts with keep the GPU order unchanged.
++ * A wait (vk_submit_and_wait) waits for every kicked buffer too.
++ * PS3RECOMP_VK_KICK=0 turns kicks off. */
++#define VK_KICK_MAX 4
++static struct {
++    int             ready;           /* the pool exists                     */
++    int             cur;             /* cb[cur] is s_vk.cmd                 */
++    VkCommandBuffer cb[VK_KICK_MAX];
++    VkFence         fence[VK_KICK_MAX];
++    int             pending[VK_KICK_MAX];
++    u32             since;           /* draws recorded since the last kick  */
++} s_kick;
++
++static int vk_kick_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_KICK"); on = !(e && e[0] == '0'); }
++    return on;
++}
++
++static void vk_kick_wait_all(void)
++{
++    for (int i = 0; i < VK_KICK_MAX; i++)
++        if (s_kick.pending[i]) {
++            pvkWaitForFences(s_vk.device, 1, &s_kick.fence[i], VK_TRUE, UINT64_MAX);
++            s_kick.pending[i] = 0;
++        }
++}
++
++static void vk_pass_end(void);
++
++/* Submit what the open batch has recorded so far and carry on recording in
++ * the next command buffer, without waiting. */
++static void vk_kick(void)
++{
++    if (!s_kick.ready || !s_batch.open || s_batch.off || !vk_kick_on()) return;
++    s_kick.since = 0;
++    vk_pass_end();
++    if (pvkEndCommandBuffer(s_vk.cmd) != VK_SUCCESS) return;
++    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
++                        .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
++    pvkResetFences(s_vk.device, 1, &s_vk.fence);
++    if (pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence) != VK_SUCCESS) {
++        VK_LOG("vkQueueSubmit (kick) failed\n");
++        return;
++    }
++    s_kick.pending[s_kick.cur] = 1;
++    const int nx = (s_kick.cur + 1) % VK_KICK_MAX;
++    if (s_kick.pending[nx]) {            /* the oldest one: reuse it once done */
++        pvkWaitForFences(s_vk.device, 1, &s_kick.fence[nx], VK_TRUE, UINT64_MAX);
++        s_kick.pending[nx] = 0;
++    }
++    s_kick.cur = nx;
++    s_vk.cmd = s_kick.cb[nx];
++    s_vk.fence = s_kick.fence[nx];
++    pvkResetCommandBuffer(s_vk.cmd, 0);
++    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++    pvkBeginCommandBuffer(s_vk.cmd, &bi);
++}
++
+ static int vk_batch_flush(void)
+ {
+     if (!s_batch.open) return 0;
+@@ -622,6 +694,7 @@ static int vk_submit_and_wait(void)
+     struct timespec t0, t1;
+     if (st) clock_gettime(CLOCK_MONOTONIC, &t0);
+     VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
++    vk_kick_wait_all();                  /* buffers kicked before this one */
+     if (st) {
+         static double wait_ms, t_last; static unsigned long subs, draws_at;
+         extern unsigned long g_vk_draws_total;
+@@ -4370,7 +4443,11 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
+     if (!merge) vk_pass_end();
+     s_batch.draws++;
+     g_vk_draws_total++;
+-    if (s_batch.off) vk_batch_flush();
++    if (s_batch.off) { vk_batch_flush(); return; }
++    static u32 kick_draws = 0;
++    if (!kick_draws) { const char* e = getenv("PS3RECOMP_VK_KICK_DRAWS");
++                       kick_draws = (e && atoi(e) > 0) ? (u32)atoi(e) : 48u; }
++    if (++s_kick.since >= kick_draws) vk_kick();
+ }
+ 
+ static const rsx_draw_backend s_vk_engine_backend = {
+@@ -4514,6 +4591,15 @@ static int vk_init_all(u32 width, u32 height, const char* title)
+     VK_CHECK(pvkAllocateCommandBuffers(s_vk.device, &cai, &s_vk.cmd), "vkAllocateCommandBuffers");
+     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+     VK_CHECK(pvkCreateFence(s_vk.device, &fci, NULL, &s_vk.fence), "vkCreateFence");
++    /* The kick pool (vk_kick): cb[0]/fence[0] are the ones just made. */
++    s_kick.cb[0] = s_vk.cmd; s_kick.fence[0] = s_vk.fence; s_kick.cur = 0;
++    cai.commandBufferCount = VK_KICK_MAX - 1;
++    if (pvkAllocateCommandBuffers(s_vk.device, &cai, &s_kick.cb[1]) == VK_SUCCESS) {
++        int ok = 1;
++        for (int i = 1; i < VK_KICK_MAX; i++)
++            if (pvkCreateFence(s_vk.device, &fci, NULL, &s_kick.fence[i]) != VK_SUCCESS) ok = 0;
++        s_kick.ready = ok;
++    }
+ 
+     if (vk_pick_depth_format()) return -1;
+     if (vk_create_image(&s_vk.color, VK_FORMAT_R8G8B8A8_UNORM, s_vk.width, s_vk.height,
+@@ -4623,7 +4709,13 @@ void rsx_vulkan_backend_shutdown(void)
+         vk_destroy_image(&s_vk.color);
+         vk_destroy_buffer(&s_vk.vertices);
+         vk_destroy_buffer(&s_vk.readback);
+-        if (s_vk.fence) pvkDestroyFence(s_vk.device, s_vk.fence, NULL);
++        if (s_kick.ready || s_kick.fence[0]) {
++            for (int i = 0; i < VK_KICK_MAX; i++)
++                if (s_kick.fence[i]) pvkDestroyFence(s_vk.device, s_kick.fence[i], NULL);
++        } else if (s_vk.fence) {
++            pvkDestroyFence(s_vk.device, s_vk.fence, NULL);
++        }
++        memset(&s_kick, 0, sizeof s_kick);
+         if (s_vk.pool)  pvkDestroyCommandPool(s_vk.device, s_vk.pool, NULL);
+         pvkDestroyDevice(s_vk.device, NULL);
+     }
+@@ -4779,6 +4871,10 @@ int rsx_vulkan_backend_set_render_scale(u32 num, u32 den)
+ 
+ u32 rsx_vulkan_backend_max_image_dim(void) { return vk_max_dim(); }
+ 
++/* End of a drain pass: hand the GPU what the pass recorded now rather than
++ * at the next wait (vk_kick). */
++void rsx_vulkan_backend_kick(void) { if (s_vk.device) vk_kick(); }
++
+ void rsx_vulkan_backend_set_ui(const u32* rgba, u32 w, u32 h)
+ {
+     if (!rgba || !w || !h) { s_disp.ui_shown = 0; return; }
+diff --git a/libs/video/rsx_vulkan_backend.h b/libs/video/rsx_vulkan_backend.h
+index 41b4353..42246ae 100644
+--- a/libs/video/rsx_vulkan_backend.h
++++ b/libs/video/rsx_vulkan_backend.h
+@@ -108,6 +108,11 @@ void  rsx_vulkan_backend_window_extent(u32* w, u32* h);
+ int   rsx_vulkan_backend_set_render_scale(u32 num, u32 den);
+ u32   rsx_vulkan_backend_max_image_dim(void);
+ 
++/* Submit the draws recorded so far without waiting (the frame clock calls it
++ * after each FIFO drain pass), so the GPU works while the FIFO thread does not
++ * wait. PS3RECOMP_VK_KICK=0 makes it a no-op. */
++void  rsx_vulkan_backend_kick(void);
++
+ /* The clear colour most recently set through the command stream, ARGB8888. */
+ u32  rsx_vulkan_backend_debug_color(void);
+ 
