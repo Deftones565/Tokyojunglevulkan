@@ -1,0 +1,376 @@
+diff --git a/libs/video/rsx_shader_spirv.cpp b/libs/video/rsx_shader_spirv.cpp
+index f9725b8..cca2e3f 100644
+--- a/libs/video/rsx_shader_spirv.cpp
++++ b/libs/video/rsx_shader_spirv.cpp
+@@ -25,8 +25,26 @@
+ #include <glslang/Public/ShaderLang.h>
+ #include <glslang/Public/ResourceLimits.h>
+ #include <glslang/SPIRV/GlslangToSpv.h>
++#include <glslang/build_info.h>
+ 
++#include <atomic>
++#include <chrono>
++#include <mutex>
++#include <stdlib.h>
++#include <string>
++#include <sys/stat.h>
+ #include <vector>
++#if defined(_WIN32)
++#include <direct.h>
++#include <process.h>
++#define mkdir(path, mode) _mkdir(path)
++#define getpid _getpid
++#ifndef S_ISDIR
++#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
++#endif
++#else
++#include <unistd.h>
++#endif
+ 
+ namespace {
+ 
+@@ -51,9 +69,9 @@ bool glslang_ready()
+ 
+ extern "C" int rsx_hlsl_to_spirv_available(void) { return 1; }
+ 
+-extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
+-                                 u32* words, u32 max_words, u32* out_words,
+-                                 char* log, u32 log_size)
++static int hlsl_to_spirv_uncached(const char* hlsl, int stage,
++                                  u32* words, u32 max_words, u32* out_words,
++                                  char* log, u32 log_size)
+ {
+     if (out_words) *out_words = 0;
+     if (!hlsl || !words || !out_words || max_words == 0) {
+@@ -122,6 +140,136 @@ extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
+     return 0;
+ }
+ 
++/* SPIR-V disk cache. glslang takes milliseconds per shader and every program
++ * a title uses is translated again on every launch, the first time it is
++ * drawn: the hitches of the first minutes in each area. The result depends
++ * only on the HLSL text, the stage and the translator, so it is stored under
++ * a 128-bit hash of those, one file per shader, and read back on the next
++ * launch. A file whose header does not match (another translator version, a
++ * different text length, a short read) counts as a miss and is rewritten.
++ * Bump SPIRV_CACHE_TAG whenever the options above change.
++ * PS3RECOMP_SHADER_CACHE=<dir> moves it (default $XDG_CACHE_HOME or
++ * ~/.cache, then ps3recomp/spirv), =0 turns it off.
++ * PS3RECOMP_SHADER_CACHE_STATS=1 logs hits, misses and translation time. */
++namespace {
++
++#define SPV_STR2(x) #x
++#define SPV_STR(x) SPV_STR2(x)
++const char SPIRV_CACHE_TAG[] = "rsx-spirv-cache 1 glslang "
++    SPV_STR(GLSLANG_VERSION_MAJOR) "." SPV_STR(GLSLANG_VERSION_MINOR) "."
++    SPV_STR(GLSLANG_VERSION_PATCH) GLSLANG_VERSION_FLAVOR;
++
++struct SpvCacheHeader {
++    char magic[8];          /* "RSXSPV1\0" */
++    u64  key_lo, key_hi;    /* repeats the file name */
++    u64  text_bytes;        /* strlen(hlsl) */
++    u32  stage, words;
++};
++
++std::string spv_cache_dir()
++{
++    static std::once_flag once;
++    static std::string dir;
++    std::call_once(once, [] {
++        const char* e = getenv("PS3RECOMP_SHADER_CACHE");
++        if (e && e[0] == '0' && !e[1]) return;
++        std::string d;
++        if (e && *e) d = e;
++        else if (const char* x = getenv("XDG_CACHE_HOME"); x && *x) d = std::string(x) + "/ps3recomp/spirv";
++        else if (const char* h = getenv("HOME"); h && *h) d = std::string(h) + "/.cache/ps3recomp/spirv";
++        else return;
++        for (size_t i = 1; i <= d.size(); i++)          /* mkdir -p */
++            if (i == d.size() || d[i] == '/') mkdir(d.substr(0, i).c_str(), 0755);
++        struct stat st;
++        if (stat(d.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) dir = d;
++    });
++    return dir;
++}
++
++void spv_cache_key(const char* hlsl, size_t n, int stage, u64* lo, u64* hi)
++{
++    u64 a = 1469598103934665603ull, b = 0x9E3779B97F4A7C15ull;
++    auto mix = [&](const unsigned char* p, size_t len) {
++        for (size_t i = 0; i < len; i++) {
++            a = (a ^ p[i]) * 1099511628211ull;
++            b = (b ^ p[i]) * 0xff51afd7ed558ccdull;
++            b ^= b >> 29;
++        }
++    };
++    mix((const unsigned char*)SPIRV_CACHE_TAG, sizeof SPIRV_CACHE_TAG);
++    const unsigned char st = (unsigned char)stage;
++    mix(&st, 1);
++    mix((const unsigned char*)hlsl, n);
++    *lo = a; *hi = b;
++}
++
++std::atomic<unsigned> s_spv_hits{0}, s_spv_misses{0}, s_spv_tmp{0};
++std::atomic<unsigned long long> s_spv_miss_us{0};
++
++} // namespace
++
++extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
++                                 u32* words, u32 max_words, u32* out_words,
++                                 char* log, u32 log_size)
++{
++    const std::string dir = (hlsl && words && out_words) ? spv_cache_dir() : std::string();
++    if (dir.empty())
++        return hlsl_to_spirv_uncached(hlsl, stage, words, max_words, out_words, log, log_size);
++    static const int stats = getenv("PS3RECOMP_SHADER_CACHE_STATS") ? 1 : 0;
++
++    const size_t n = strlen(hlsl);
++    u64 lo, hi;
++    spv_cache_key(hlsl, n, stage, &lo, &hi);
++    char name[64];
++    snprintf(name, sizeof name, "/%016llx%016llx.spv", (unsigned long long)hi, (unsigned long long)lo);
++    const std::string path = dir + name;
++
++    if (FILE* f = fopen(path.c_str(), "rb")) {
++        SpvCacheHeader h;
++        const bool ok = fread(&h, sizeof h, 1, f) == 1 &&
++            memcmp(h.magic, "RSXSPV1", 8) == 0 && h.key_lo == lo && h.key_hi == hi &&
++            h.text_bytes == n && h.stage == (u32)stage && h.words && h.words <= max_words &&
++            fread(words, sizeof(u32), h.words, f) == h.words && fgetc(f) == EOF;
++        fclose(f);
++        if (ok) {
++            *out_words = h.words;
++            const unsigned k = ++s_spv_hits;
++            if (stats && (k & 63u) == 1u)
++                fprintf(stderr, "[spirv-cache] %u hits, %u misses (%llu ms translating)\n",
++                        k, s_spv_misses.load(), s_spv_miss_us.load() / 1000ull);
++            return 0;
++        }
++    }
++
++    const auto t0 = std::chrono::steady_clock::now();
++    const int rc = hlsl_to_spirv_uncached(hlsl, stage, words, max_words, out_words, log, log_size);
++    const unsigned long long us = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
++        std::chrono::steady_clock::now() - t0).count();
++    s_spv_miss_us += us;
++    const unsigned k = ++s_spv_misses;
++    if (stats)
++        fprintf(stderr, "[spirv-cache] miss %u: %llu us (%u hits so far)\n", k, us, s_spv_hits.load());
++    if (rc != 0 || !*out_words) return rc;
++
++    /* Written whole to a private name, then renamed: a reader never sees
++     * half a file, and two writers of one key leave one complete copy. */
++    SpvCacheHeader h;
++    memset(&h, 0, sizeof h);
++    memcpy(h.magic, "RSXSPV1", 8);
++    h.key_lo = lo; h.key_hi = hi; h.text_bytes = n;
++    h.stage = (u32)stage; h.words = *out_words;
++    char tmp_suffix[48];
++    snprintf(tmp_suffix, sizeof tmp_suffix, ".%d.%u.tmp", (int)getpid(), ++s_spv_tmp);
++    const std::string tmp = path + tmp_suffix;
++    if (FILE* f = fopen(tmp.c_str(), "wb")) {
++        const bool ok = fwrite(&h, sizeof h, 1, f) == 1 &&
++            fwrite(words, sizeof(u32), h.words, f) == h.words;
++        if (fclose(f) == 0 && ok) rename(tmp.c_str(), path.c_str());
++        else remove(tmp.c_str());
++    }
++    return 0;
++}
++
+ #else /* !PS3RECOMP_HAVE_SPIRV_TRANSLATION */
+ 
+ extern "C" int rsx_hlsl_to_spirv_available(void) { return 0; }
+diff --git a/libs/video/rsx_vulkan_backend.c b/libs/video/rsx_vulkan_backend.c
+index d0c57dc..39b8201 100644
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -60,12 +60,15 @@
+ #include <SDL2/SDL_vulkan.h>
+ 
+ #include <dlfcn.h>
++#include <pthread.h>
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <sys/stat.h>
+ #include <time.h>
++#include <unistd.h>
+ 
+ /* ---------------------------------------------------------------------------
+  * Run-time loaded entry points (Vulkan 1.0 core only)
+@@ -94,6 +97,7 @@
+     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkResetDescriptorPool) \
+     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) \
+     X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
++    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData) \
+     X(vkCreateSampler) X(vkDestroySampler) \
+     X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
+     X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) \
+@@ -221,6 +225,121 @@ typedef struct vk_state {
+ 
+ static vk_state s_vk;
+ 
++/* Pipeline disk cache. Every graphics pipeline is created through
++ * s_vk_pcache, which starts from the file the last launch left
++ * (<shader cache dir>/vk_pipelines.bin, the directory of the SPIR-V cache,
++ * rsx_shader_spirv.cpp) and is written back from a background thread every
++ * 15 s while new pipelines appear: the driver validates the header (vendor,
++ * device, driver UUID) and ignores a stale file. PS3RECOMP_SHADER_CACHE=0
++ * turns it off with the SPIR-V cache; PS3RECOMP_SHADER_CACHE_STATS=1 logs
++ * pipeline creation counts and times. */
++static VkPipelineCache s_vk_pcache;
++static char            s_vk_pcache_path[1024];
++static volatile u32    s_vk_pipes_made, s_vk_pipes_saved;
++static double          s_vk_pipe_ms, s_vk_pipe_ms_max;
++
++static double vk_now_ms(void)
++{
++    struct timespec t;
++    clock_gettime(CLOCK_MONOTONIC, &t);
++    return t.tv_sec * 1e3 + t.tv_nsec * 1e-6;
++}
++
++static int vk_pcache_save(void)
++{
++    size_t n = 0;
++    if (!s_vk_pcache || pvkGetPipelineCacheData(s_vk.device, s_vk_pcache, &n, NULL) != VK_SUCCESS || !n)
++        return -1;
++    void* data = malloc(n);
++    if (!data) return -1;
++    int rc = -1;
++    if (pvkGetPipelineCacheData(s_vk.device, s_vk_pcache, &n, data) == VK_SUCCESS) {
++        char tmp[1100];
++        snprintf(tmp, sizeof tmp, "%s.%d.tmp", s_vk_pcache_path, (int)getpid());
++        FILE* f = fopen(tmp, "wb");
++        if (f) {
++            const int ok = fwrite(data, 1, n, f) == n;
++            if (fclose(f) == 0 && ok && rename(tmp, s_vk_pcache_path) == 0) rc = 0;
++            else remove(tmp);
++        }
++    }
++    free(data);
++    return rc;
++}
++
++static void* vk_pcache_saver(void* arg)
++{
++    (void)arg;
++    for (;;) {
++        sleep(15);
++        const u32 made = s_vk_pipes_made;
++        if (made != s_vk_pipes_saved && vk_pcache_save() == 0) s_vk_pipes_saved = made;
++    }
++    return NULL;
++}
++
++static void vk_pcache_open(void)
++{
++    const char* e = getenv("PS3RECOMP_SHADER_CACHE");
++    if (e && e[0] == '0' && !e[1]) return;
++    char dir[900];
++    const char* x = getenv("XDG_CACHE_HOME");
++    const char* h = getenv("HOME");
++    if (e && *e)        snprintf(dir, sizeof dir, "%s", e);
++    else if (x && *x)   snprintf(dir, sizeof dir, "%s/ps3recomp/spirv", x);
++    else if (h && *h)   snprintf(dir, sizeof dir, "%s/.cache/ps3recomp/spirv", h);
++    else return;
++    for (char* p = dir + 1; ; p++) {                        /* mkdir -p */
++        const char c = *p;
++        if (c == '/' || !c) { *p = 0; mkdir(dir, 0755); *p = c; }
++        if (!c) break;
++    }
++    snprintf(s_vk_pcache_path, sizeof s_vk_pcache_path, "%s/vk_pipelines.bin", dir);
++    void* data = NULL;
++    size_t n = 0;
++    FILE* f = fopen(s_vk_pcache_path, "rb");
++    if (f) {
++        if (fseek(f, 0, SEEK_END) == 0) {
++            const long len = ftell(f);
++            if (len > 0 && len < (256L << 20) && fseek(f, 0, SEEK_SET) == 0 &&
++                (data = malloc((size_t)len)) && fread(data, 1, (size_t)len, f) == (size_t)len)
++                n = (size_t)len;
++        }
++        fclose(f);
++    }
++    VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
++                                     .initialDataSize = n, .pInitialData = n ? data : NULL };
++    if (pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_vk_pcache) != VK_SUCCESS) {
++        ci.initialDataSize = 0; ci.pInitialData = NULL;      /* a file the driver refuses */
++        if (pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_vk_pcache) != VK_SUCCESS)
++            s_vk_pcache = VK_NULL_HANDLE;
++    }
++    free(data);
++    if (!s_vk_pcache) return;
++    fprintf(stderr, "[vk] pipeline cache: %s (%zu bytes loaded)\n", s_vk_pcache_path, n);
++    pthread_t t;
++    if (pthread_create(&t, NULL, vk_pcache_saver, NULL) == 0) pthread_detach(t);
++}
++
++/* vkCreateGraphicsPipelines through the disk cache, timed. */
++static VkResult vk_create_pipeline(const VkGraphicsPipelineCreateInfo* gci, VkPipeline* out)
++{
++    static int stats = -1;
++    if (stats < 0) stats = getenv("PS3RECOMP_SHADER_CACHE_STATS") ? 1 : 0;
++    const double t0 = stats ? vk_now_ms() : 0.0;
++    const VkResult r = pvkCreateGraphicsPipelines(s_vk.device, s_vk_pcache, 1, gci, NULL, out);
++    __atomic_add_fetch(&s_vk_pipes_made, 1u, __ATOMIC_RELAXED);
++    if (stats) {
++        const double ms = vk_now_ms() - t0;
++        s_vk_pipe_ms += ms;
++        if (ms > s_vk_pipe_ms_max) s_vk_pipe_ms_max = ms;
++        if ((s_vk_pipes_made & 63u) == 1u || ms > 20.0)
++            fprintf(stderr, "[vk-pipeline] %u made, %.0f ms total, max %.1f ms (this one %.1f ms)\n",
++                    s_vk_pipes_made, s_vk_pipe_ms, s_vk_pipe_ms_max, ms);
++    }
++    return r;
++}
++
+ #define VK_LOG(...)  fprintf(stderr, "[RSX vulkan] " __VA_ARGS__)
+ #define VK_CHECK(call, what)                                               \
+     do { VkResult r_ = (call);                                             \
+@@ -1202,7 +1321,7 @@ static VkPipeline vk_get_pipeline(int ztest, int zwrite, u32 cmp)
+         .pDynamicState = &dy, .layout = s_vk.pipe_layout, .renderPass = s_vk.render_pass,
+         .subpass = 0 };
+     VkPipeline p = VK_NULL_HANDLE;
+-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
++    VkResult r = vk_create_pipeline(&gci, &p);
+     if (r != VK_SUCCESS) { VK_LOG("vkCreateGraphicsPipelines failed (%d)\n", (int)r); return VK_NULL_HANDLE; }
+     s_vk.pipelines[slot] = p;
+     return p;
+@@ -1543,7 +1662,7 @@ static VkPipeline vk_guest_pipeline(int vs, int fs, int ztest, int zwrite, u32 c
+         .pDynamicState = &dy, .layout = s_g.pipe_layout, .renderPass = s_vk.render_pass,
+         .subpass = 0 };
+     VkPipeline p = VK_NULL_HANDLE;
+-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &p);
++    VkResult r = vk_create_pipeline(&gci, &p);
+     if (r != VK_SUCCESS) {
+         VK_LOG("guest pipeline: vkCreateGraphicsPipelines failed (%d)\n", (int)r);
+         return VK_NULL_HANDLE;
+@@ -2126,7 +2245,7 @@ static int vk_ui_pipeline(void)
+         .pColorBlendState = &cb, .pDynamicState = &ds, .layout = s_disp.layout,
+         .renderPass = s_disp.rp, .subpass = 0,
+     };
+-    VkResult r = pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL, &s_disp.pipe);
++    VkResult r = vk_create_pipeline(&gci, &s_disp.pipe);
+     pvkDestroyShaderModule(s_vk.device, vs, NULL);
+     pvkDestroyShaderModule(s_vk.device, fs, NULL);
+     if (r != VK_SUCCESS) { VK_LOG("ui: pipeline failed (VkResult %d)\n", (int)r); s_disp.pipe = VK_NULL_HANDLE; return -1; }
+@@ -3976,8 +4095,7 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
+         .pViewportState = &vps, .pRasterizationState = &ras, .pMultisampleState = &ms,
+         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
+         .layout = layout, .renderPass = rp, .subpass = 0 };
+-    if (pvkCreateGraphicsPipelines(s_vk.device, VK_NULL_HANDLE, 1, &gci, NULL,
+-                                   &P->variant[topo_idx]) != VK_SUCCESS) {
++    if (vk_create_pipeline(&gci, &P->variant[topo_idx]) != VK_SUCCESS) {
+         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
+         P->variant[topo_idx] = VK_NULL_HANDLE;
+     }
+@@ -4610,6 +4728,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
+     if (s_vk.windowed && vk_load_wsi_device_functions())
+         vk_window_drop("the driver has no swapchain functions");
+     pvkGetDeviceQueue(s_vk.device, s_vk.queue_family, 0, &s_vk.queue);
++    vk_pcache_open();
+ 
+     VkCommandPoolCreateInfo pci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                     .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
