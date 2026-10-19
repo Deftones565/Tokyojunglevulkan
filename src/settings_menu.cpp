@@ -54,6 +54,7 @@ extern "C" {
 void     rsx_vulkan_backend_set_ui(const uint32_t* rgba, uint32_t w, uint32_t h);
 void     rsx_vulkan_backend_set_vsync(int on);
 void     rsx_vulkan_backend_set_keep_aspect(int mode);   /* 0 stretch, 1 keep, 2 fill */
+void     rsx_vulkan_backend_set_fxaa(int on);
 void     rsx_vulkan_backend_set_escape_quits(int on);
 void*    rsx_vulkan_backend_sdl_window(void);
 void     rsx_vulkan_backend_window_extent(uint32_t* w, uint32_t* h);
@@ -122,7 +123,8 @@ static void settings_save(void)
     fprintf(f, "aspect_ratio = %s\n", aspects[s_set.aspect]);
     fprintf(f, "vsync = %s\n", s_set.vsync ? "on" : "off");
     fprintf(f, "show_fps = %s\n", s_set.show_fps ? "on" : "off");
-    fprintf(f, "anti_aliasing = %s\n", s_set.anti_aliasing == TJ_AA_GAME_MLAA ? "mlaa" : "off");
+    fprintf(f, "anti_aliasing = %s\n", s_set.anti_aliasing == TJ_AA_GAME_MLAA ? "mlaa"
+                                       : s_set.anti_aliasing == TJ_AA_FXAA ? "fxaa" : "off");
     fprintf(f, "frame_rate = %s\n", s_set.target60 ? "60" : "game");
     fclose(f);
     rename(tmp, s_path);
@@ -166,7 +168,8 @@ static void settings_parse(FILE* f)
         } else if (!strcmp(k, "frame_rate")) {
             s_set.target60 = strcmp(v, "game") != 0;
         } else if (!strcmp(k, "anti_aliasing")) {
-            s_set.anti_aliasing = !strcmp(v, "mlaa") ? TJ_AA_GAME_MLAA : TJ_AA_OFF;
+            s_set.anti_aliasing = !strcmp(v, "mlaa") ? TJ_AA_GAME_MLAA
+                                : !strcmp(v, "fxaa") ? TJ_AA_FXAA : TJ_AA_OFF;
         }
     }
 }
@@ -198,6 +201,8 @@ void tj_settings_load(void)
     if (const char* e = getenv("TJ_SHOW_FPS"); e && *e) s_set.show_fps = *e != '0';
     if (const char* e = getenv("TJ_DISABLE_MLAA"); e && *e)
         s_set.anti_aliasing = *e == '0' ? TJ_AA_GAME_MLAA : TJ_AA_OFF;
+    if (const char* e = getenv("TJ_FXAA"); e && *e)
+        s_set.anti_aliasing = *e != '0' ? TJ_AA_FXAA : TJ_AA_OFF;
     if (const char* e = getenv("TJ_RENDER_SCALE"); e && *e) {
         const int p = atoi(e);
         if (p >= 100 && p <= 800) s_set.scale_pct = p;
@@ -561,7 +566,7 @@ static std::vector<Row> rows(void)
     r.push_back({ R_ASPECT, nullptr, "Aspect ratio", aspects[s_set.aspect], s_have_window, true });
     r.push_back({ R_VSYNC, nullptr, "VSync", s_set.vsync ? "On" : "Off", s_have_window, true });
     r.push_back({ R_RATE, nullptr, "Frame rate", s_set.target60 ? "Aim for 60" : "Game decides 30/60", true, true });
-    static const char* const aa[] = { "Off", "Game MLAA (slower)" };
+    static const char* const aa[] = { "Off", "Game MLAA (slower)", "FXAA (fast)" };
     r.push_back({ R_AA, nullptr, "Anti-aliasing", aa[s_set.anti_aliasing], true, true });
     r.push_back({ R_FPS, "INTERFACE", "Show FPS (F1)", s_set.show_fps ? "On" : "Off", s_have_window, true });
     r.push_back({ R_RESUME, "", "Resume", "", true, false });
@@ -623,7 +628,8 @@ static void change(RowId id, int dir)
         s_set.target60 = !s_set.target60;
         break;
     case R_AA:
-        s_set.anti_aliasing = ((s_set.anti_aliasing + dir) % 2 + 2) % 2;
+        s_set.anti_aliasing = ((s_set.anti_aliasing + dir) % 3 + 3) % 3;
+        rsx_vulkan_backend_set_fxaa(s_set.anti_aliasing == TJ_AA_FXAA);
         break;
     default:
         return;
@@ -822,6 +828,7 @@ void tj_settings_backend_ready(void)
     s_have_window = window() != nullptr;
     rsx_vulkan_backend_set_keep_aspect(s_set.aspect);
     rsx_vulkan_backend_set_vsync(s_set.vsync);
+    rsx_vulkan_backend_set_fxaa(s_set.anti_aliasing == TJ_AA_FXAA);
     if (s_have_window) {
         rsx_vulkan_backend_set_escape_quits(0);   /* Escape opens the menu; Quit is in it */
         apply_display();

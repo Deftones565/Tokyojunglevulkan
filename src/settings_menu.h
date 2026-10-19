@@ -29,9 +29,10 @@ void tj_settings_frame(void);
 bool tj_settings_show_fps(void);
 
 /* Anti-aliasing: 0 off, 1 the game's own SPU MLAA (slower: two full-frame
- * readbacks a frame, and the game drops to its 30 FPS mode). Read per frame
- * by src/tj_mlaa.cpp, so the menu switches it live. */
-enum { TJ_AA_OFF = 0, TJ_AA_GAME_MLAA = 1 };
+ * readbacks a frame, and the game drops to its 30 FPS mode), 2 host FXAA (one
+ * GPU pass when the frame is presented; the game's MLAA stays off). Read per
+ * frame by src/tj_mlaa.cpp, so the menu switches it live. */
+enum { TJ_AA_OFF = 0, TJ_AA_GAME_MLAA = 1, TJ_AA_FXAA = 2 };
 int tj_settings_anti_aliasing(void);
 
 /* Frame rate: aim for 60 (the game's drop to its 30 FPS mode switched off)
