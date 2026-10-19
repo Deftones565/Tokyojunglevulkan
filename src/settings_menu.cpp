@@ -75,6 +75,7 @@ struct Settings {
     int  aspect = 0;                  /* 0 stretch, 1 keep 16:9 (bars), 2 fill (crop) */
     bool vsync = true;
     bool show_fps = false;
+    int  anti_aliasing = 0;           /* TJ_AA_*: off by default (60 FPS mode) */
 };
 
 static Settings s_set;
@@ -120,6 +121,7 @@ static void settings_save(void)
     fprintf(f, "aspect_ratio = %s\n", aspects[s_set.aspect]);
     fprintf(f, "vsync = %s\n", s_set.vsync ? "on" : "off");
     fprintf(f, "show_fps = %s\n", s_set.show_fps ? "on" : "off");
+    fprintf(f, "anti_aliasing = %s\n", s_set.anti_aliasing == TJ_AA_GAME_MLAA ? "mlaa" : "off");
     fclose(f);
     rename(tmp, s_path);
 }
@@ -159,6 +161,8 @@ static void settings_parse(FILE* f)
             s_set.vsync = parse_on(v);
         } else if (!strcmp(k, "show_fps")) {
             s_set.show_fps = parse_on(v);
+        } else if (!strcmp(k, "anti_aliasing")) {
+            s_set.anti_aliasing = !strcmp(v, "mlaa") ? TJ_AA_GAME_MLAA : TJ_AA_OFF;
         }
     }
 }
@@ -188,6 +192,8 @@ void tj_settings_load(void)
     }
     /* Environment overrides, for scripted runs. */
     if (const char* e = getenv("TJ_SHOW_FPS"); e && *e) s_set.show_fps = *e != '0';
+    if (const char* e = getenv("TJ_DISABLE_MLAA"); e && *e)
+        s_set.anti_aliasing = *e == '0' ? TJ_AA_GAME_MLAA : TJ_AA_OFF;
     if (const char* e = getenv("TJ_RENDER_SCALE"); e && *e) {
         const int p = atoi(e);
         if (p >= 100 && p <= 800) s_set.scale_pct = p;
@@ -195,6 +201,7 @@ void tj_settings_load(void)
 }
 
 bool tj_settings_show_fps(void) { return s_set.show_fps; }
+int  tj_settings_anti_aliasing(void) { return s_set.anti_aliasing; }
 
 /* ---------------------------------------------------------------------------
  * Applying
@@ -499,7 +506,7 @@ static float draw_text(Canvas& cv, Font& f, int px_size, float x, float y, const
 /* ---------------------------------------------------------------------------
  * The menu
  * -----------------------------------------------------------------------*/
-enum RowId { R_MODE, R_RES, R_SCALE, R_ASPECT, R_VSYNC, R_FPS, R_RESUME, R_QUIT };
+enum RowId { R_MODE, R_RES, R_SCALE, R_ASPECT, R_VSYNC, R_AA, R_FPS, R_RESUME, R_QUIT };
 
 struct Row {
     RowId id;
@@ -548,6 +555,8 @@ static std::vector<Row> rows(void)
     static const char* const aspects[] = { "Stretch to window", "Keep 16:9 (bars)", "Fill window (crop)" };
     r.push_back({ R_ASPECT, nullptr, "Aspect ratio", aspects[s_set.aspect], s_have_window, true });
     r.push_back({ R_VSYNC, nullptr, "VSync", s_set.vsync ? "On" : "Off", s_have_window, true });
+    static const char* const aa[] = { "Off", "Game MLAA (slower)" };
+    r.push_back({ R_AA, nullptr, "Anti-aliasing", aa[s_set.anti_aliasing], true, true });
     r.push_back({ R_FPS, "INTERFACE", "Show FPS (F1)", s_set.show_fps ? "On" : "Off", s_have_window, true });
     r.push_back({ R_RESUME, "", "Resume", "", true, false });
     r.push_back({ R_QUIT, nullptr, "Quit game", "", true, false });
@@ -603,6 +612,9 @@ static void change(RowId id, int dir)
         break;
     case R_FPS:
         s_set.show_fps = !s_set.show_fps;
+        break;
+    case R_AA:
+        s_set.anti_aliasing = ((s_set.anti_aliasing + dir) % 2 + 2) % 2;
         break;
     default:
         return;
@@ -850,6 +862,11 @@ void tj_settings_load(void) {}
 void tj_settings_backend_ready(void) {}
 void tj_settings_frame(void) {}
 bool tj_settings_show_fps(void) { const char* e = getenv("TJ_SHOW_FPS"); return e && *e && *e != '0'; }
+int  tj_settings_anti_aliasing(void)
+{
+    const char* e = getenv("TJ_DISABLE_MLAA");
+    return e && *e == '0' ? TJ_AA_GAME_MLAA : TJ_AA_OFF;
+}
 bool tj_settings_quit_requested(void) { return false; }
 
 #endif

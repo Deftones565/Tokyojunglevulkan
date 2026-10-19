@@ -411,8 +411,7 @@ else()
     # plain big-endian loads and stores, the runtime accessors only where they
     # do real work. OFF gives the debug hooks (PPU_RWATCH, ...) the lifted
     # code's accesses back.
-    # OFF until reviewed and landed (pending with 0089; user test 40-49 FPS).
-    option(TJ_VM_FAST "Inline guest memory access in lifted PPU code" OFF)
+    option(TJ_VM_FAST "Inline guest memory access in lifted PPU code" ON)
     if(TJ_VM_FAST)
         set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY
             COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/src/tj_vm_fast.h")

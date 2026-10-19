@@ -1004,6 +1004,10 @@ int main(int argc, char** argv)
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",
            entry, STACK_TOP);
 
+    /* The main PPU thread waits on SPU job batches that often finish within
+     * ~0.1 ms: spin up to 200 us before sleeping (pending 0089's
+     * SPURS_EF_SPIN_US; user test +2 FPS). Set it to 0 to turn this off. */
+    setenv("SPURS_EF_SPIN_US", "200", 0);
     tj_flip_promote_install();
     int rc = ppu_run(entry, STACK_TOP);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
