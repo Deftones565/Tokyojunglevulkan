@@ -1,0 +1,27 @@
+# SPU jobs no longer clear their local store between jobs (as the console's job
+# manager): user-measured 23-26 -> 58-60 FPS under the expressway, no flashing.
+# SPU_JOB_LS_CLEAR=1 restores the clear.
+diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
+index 52c9c5e..5534857 100644
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -241,12 +241,14 @@ static spurs_job_ctx_slot* spurs_job_ctx_take(uint32_t bin_end)
+     const size_t ls_end   = ls_begin + SPU_LS_SIZE;
+     memset(ctx, 0, ls_begin);
+     memset((uint8_t*)ctx + ls_end, 0, sizeof(*ctx) - ls_end);
+-    /* SPU_JOB_LS_CLEAR=0: leave the previous job's bytes in LS, as the real
+-     * job manager does (it does not clear LS between jobs). Default: cleared,
+-     * the state a fresh context had. Each clear is most of 256 KB for the
+-     * geometry job, ~7.6% of gameplay CPU. */
++    /* The previous job's bytes stay in LS, as with the real job manager (it
++     * does not clear LS between jobs). Each clear was most of 256 KB for the
++     * geometry job and sat on the frame's critical path: under Tokyo Jungle's
++     * elevated expressway 23-26 -> 58-60 FPS without it (user, 2026-10-19;
++     * visual A/B identical, docs/ab/2026-10-19-job-ls-noclear-ab.png).
++     * SPU_JOB_LS_CLEAR=1 clears as before. */
+     static int ls_clear = -1;
+-    if (ls_clear < 0) ls_clear = spurs_job_env_flag("SPU_JOB_LS_CLEAR", 1);
++    if (ls_clear < 0) ls_clear = spurs_job_env_flag("SPU_JOB_LS_CLEAR", 0);
+     if (ls_clear && slot->dirty_end > bin_end)
+         memset(ctx->ls_store + bin_end, 0, slot->dirty_end - bin_end);
+     memset(ctx->ls_store + SPU_LS_SIZE - JOB_LS_TOP_BLOCK, 0, JOB_LS_TOP_BLOCK);
