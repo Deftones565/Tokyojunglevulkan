@@ -37,3 +37,6 @@ ENV CC=clang-22 CXX=clang++-22
 RUN wget -qO /tmp/ait https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
  && chmod +x /tmp/ait && cd /opt && /tmp/ait --appimage-extract >/dev/null && mv squashfs-root appimagetool \
  && chmod -R a+rX /opt/appimagetool && rm /tmp/ait
+# OpenSSL headers for psnr's TLS (0120). Linked, not bundled: build_in_container.sh leaves
+# libssl/libcrypto to the system, whose OpenSSL knows where that system keeps its CA certificates.
+RUN apt-get update && apt-get install -y --no-install-recommends libssl-dev && rm -rf /var/lib/apt/lists/*

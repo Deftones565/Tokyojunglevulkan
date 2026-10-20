@@ -17,12 +17,15 @@ patchelf --set-rpath '$ORIGIN/../lib' $A/usr/bin/tokyojungle
 # Bundle every shared library it links except the base system ones (glibc,
 # libstdc++/libgcc: SteamOS's are newer) and the display/audio/GPU stack, which
 # must be the system's own (it matches the Deck's graphics driver), plus FFmpeg,
-# which it dlopens.
+# which it dlopens. OpenSSL (libssl.so.3/libcrypto.so.3, on SteamOS too) is the
+# system's as well: Ubuntu's would look for CA certificates in /usr/lib/ssl,
+# which SteamOS doesn't have, and online servers' certificates would not verify.
 ldd $B/tokyojungle | awk '/=> \//{print $3}' | while read -r l; do
     case "$(basename "$l")" in
         libc.so*|libm.so*|libdl.so*|libpthread.so*|librt.so*|ld-linux*|libstdc++.so*|libgcc_s.so*) ;;
         libX*|libxcb*|libwayland*|libdecor*|libxkbcommon*|libdrm*|libgbm*|libEGL*|libGL*|libvulkan*) ;;
         libasound*|libpulse*|libpipewire*|libdbus*|libsystemd*|libudev*) ;;
+        libssl.so*|libcrypto.so*) ;;
         *) cp -L "$l" $A/usr/lib/ ;;
     esac
 done
