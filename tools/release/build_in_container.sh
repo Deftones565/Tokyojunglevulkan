@@ -3,7 +3,7 @@
 # /src = this checkout (read-only), /out = the output dir. Builds the game the way build/ is
 # built (RelWithDebInfo = -O2, the same options), then assembles AppDir and the AppImage.
 set -euo pipefail
-B=/out/build; A=/out/AppDir
+B=/out/.build; A=/out/.AppDir
 cmake -S /src -B $B -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 \
       -DPS3RECOMP_FFMPEG_INCLUDE_DIR=/opt/ffmpeg/include

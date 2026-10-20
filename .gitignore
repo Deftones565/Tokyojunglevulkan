@@ -16,3 +16,5 @@ __pycache__/
 .agents/board.*.log
 *.tsv
 .claude/settings.local.json
+# Steam Deck release output (tools/release/)
+/release/

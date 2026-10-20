@@ -1,5 +1,5 @@
 #!/bin/bash
-# usage: tools/release/make_data_dir.sh <out-dir>   (e.g. build-magi7/release/TokyoJungle-data)
+# usage: tools/release/make_data_dir.sh <out-dir>   (e.g. release/TokyoJungle-data)
 # The game data the AppImage needs, from this checkout: the decrypted EBOOT.ELF, the extracted
 # title (extracted/: PARAM.SFO + USRDIR, ~2.4 GB) and the firmware fonts from the RPCS3 install
 # (dev_flash/data/font). Copy the folder next to the AppImage (or to ~/TokyoJungle-data).
