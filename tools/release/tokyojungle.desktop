@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Tokyo Jungle
+Comment=Tokyo Jungle, statically recompiled from the PS3 version
+Exec=tokyojungle
+Icon=tokyojungle
+Categories=Game;
+Terminal=false

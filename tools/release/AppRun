@@ -1,0 +1,68 @@
+#!/bin/bash
+# Tokyo Jungle (static recompilation) AppImage entry point.
+#
+# Game data is NOT in the AppImage. It is a folder "TokyoJungle-data" (made by
+# tools/release/make_data_dir.sh) found, in order, at $TJ_DATA, next to the
+# AppImage, or in ~/TokyoJungle-data:
+#   EBOOT.ELF                      the decrypted game executable
+#   game/                          PARAM.SFO + USRDIR/ (the extracted title)
+#   dev_flash/                     optional: firmware fonts (data/font)
+# Saves and trophies: gamedata/ in the folder holding the AppImage (unpack
+# TokyoJungle-save.tar.gz there to continue a save; a new one is made if it is
+# missing). Settings, the log and the run directory live in
+# ${XDG_DATA_HOME:-~/.local/share}/tokyojungle.
+HERE="$(dirname "$(readlink -f "$0")")"
+
+find_data() {
+    local c
+    for c in "$TJ_DATA" "${APPIMAGE:+$(dirname "$APPIMAGE")/TokyoJungle-data}" \
+             "$HOME/TokyoJungle-data"; do
+        [ -n "$c" ] && [ -f "$c/EBOOT.ELF" ] && [ -d "$c/game/USRDIR" ] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+fail() {
+    echo "tokyojungle: $1" >&2
+    if command -v zenity >/dev/null 2>&1; then zenity --error --no-wrap --text="$1" 2>/dev/null
+    elif command -v kdialog >/dev/null 2>&1; then kdialog --error "$1" 2>/dev/null; fi
+    exit 1
+}
+
+DATA="$(find_data)" || fail "Game data not found.
+Put the TokyoJungle-data folder next to the AppImage or in your home folder
+(it must contain EBOOT.ELF and game/USRDIR), or set TJ_DATA."
+
+STATE="${XDG_DATA_HOME:-$HOME/.local/share}/tokyojungle"
+mkdir -p "$STATE" || fail "Cannot create $STATE"
+
+# Saves: the AppImage's own folder, or the state folder if that is not writable.
+SAVEDIR="$STATE"
+if [ -n "$APPIMAGE" ] && [ -w "$(dirname "$APPIMAGE")" ]; then SAVEDIR="$(dirname "$APPIMAGE")"; fi
+# First run: settings suited to a handheld (Steam Deck: 1280x800, 4 cores).
+if [ ! -f "$STATE/settings.ini" ]; then
+    cat > "$STATE/settings.ini" <<'INI'
+display_mode = borderless
+internal_resolution = 100%
+aspect_ratio = keep
+vsync = on
+show_fps = off
+anti_aliasing = fxaa
+frame_rate = 60
+INI
+fi
+
+export TJ_RUN_DIR="$STATE/vfs"
+export TJ_SETTINGS="$STATE/settings.ini"
+export PS3_VERBOSE="${PS3_VERBOSE:-0}"
+[ -d "$DATA/dev_flash" ] && export PS3_DEV_FLASH="$DATA/dev_flash"
+export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Saves and trophies go to ./gamedata: cellSaveData's and sceNpTrophy's roots
+# are relative to the working directory.
+cd "$SAVEDIR" || fail "Cannot enter $SAVEDIR"
+echo "[apprun] data $DATA, saves $SAVEDIR/gamedata, settings $TJ_SETTINGS" >&2
+if [ -n "$TJ_LOG_TO_TERMINAL" ]; then
+    exec "$HERE/usr/bin/tokyojungle" "$DATA/EBOOT.ELF" "$DATA/game" "$@"
+fi
+exec "$HERE/usr/bin/tokyojungle" "$DATA/EBOOT.ELF" "$DATA/game" "$@" > "$STATE/tokyojungle.log" 2>&1
