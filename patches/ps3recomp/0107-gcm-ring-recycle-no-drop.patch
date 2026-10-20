@@ -1,8 +1,6 @@
-diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index 3e90ed5..ef5491b 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -601,7 +601,10 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
+@@ -601,7 +601,10 @@
      u32 cdata  = galloc ? galloc(16, 16) : 0;
      if (cdata && gwrite32) {
          gwrite32(cdata + 0x0, cmdbuf);              /* begin   */
@@ -14,7 +12,7 @@ index 3e90ed5..ef5491b 100644
          gwrite32(cdata + 0x8, cmdbuf);              /* current */
          /* Command-buffer-full callback: a guest OPD {func, toc} routed to
           * hle_gcm_callback -> cellGcm_fifo_recycle. Without a real callback the
-@@ -2554,7 +2557,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2554,7 +2557,18 @@
       *
       * ponytail: append the JUMP at `current` the way the SDK's own callback
       * does, rather than tracking a second copy of the ring's geometry. */
@@ -23,9 +21,8 @@ index 3e90ed5..ef5491b 100644
 +     * (cellGcmSetupContext installs it): cellGcm_fifo_recycle wraps that ring
 +     * and waits for the walker to take the tail. While it waits, `current`
 +     * sits at `end`, which looked like an overrun here: this recycle then
-+     * moved get to begin and DROPPED the unread tail -- a frame's world draws
-+     * (Tokyo Jungle: the world vanished to the skybox for a frame) and its
-+     * closing fence (the title then hung on it). The other Tokyo Jungle port
++     * moved get to begin and DROPPED the unread tail -- a frame's draws and
++     * its closing fence (Tokyo Jungle then hung on it). The other Tokyo Jungle port
 +     * (sp00nznet/tokyojungle) recycles only through the callback, and only
 +     * once the walker has retired the tail. */
 +    u32 cb_ctx = s_gcm_ctx_out_ea ? vm_read32(s_gcm_ctx_out_ea) : 0;
