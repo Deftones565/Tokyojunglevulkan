@@ -1,0 +1,20 @@
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -16,6 +16,7 @@
+  *
+  * Compiled as C++ (matches the lifted output). Game-agnostic.
+  */
++#define PPU_NO_INLINE_LOADS   /* declares the out-of-line accessors below */
+ #include "ppu_recomp.h"   /* ppu_context */
+ #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
+ #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -10,6 +10,7 @@
+  * NIDs are computed from the names (ps3_compute_nid), so this stays correct
+  * without hand-written NID literals.
+  */
++#define PPU_NO_INLINE_LOADS   /* declares the out-of-line accessors below */
+ #include "ppu_recomp.h"     /* ppu_context */
+ #include "ps3emu/nid.h"     /* ps3_compute_nid */
+ #include <stdint.h>

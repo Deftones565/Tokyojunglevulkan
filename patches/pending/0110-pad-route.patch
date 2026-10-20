@@ -1,0 +1,26 @@
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -763,6 +763,23 @@
+                  sscanf(e, "%d,%d,%d,%d,%lf,%lf", &a,&b,&c,&d,&s_from,&s_until);
+                  s_v[0]=(unsigned char)a; s_v[1]=(unsigned char)b;
+                  s_v[2]=(unsigned char)c; s_v[3]=(unsigned char)d; } }
++      /* PAD_ROUTE="<sec>:<lx>,<ly>[,<mask>];..." -- from each wall-clock
++       * second on, hold the left stick there (and the buttons in mask) until
++       * the next entry: a fixed walk through the map for perf runs. */
++      { static int rt = -1; static int rn = 0; static double rs[512]; static unsigned char rx[512], ry[512];
++        static unsigned rm[512]; static unsigned long long r0 = 0;
++        if (rt < 0) { const char* e = getenv("PAD_ROUTE"); rt = (e && *e) ? 1 : 0; r0 = GetTickCount64();
++          while (rt && *e && rn < 512) { double t; int x = 128, y = 128; unsigned m = 0; int k = 0;
++            if (sscanf(e, "%lf:%d,%d%n", &t, &x, &y, &k) < 3) break;
++            e += k; if (*e == ',') { char* q; m = (unsigned)strtoul(e + 1, &q, 0); e = q; }
++            rs[rn] = t; rx[rn] = (unsigned char)x; ry[rn] = (unsigned char)y; rm[rn] = m; rn++;
++            while (*e == ';' || *e == ' ') e++; } }
++        if (rt && port_no == 0) {
++          const double now = (double)(GetTickCount64() - r0) / 1000.0;
++          int cur = -1; for (int i = 0; i < rn; i++) if (now >= rs[i]) cur = i;
++          if (cur >= 0) { hs->analog_lx = rx[cur]; hs->analog_ly = ry[cur]; hs->connected = 1;
++            data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(rm[cur] & 0xFF);
++            data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((rm[cur] >> 8) & 0xFF); } } }
+       if (s_st && (double)(GetTickCount64() - s_t0) / 1000.0 >= s_from && (double)(GetTickCount64() - s_t0) / 1000.0 < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
+                   hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
+                   hs->connected = 1; }
