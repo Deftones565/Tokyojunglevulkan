@@ -410,6 +410,25 @@ else()
     # -fwrapv: guest integer arithmetic wraps (mulld, mulli, add overflow);
     # without it the compiler may assume signed overflow never happens
     # (ps3recomp v0.15, f6c7bec).
+    # TJ_PPU_HOST_SIMD: the lifted SPU code's SSE4.1 + FMA, for the PPU too.
+    # The VMX helpers' fmaf() (vmaddfp, vnmsubfp, fmadds...) becomes one
+    # instruction instead of a libm call, byte swaps and lane loops can use
+    # pshufb/blends, and -ffp-contract=off (above) still keeps the compiler
+    # from fusing anything the guest did not fuse, so results do not change.
+    # With it, ppu_vmx.h's vaddfp/vsubfp/vmaddfp/vnmsubfp run four lanes at
+    # once (0114; bit-exact, runtime/ppu/tests/test_ppu_vmx_simd.c). Windowed
+    # gameplay: main thread 8.6 -> 5.5 ms of guest code a frame, frames over
+    # 16.7 ms 22% -> 6% (docs/STATUS.md). On by default when the building
+    # machine has SSE4.1 + FMA, as for the SPU (same check, same SIGILL caveat).
+    set(TJ_PPU_HOST_SIMD_DEFAULT OFF)
+    if(PORT_BUILD_HOST_HAS_SSE41_FMA)
+        set(TJ_PPU_HOST_SIMD_DEFAULT ON)
+    endif()
+    option(TJ_PPU_HOST_SIMD "Build the lifted PPU sources with SSE4.1 + FMA (x86-64)" ${TJ_PPU_HOST_SIMD_DEFAULT})
+    if(TJ_PPU_HOST_SIMD AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+        set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY COMPILE_OPTIONS "-msse4.1;-mfma")
+        message(STATUS "Lifted PPU:      SSE4.1 + FMA (TJ_PPU_HOST_SIMD)")
+    endif()
     # Inline guest memory access in the lifted PPU code (src/tj_vm_fast.h):
     # plain big-endian loads and stores, the runtime accessors only where they
     # do real work. OFF gives the debug hooks (PPU_RWATCH, ...) the lifted
