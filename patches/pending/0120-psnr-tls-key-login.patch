@@ -1,0 +1,377 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 94de794..b538393 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -128,6 +128,16 @@ target_include_directories(ps3recomp_runtime PRIVATE
+     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+ )
+ 
++# psnr (libs/network/psnr) reaches online servers over TLS through OpenSSL.
++find_package(OpenSSL QUIET)
++if(OpenSSL_FOUND)
++    target_compile_definitions(ps3recomp_runtime PRIVATE PSNR_HAVE_OPENSSL)
++    target_link_libraries(ps3recomp_runtime PRIVATE OpenSSL::SSL OpenSSL::Crypto)
++    message(STATUS "  OpenSSL:      found (TLS for online servers)")
++else()
++    message(STATUS "  OpenSSL:      not found (online servers only without TLS: PSNR_TLS=0)")
++endif()
++
+ # Platform-specific link libraries
+ if(WIN32)
+     target_link_libraries(ps3recomp_runtime PRIVATE
+diff --git a/libs/network/np_psnr.c b/libs/network/np_psnr.c
+index 8adba0b..eb704a9 100644
+--- a/libs/network/np_psnr.c
++++ b/libs/network/np_psnr.c
+@@ -117,6 +117,55 @@ int np_psnr_connected(void)
+     return s_client != NULL;
+ }
+ 
++/* 64 hex digits (whitespace around them allowed) into 32 bytes. */
++static int hex32(const char* in, uint8_t out[32])
++{
++    while (*in && isspace((unsigned char)*in)) in++;
++    for (int i = 0; i < 32; i++) {
++        unsigned v;
++        if (!isxdigit((unsigned char)in[0]) || !isxdigit((unsigned char)in[1]) ||
++            sscanf(in, "%2x", &v) != 1)
++            return 0;
++        out[i] = (uint8_t)v;
++        in += 2;
++    }
++    while (*in && isspace((unsigned char)*in)) in++;
++    return *in == 0;
++}
++
++/* PSNR_TLS (default 1), PSNR_CERT_SHA256 and PSNR_KEY / PSNR_KEY_FILE
++ * (docs/ONLINE.md) into psnr_set_security. 0 if one is malformed. */
++static int setup_security(void)
++{
++    const char* tls = getenv("PSNR_TLS");
++    const char* pin_hex = getenv("PSNR_CERT_SHA256");
++    const char* key_hex = getenv("PSNR_KEY");
++    const char* key_file = getenv("PSNR_KEY_FILE");
++    uint8_t pin[32], key[32];
++    char buf[160] = {0};
++    int have_pin = 0, have_key = 0;
++
++    if (pin_hex && *pin_hex) {
++        if (!hex32(pin_hex, pin)) { printf("[psnr] PSNR_CERT_SHA256 must be 64 hex digits\n"); return 0; }
++        have_pin = 1;
++    }
++    if ((!key_hex || !*key_hex) && key_file && *key_file) {
++        FILE* f = fopen(key_file, "r");
++        if (!f) { printf("[psnr] can't read PSNR_KEY_FILE %s\n", key_file); return 0; }
++        (void)fread(buf, 1, sizeof(buf) - 1, f);
++        fclose(f);
++        key_hex = buf;
++    }
++    if (key_hex && *key_hex) {
++        if (!hex32(key_hex, key)) { printf("[psnr] the player key must be 64 hex digits\n"); return 0; }
++        have_key = 1;
++    }
++    memset(buf, 0, sizeof(buf));
++    psnr_set_security(!(tls && strcmp(tls, "0") == 0), have_pin ? pin : NULL, have_key ? key : NULL);
++    memset(key, 0, sizeof(key));
++    return 1;
++}
++
+ int np_psnr_connect(const char* comm_id)
+ {
+     char host[256];
+@@ -138,14 +187,20 @@ int np_psnr_connect(const char* comm_id)
+     char* colon = strrchr(host, ':');
+     if (colon) { *colon = 0; port = (uint16_t)atoi(colon + 1); }
+ 
+-    s_client = psnr_connect(host, port, comm_id, np_psnr_online_id(),
+-                            np_psnr_p2p_port(), &user_id, ip);
++    s_client = setup_security()
++        ? psnr_connect(host, port, comm_id, np_psnr_online_id(), np_psnr_p2p_port(), &user_id, ip)
++        : NULL;
+     s_user_id = user_id;
+     UNLOCK();
+     if (s_client)
+         printf("[psnr] connected to %s:%u as \"%s\" (%s), user %u, seen from %u.%u.%u.%u, p2p port %u\n",
+                host, port, np_psnr_online_id(), comm_id, user_id, ip[0], ip[1], ip[2], ip[3],
+                np_psnr_p2p_port());
++    else if (psnr_connect_error() == PSNR_E_AUTH)
++        printf("[psnr] %s:%u refused the login for \"%s\": check the name and PSNR_KEY. "
++               "NP stays offline\n", host, port, np_psnr_online_id());
++    else if (psnr_connect_error() == PSNR_E_UNKNOWN_TITLE)
++        printf("[psnr] %s:%u doesn't serve %s. NP stays offline\n", host, port, comm_id);
+     else if (psnr_connect_error() == PSNR_E_NAME_TAKEN)
+         printf("[psnr] %s:%u: another player there is already \"%s\" -- pick another "
+                "with --username. NP stays offline\n", host, port, np_psnr_online_id());
+diff --git a/libs/network/psnr/psnr.c b/libs/network/psnr/psnr.c
+index a1ae943..796648a 100644
+--- a/libs/network/psnr/psnr.c
++++ b/libs/network/psnr/psnr.c
+@@ -43,8 +43,30 @@
+    typedef struct pollfd pollfd_t;
+ #endif
+ 
++#ifdef PSNR_HAVE_OPENSSL
++#  include <openssl/ssl.h>
++#  include <openssl/x509.h>
++#  include <openssl/evp.h>
++#  include <openssl/crypto.h>
++#endif
++
+ #define HEARTBEAT_SECS 20
+ 
++/* psnr_set_security; TLS on by default. */
++static struct {
++    int tls, have_pin, have_key;
++    uint8_t pin[32], key[32];
++} s_sec = { 1, 0, 0, {0}, {0} };
++
++void psnr_set_security(int tls, const uint8_t cert_sha256[32], const uint8_t key[32])
++{
++    s_sec.tls = tls;
++    s_sec.have_pin = cert_sha256 != NULL;
++    s_sec.have_key = key != NULL;
++    if (cert_sha256) memcpy(s_sec.pin, cert_sha256, 32);
++    if (key) memcpy(s_sec.key, key, 32);
++}
++
+ static uint64_t now_ms(void)
+ {
+ #ifdef _WIN32
+@@ -70,16 +92,65 @@ struct psnr_client {
+     int      relay;                       /* HELLO_ACK: the server relays */
+     uint8_t  server_ip[4], local_ip[4];   /* the TCP connection's two ends */
+     uint16_t server_port;
++#ifdef PSNR_HAVE_OPENSSL
++    SSL_CTX* ssl_ctx;
++    SSL*     ssl;      /* NULL: plain TCP */
++#endif
+ };
+ 
++/* One send/recv on the connection, through TLS if it has it. >0: bytes
++ * moved. 0 from io_recv: the peer closed. -1: try again once the socket is
++ * ready for *want (POLLIN or POLLOUT). -2: the connection is broken. */
++static int io_send(psnr_client* c, const uint8_t* p, size_t n, short* want)
++{
++#ifdef PSNR_HAVE_OPENSSL
++    if (c->ssl) {
++        int k = SSL_write(c->ssl, p, (int)n);
++        if (k > 0) return k;
++        switch (SSL_get_error(c->ssl, k)) {
++        case SSL_ERROR_WANT_WRITE: *want = POLLOUT; return -1;
++        case SSL_ERROR_WANT_READ:  *want = POLLIN;  return -1;
++        default: return -2;
++        }
++    }
++#endif
++    {
++        int k = send(c->s, (const char*)p, (int)n, 0);
++        if (k >= 0) return k;
++        *want = POLLOUT;
++        return WOULD_BLOCK() ? -1 : -2;
++    }
++}
++
++static int io_recv(psnr_client* c, uint8_t* p, size_t n)
++{
++#ifdef PSNR_HAVE_OPENSSL
++    if (c->ssl) {
++        int k = SSL_read(c->ssl, p, (int)n);
++        if (k > 0) return k;
++        switch (SSL_get_error(c->ssl, k)) {
++        case SSL_ERROR_WANT_READ: case SSL_ERROR_WANT_WRITE: return -1;
++        case SSL_ERROR_ZERO_RETURN: return 0;
++        default: return -2;
++        }
++    }
++#endif
++    {
++        int k = recv(c->s, (char*)p, (int)n, 0);
++        if (k >= 0) return k;
++        return WOULD_BLOCK() ? -1 : -2;
++    }
++}
++
+ static int send_all(psnr_client* c, const uint8_t* p, size_t n)
+ {
+     while (n) {
+-        int k = send(c->s, (const char*)p, (int)n, 0);
++        short want = POLLOUT;
++        int k = io_send(c, p, n, &want);
+         if (k < 0) {
+             pollfd_t pf;
+-            if (!WOULD_BLOCK()) { c->dead = 1; return -1; }
+-            pf.fd = c->s; pf.events = POLLOUT; pf.revents = 0;
++            if (k == -2) { c->dead = 1; return -1; }
++            pf.fd = c->s; pf.events = want; pf.revents = 0;
+             poll(&pf, 1, 1000);
+             continue;
+         }
+@@ -110,8 +181,8 @@ static int pump(psnr_client* c)
+             c->rx_cap = c->rx_cap ? c->rx_cap * 2 : 8192;
+             c->rx = (uint8_t*)realloc(c->rx, c->rx_cap);
+         }
+-        int k = recv(c->s, (char*)c->rx + c->rx_len, (int)(c->rx_cap - c->rx_len), 0);
+-        if (k == 0 || (k < 0 && !WOULD_BLOCK())) { c->dead = 1; break; }
++        int k = io_recv(c, c->rx + c->rx_len, c->rx_cap - c->rx_len);
++        if (k == 0 || k == -2) { c->dead = 1; break; }
+         if (k < 0) break;
+         c->rx_len += (size_t)k;
+     }
+@@ -187,6 +258,50 @@ void psnr_msg_free(psnr_msg* m)
+ 
+ static int s_connect_error;
+ 
++#ifdef PSNR_HAVE_OPENSSL
++/* TLS 1.3 on c->s, still blocking, checked the way psnr_set_security said.
++ * 0 on success; on failure c->ssl may be set, and psnr_close frees it. */
++static int tls_start(psnr_client* c, const char* host)
++{
++    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
++    if (!ctx) return -1;
++    c->ssl_ctx = ctx;
++    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
++    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
++    if (!s_sec.have_pin) {
++        /* No pin: the certificate must chain to a system CA and name host
++         * (a Let's Encrypt certificate for the server's DNS name). */
++        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
++        if (SSL_CTX_set_default_verify_paths(ctx) != 1) return -1;
++    }
++    c->ssl = SSL_new(ctx);
++    if (!c->ssl || SSL_set_fd(c->ssl, (int)c->s) != 1) return -1;
++    if (!s_sec.have_pin) {
++        SSL_set_tlsext_host_name(c->ssl, host);
++        if (SSL_set1_host(c->ssl, host) != 1) return -1;
++    }
++    if (SSL_connect(c->ssl) != 1) {
++        printf("[psnr] TLS handshake with %s failed%s\n", host,
++               s_sec.have_pin ? "" : " (certificate not trusted for this host name? "
++               "A self-signed server needs PSNR_CERT_SHA256)");
++        return -1;
++    }
++    if (s_sec.have_pin) {
++        X509* cert = SSL_get_peer_certificate(c->ssl);
++        unsigned char md[EVP_MAX_MD_SIZE];
++        unsigned int n = 0;
++        int ok = cert && X509_digest(cert, EVP_sha256(), md, &n) == 1 && n == 32 &&
++                 CRYPTO_memcmp(md, s_sec.pin, 32) == 0;
++        X509_free(cert);
++        if (!ok) {
++            printf("[psnr] %s's certificate does not match PSNR_CERT_SHA256; not connecting\n", host);
++            return -1;
++        }
++    }
++    return 0;
++}
++#endif
++
+ psnr_client* psnr_connect(const char* host, uint16_t port,
+                           const char* comm_id, const char* online_id, uint16_t p2p_port,
+                           uint32_t* out_user_id, uint8_t out_public_ip[4])
+@@ -218,14 +333,35 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
+         int one = 1;
+         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+     }
++
++    psnr_client* c = (psnr_client*)calloc(1, sizeof(psnr_client));
++    c->s = s;
++    s_connect_error = 0;
++    if (s_sec.tls) {
++#ifdef PSNR_HAVE_OPENSSL
++        /* The handshake runs blocking; don't let a silent server hang it. */
++#  ifdef _WIN32
++        DWORD ms = 5000;
++        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms, sizeof(ms));
++        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&ms, sizeof(ms));
++#  else
++        struct timeval tv = { 5, 0 };
++        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++#  endif
++        if (tls_start(c, host) != 0) { psnr_close(c); return NULL; }
++#else
++        printf("[psnr] built without OpenSSL: can't make a TLS connection "
++               "(PSNR_TLS=0 for a plain local test server)\n");
++        psnr_close(c);
++        return NULL;
++#endif
++    }
+ #ifdef _WIN32
+     { u_long nb = 1; ioctlsocket(s, FIONBIO, &nb); }
+ #else
+     fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+ #endif
+-
+-    psnr_client* c = (psnr_client*)calloc(1, sizeof(psnr_client));
+-    c->s = s;
+     {   /* UDP goes to the same server address and port; the local end is
+          * this machine's address on the way to the server, for peers on the
+          * same network. */
+@@ -239,14 +375,16 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
+         if (getsockname(s, (struct sockaddr*)&a, &n) == 0) memcpy(c->local_ip, &a.sin_addr, 4);
+     }
+ 
+-    /* HELLO: comm_id [12] | online_id [16] | p2p_port u16 */
+-    uint8_t hello[30] = {0};
++    /* HELLO: comm_id [12] | online_id [16] | p2p_port u16, and for
++     * HELLO_AUTH key [32] */
++    uint8_t hello[62] = {0};
+     strncpy((char*)hello, comm_id, 12);
+     strncpy((char*)hello + 12, online_id, 16);
+     psnr_put16(hello + 28, p2p_port);
++    if (s_sec.have_key) memcpy(hello + 30, s_sec.key, 32);
+     psnr_msg ack;
+-    s_connect_error = 0;
+-    if (psnr_call(c, PSNR_HELLO, hello, sizeof(hello), &ack, 5000) != 1) {
++    if (psnr_call(c, s_sec.have_key ? PSNR_HELLO_AUTH : PSNR_HELLO, hello,
++                  s_sec.have_key ? 62 : 30, &ack, 5000) != 1) {
+         psnr_close(c);
+         return NULL;
+     }
+@@ -408,6 +546,10 @@ void psnr_close(psnr_client* c)
+ {
+     psnr_msg m;
+     if (!c) return;
++#ifdef PSNR_HAVE_OPENSSL
++    if (c->ssl) SSL_free(c->ssl);   /* no close_notify: the server doesn't need one */
++    if (c->ssl_ctx) SSL_CTX_free(c->ssl_ctx);
++#endif
+     sock_close(c->s);
+     c->dead = 1;
+     while (take(c, &m, 0)) psnr_msg_free(&m);
+diff --git a/libs/network/psnr/psnr.h b/libs/network/psnr/psnr.h
+index 61a4f86..2d366a3 100644
+--- a/libs/network/psnr/psnr.h
++++ b/libs/network/psnr/psnr.h
+@@ -27,6 +27,7 @@ extern "C" {
+ /* Message types; payloads in docs/api.md. */
+ enum {
+     PSNR_HELLO = 0x01, PSNR_HEARTBEAT = 0x02,
++    PSNR_HELLO_AUTH = 0x03,   /* HELLO + key [32]: servers that check who you are (tjnetd) */
+     PSNR_CREATE_ROOM = 0x10, PSNR_SEARCH_ROOMS = 0x11, PSNR_JOIN_ROOM = 0x12,
+     PSNR_LEAVE_ROOM = 0x13, PSNR_SET_ROOM_DATA = 0x14, PSNR_ROOM_MESSAGE = 0x15,
+     PSNR_KICK_MEMBER = 0x16,
+@@ -49,7 +50,8 @@ enum {
+ enum {
+     PSNR_E_BAD_REQUEST = 1, PSNR_E_NOT_FOUND = 2, PSNR_E_ROOM_FULL = 3,
+     PSNR_E_NOT_OWNER = 4, PSNR_E_NOT_IN_ROOM = 5, PSNR_E_LIMIT = 6, PSNR_E_NO_HELLO = 7,
+-    PSNR_E_NAME_TAKEN = 8, PSNR_E_NO_RELAY = 9
++    PSNR_E_NAME_TAKEN = 8, PSNR_E_NO_RELAY = 9,
++    PSNR_E_AUTH = 10, PSNR_E_UNKNOWN_TITLE = 12   /* tjnetd: wrong key / title not served */
+ };
+ 
+ typedef struct psnr_client psnr_client;
+@@ -63,6 +65,13 @@ typedef struct {
+     uint32_t len;
+ } psnr_msg;
+ 
++/* How the next psnr_connect secures the connection. tls: wrap it in TLS 1.3
++ * (needs PSNR_HAVE_OPENSSL; without it a TLS connect fails). cert_sha256:
++ * accept exactly the server certificate with this SHA-256 (a self-signed
++ * server); NULL: verify it against the system's CAs and the host name. key:
++ * log in with HELLO_AUTH; NULL: plain HELLO. Copies what it is given. */
++void psnr_set_security(int tls, const uint8_t cert_sha256[32], const uint8_t key[32]);
++
+ /* Connect and say HELLO. comm_id is the title's NP communication ID
+  * ("NPWR00860_00"), online_id the player's name, p2p_port the UDP port the
+  * title takes peer traffic on (0 if none). Fills the id the server assigned
