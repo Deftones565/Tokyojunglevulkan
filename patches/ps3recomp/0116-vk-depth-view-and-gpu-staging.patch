@@ -1,0 +1,219 @@
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -619,6 +619,34 @@
+     return 0;
+ }
+ 
++/* A buffer only the GPU touches (copies in and out): device-local memory,
++ * not mapped. In host memory every byte crossed the bus twice -- Tokyo
++ * Jungle's depth snapshots (depth -> buffer -> R32F image) cost 2 ms of GPU
++ * a frame at 100% and 7 ms at 400% internal resolution that way. Falls back
++ * to a host buffer when the device has no device-local type for it. */
++static int vk_create_device_buffer(vk_buffer* b, VkDeviceSize size, VkBufferUsageFlags usage)
++{
++    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
++                               .size = size, .usage = usage,
++                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
++    VK_CHECK(pvkCreateBuffer(s_vk.device, &bci, NULL, &b->buf), "vkCreateBuffer");
++    VkMemoryRequirements req;
++    pvkGetBufferMemoryRequirements(s_vk.device, b->buf, &req);
++    u32 type;
++    if (vk_find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type)) {
++        pvkDestroyBuffer(s_vk.device, b->buf, NULL); b->buf = VK_NULL_HANDLE;
++        return vk_create_host_buffer(b, size, usage);
++    }
++    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++                                 .allocationSize = req.size, .memoryTypeIndex = type };
++    VK_CHECK(pvkAllocateMemory(s_vk.device, &mai, NULL, &b->mem), "vkAllocateMemory(buffer)");
++    VK_CHECK(pvkBindBufferMemory(s_vk.device, b->buf, b->mem, 0), "vkBindBufferMemory");
++    b->ptr = NULL;
++    b->coherent = 1;
++    b->size = size;
++    return 0;
++}
++
+ static void vk_destroy_buffer(vk_buffer* b)
+ {
+     vk_batch_flush();
+@@ -646,6 +674,15 @@
+     vk_destroy_buffer(b);
+     return vk_create_host_buffer(b, size, usage);
+ }
++/* vk_stage for a buffer only the GPU touches: device-local. */
++static int vk_stage_gpu(vk_buffer* b, VkDeviceSize bytes, VkBufferUsageFlags usage)
++{
++    if (b->buf && b->size >= bytes) return 0;
++    VkDeviceSize size = b->size ? b->size * 2u : (VkDeviceSize)1u << 20;
++    while (size < bytes) size *= 2u;
++    vk_destroy_buffer(b);
++    return vk_create_device_buffer(b, size, usage);
++}
+ 
+ /* Host writes to non-coherent memory need a flush; there is no
+  * vkFlushMappedMemoryRanges loaded, so writes only ever go to coherent
+@@ -3036,6 +3073,9 @@
+ #define VK_ENG_MAX_OBJ 2048          /* the engine's texture cache is 1024 */
+ 
+ enum { VK_ENG_FREE = 0, VK_ENG_COLOR, VK_ENG_DEPTH, VK_ENG_TEXTURE, VK_ENG_VIEW };
++/* rsx_fmt of a vk_eng_depth_view view (no RSX texture format has it) */
++#define VK_ENG_DEPTH_VIEW_FMT 0xD0D0D0D0u
++static int vk_eng_make_depth_view(VkImage img, VkImageView* out);
+ 
+ typedef struct vk_eng_obj {
+     u8       kind;
+@@ -3284,7 +3324,7 @@
+ {
+     (void)user;
+     if (!handle || handle >= VK_ENG_MAX_OBJ || s_eobj[handle].kind == VK_ENG_FREE) return;
+-    if (s_eobj[handle].kind == VK_ENG_COLOR)
++    if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
+         for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
+             if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == handle) {
+                 vk_destroy_image_later(&s_eobj[i].im);
+@@ -3364,7 +3404,7 @@
+     if (!hd) return 0;
+     vk_eng_obj* o = &s_eobj[hd];
+     if (vk_create_image(&o->im, s_vk.depth_format, iw, ih,
+-                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
++                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                         s_vk.depth_aspect)) {
+         vk_destroy_image(&o->im); return 0;
+@@ -3613,6 +3653,46 @@
+     o->surface = surface; o->remap = remap; o->rsx_fmt = rsx_format;
+     return hd;
+ }
++/* A depth target sampled as a texture, without a copy: a view of its depth
++ * aspect (the image is SAMPLED and lives in GENERAL like every engine
++ * image). Only for a pass that reads it while it is not attached -- the
++ * engine's depth -> A8R8G8B8 conversion, which used a full snapshot copy
++ * (depth -> buffer -> R32F image) every time the depth had been written:
++ * at 400% internal resolution 59 MB each way, several times a frame. The
++ * global barrier every pass starts with orders the read after the writes.
++ * Cached per depth target; released and remade with it. */
++static int vk_eng_make_depth_view(VkImage img, VkImageView* out)
++{
++    VkImageViewCreateInfo vci = {
++        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img,
++        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = s_vk.depth_format,
++        .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 },
++    };
++    return pvkCreateImageView(s_vk.device, &vci, NULL, out) == VK_SUCCESS ? 0 : -1;
++}
++static u32 vk_eng_depth_view(void* user, u32 depth)
++{
++    (void)user;
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_DEPTH_VIEW"); on = !(e && e[0] == '0'); }
++    vk_eng_obj* z = vk_eng_get(depth, VK_ENG_DEPTH);
++    if (!on || !z) return 0;
++    if (s_vk.depth_format != VK_FORMAT_D32_SFLOAT &&
++        s_vk.depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) return 0;   /* as depth_snapshot */
++    for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++)
++        if (s_eobj[i].kind == VK_ENG_VIEW && s_eobj[i].surface == depth &&
++            s_eobj[i].rsx_fmt == VK_ENG_DEPTH_VIEW_FMT)
++            return i;
++    const u32 hd = vk_eng_alloc();
++    if (!hd) return 0;
++    vk_eng_obj* o = &s_eobj[hd];
++    if (vk_eng_make_depth_view(z->im.img, &o->im.view)) { memset(o, 0, sizeof *o); return 0; }
++    o->kind = VK_ENG_VIEW; o->fmt = s_vk.depth_format; o->w = z->w; o->h = z->h;
++    o->iw = z->iw; o->ih = z->ih;
++    o->surface = depth; o->remap = 0; o->rsx_fmt = VK_ENG_DEPTH_VIEW_FMT;
++    return hd;
++}
++
+ /* Remake a single-level 2D texture's image at iw x ih (same format, usage
+  * and crossbar), contents undefined until the caller fills it. */
+ static int vk_eng_texture_resize(vk_eng_obj* o, u32 iw, u32 ih)
+@@ -3763,7 +3843,7 @@
+         if (vk_rec_end()) return 0;
+     }
+ 
+-    if (vk_stage(&s_stage_zz, (VkDeviceSize)sw * sh * 4u,
++    if (vk_stage_gpu(&s_stage_zz, (VkDeviceSize)sw * sh * 4u,
+                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT)) {
+         vk_destroy_buffer(&s_stage_zz); return 0;
+     }
+@@ -4800,6 +4880,7 @@
+     .depth_target_create  = vk_eng_depth_target_create,
+     .depth_target_release = vk_eng_release,
+     .depth_snapshot       = vk_eng_depth_snapshot,
++    .depth_view           = vk_eng_depth_view,
+     .pipeline_create      = vk_eng_pipeline_create,
+     .pipeline_release     = vk_eng_pipeline_release,
+     .bind_targets         = vk_eng_bind_targets,
+@@ -5159,6 +5240,15 @@
+     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) {
+         vk_eng_obj* v = &s_eobj[i];
+         if (v->kind != VK_ENG_VIEW) continue;
++        if (v->rsx_fmt == VK_ENG_DEPTH_VIEW_FMT) {          /* vk_eng_depth_view */
++            const vk_eng_obj* z = vk_eng_get(v->surface, VK_ENG_DEPTH);
++            if (!z || (v->iw == z->iw && v->ih == z->ih)) continue;
++            if (v->im.view) pvkDestroyImageView(s_vk.device, v->im.view, NULL);
++            v->im.view = VK_NULL_HANDLE;
++            vk_eng_make_depth_view(z->im.img, &v->im.view);
++            v->iw = z->iw; v->ih = z->ih;
++            continue;
++        }
+         const vk_eng_obj* t = vk_eng_get(v->surface, VK_ENG_COLOR);
+         if (!t || (v->iw == t->iw && v->ih == t->ih)) continue;
+         if (v->im.view) pvkDestroyImageView(s_vk.device, v->im.view, NULL);
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -1693,7 +1693,10 @@
+ 
+     if (!z->argb || z->argb_serial != z->depth_serial ||
+         z->argb_w != t->width || z->argb_h != t->height) {
+-        const u32 snap = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
++        /* The pass reads the depth while it is not attached: no copy needed
++         * where the backend can sample the target itself. */
++        u32 snap = g.be->depth_view ? g.be->depth_view(g.be->user, z->handle) : 0;
++        if (!snap) snap = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
+         if (!snap) return 0;
+         if (z->argb && (z->argb_w != t->width || z->argb_h != t->height)) {
+             g.be->color_target_release(g.be->user, z->argb);
+@@ -1707,6 +1710,31 @@
+         }
+         eng_argb_convert(snap, z->argb, t->width, t->height);
+         z->argb_serial = z->depth_serial;
++        /* RSX_ENGINE_DEPTH_VIEW_CHECK=1 (debug): the same conversion again from
++         * a snapshot copy, both read back and compared byte for byte -- the
++         * view and the copy must give identical bytes. */
++        { static int chk = -1;
++          if (chk < 0) { const char* e = getenv("RSX_ENGINE_DEPTH_VIEW_CHECK"); chk = e && e[0] == '1'; }
++          if (chk && g.be->depth_view && snap != z->snapshot) {
++              const u32 w = t->width, h = t->height;
++              const u32 copy = g.be->depth_snapshot(g.be->user, z->handle, z->w, z->h);
++              const u32 tmp = copy ? g.be->color_target_create(g.be->user, RSX_BE_FMT_R8G8B8A8, w, h, NULL, 0u) : 0;
++              u8* a8 = (u8*)malloc((size_t)w * h * 4u); u8* b8 = (u8*)malloc((size_t)w * h * 4u);
++              if (tmp && a8 && b8) {
++                  eng_argb_convert(copy, tmp, w, h);
++                  g.be->readback(g.be->user, z->argb, 0u, 0u, w, h, a8, w * 4u);
++                  g.be->readback(g.be->user, tmp, 0u, 0u, w, h, b8, w * 4u);
++                  u32 bad = 0;
++                  for (size_t i = 0; i < (size_t)w * h * 4u; i++) bad += a8[i] != b8[i];
++                  static unsigned n, nbad;
++                  n++; if (bad) nbad++;
++                  if (bad || n <= 3 || n % 200 == 0)
++                      fprintf(stderr, "[rsx engine] depth view check 0x%08X %ux%u: %u differing bytes (%u of %u checks differ)\n",
++                              z->offset, w, h, bad, nbad, n);
++              }
++              free(a8); free(b8);
++              if (tmp) g.be->color_target_release(g.be->user, tmp);
++          } }
+ 
+         if (eng_argb_verify_on()) {
+             /* The CPU path, then every byte of the two compared. */
+--- a/libs/video/rsx_draw_engine.h
++++ b/libs/video/rsx_draw_engine.h
+@@ -174,6 +174,9 @@
+     /* Resolve a depth target into a sampleable texture and return it; 0 when
+      * the backend cannot. The engine only asks after a depth-writing draw. */
+     u32  (*depth_snapshot)(void* user, u32 depth, u32 w, u32 h);
++    /* The depth target itself as a texture (no copy), for a pass that samples
++     * it while it is not bound; 0 when the backend cannot. Optional. */
++    u32  (*depth_view)(void* user, u32 depth);
+ 
+     /* Pipelines, from the decompilers' HLSL plus the state that selects a
+      * variant. This is the one call that hides D3DCompile against glslang
