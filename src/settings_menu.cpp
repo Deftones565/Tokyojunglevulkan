@@ -853,6 +853,32 @@ void tj_settings_frame(void)
             if (const char* sel = getenv("TJ_MENU_SELECT")) s_sel = atoi(sel);
         }
     }
+    /* TJ_DISPLAY_MODE_AT=<s>:<mode>,... (tests): s seconds in, open the menu,
+     * switch the display mode (0 windowed, 1 borderless, 2 exclusive) a second
+     * later and close the menu a second after that, as a player would. */
+    static const char* dm_at = getenv("TJ_DISPLAY_MODE_AT");
+    if (dm_at && *dm_at) {
+        static const auto t0 = std::chrono::steady_clock::now();
+        static int step = 0;
+        const int at = atoi(dm_at);
+        const char* c = strchr(dm_at, ':');
+        if (!c) dm_at = nullptr;
+        else if (std::chrono::steady_clock::now() - t0 >= std::chrono::seconds(at + step)) {
+            if (step == 0) set_open(true);
+            if (step == 1) {
+                s_set.display_mode = std::clamp(atoi(c + 1), 0, 2);
+                fprintf(stderr, "[settings] display mode %d at %d s\n", s_set.display_mode, at + 1);
+                apply_display();
+                s_dirty = true;
+            }
+            if (step == 2) {
+                set_open(false);
+                dm_at = strchr(c, ',');
+                if (dm_at) dm_at++;
+            }
+            step = (step + 1) % 3;
+        }
+    }
     std::vector<Ev> q;
     { std::lock_guard<std::mutex> g(s_q_mu); q.swap(s_q); }
     for (const Ev& e : q) handle(e);

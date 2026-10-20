@@ -435,6 +435,8 @@ static void fps_overlay_update(void)
     if (shown) snprintf(buf, sizeof buf, "%.1f FPS", (f - f0) / s);
     else       snprintf(buf, sizeof buf, "-- FPS");      /* first second */
     RSX_BACKEND_OVERLAY(buf);
+    static const bool log_fps = getenv("TJ_FPS_LOG") != nullptr;   /* tests: the overlay's value */
+    if (log_fps && shown) fprintf(stderr, "[fps] %s\n", buf);
     shown = true; t0 = now; f0 = f;
 }
 #else

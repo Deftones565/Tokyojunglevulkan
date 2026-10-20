@@ -1,0 +1,28 @@
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -2861,6 +2861,25 @@
+ {
+     if (!s_vk.windowed || !s_vk.swapchain) return;
+ 
++    /* A window whose size the swapchain decides (Wayland: currentExtent is
++     * 0xFFFFFFFF) is never reported OUT_OF_DATE when it is resized, so the
++     * swapchain kept its first size through every display mode, resolution
++     * and aspect setting, and the compositor scaled that one 1280x720 buffer.
++     * Recreate it when the window's drawable size changes and no longer
++     * matches (only on a change: a clamped extent must not loop). */
++    {
++        static int lw, lh;
++        int w = 0, h = 0;
++        SDL_Vulkan_GetDrawableSize(s_vk.window, &w, &h);
++        const int changed = w != lw || h != lh;
++        lw = w; lh = h;
++        if (changed && w > 0 && h > 0 &&
++            ((u32)w != s_vk.sc_extent.width || (u32)h != s_vk.sc_extent.height)) {
++            vk_swapchain_lost();
++            if (!s_vk.windowed || !s_vk.swapchain) return;
++        }
++    }
++
+     u32 idx = 0;
+     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+                                         s_vk.sem_acquire, VK_NULL_HANDLE, &idx);
