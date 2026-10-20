@@ -4,7 +4,9 @@ Prints, for each flip both dumped: mean RGB of A and B, mean |A-B|, % of pixels 
 import sys, os, re
 from PIL import Image, ImageChops, ImageStat
 def flips(d):
-    return {int(re.search(r'flip(\d+)', f).group(1)): os.path.join(d, f) for f in os.listdir(d) if f.endswith('.ppm')}
+    # (a run killed mid-dump leaves its .staging.ppm behind: no flip number)
+    return {int(m.group(1)): os.path.join(d, f) for f in os.listdir(d)
+            if f.endswith('.ppm') for m in [re.search(r'flip(\d+)', f)] if m}
 A, B = flips(sys.argv[1]), flips(sys.argv[2])
 for fl in sorted(set(A) & set(B)):
     a, b = Image.open(A[fl]).convert('RGB'), Image.open(B[fl]).convert('RGB')
