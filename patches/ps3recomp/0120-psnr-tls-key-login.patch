@@ -20,10 +20,10 @@ index 94de794..b538393 100644
  if(WIN32)
      target_link_libraries(ps3recomp_runtime PRIVATE
 diff --git a/libs/network/np_psnr.c b/libs/network/np_psnr.c
-index 8adba0b..eb704a9 100644
+index 8adba0b..bcd9cf8 100644
 --- a/libs/network/np_psnr.c
 +++ b/libs/network/np_psnr.c
-@@ -117,6 +117,55 @@ int np_psnr_connected(void)
+@@ -117,6 +117,63 @@ int np_psnr_connected(void)
      return s_client != NULL;
  }
  
@@ -44,8 +44,9 @@ index 8adba0b..eb704a9 100644
 +}
 +
 +/* PSNR_TLS (default 1), PSNR_CERT_SHA256 and PSNR_KEY / PSNR_KEY_FILE
-+ * (docs/ONLINE.md) into psnr_set_security. 0 if one is malformed. */
-+static int setup_security(void)
++ * (docs/ONLINE.md) into psnr_set_security. 0 if one is malformed, or if the
++ * key would go out unencrypted to anything but this machine. */
++static int setup_security(const char* host)
 +{
 +    const char* tls = getenv("PSNR_TLS");
 +    const char* pin_hex = getenv("PSNR_CERT_SHA256");
@@ -71,7 +72,14 @@ index 8adba0b..eb704a9 100644
 +        have_key = 1;
 +    }
 +    memset(buf, 0, sizeof(buf));
-+    psnr_set_security(!(tls && strcmp(tls, "0") == 0), have_pin ? pin : NULL, have_key ? key : NULL);
++    int use_tls = !(tls && strcmp(tls, "0") == 0);
++    if (!use_tls && have_key && strcmp(host, "127.0.0.1") != 0 && strcmp(host, "localhost") != 0) {
++        printf("[psnr] PSNR_TLS=0 would send the player key to %s unencrypted; refusing. "
++               "Plain TCP is for a test server on this machine only\n", host);
++        memset(key, 0, sizeof(key));
++        return 0;
++    }
++    psnr_set_security(use_tls, have_pin ? pin : NULL, have_key ? key : NULL);
 +    memset(key, 0, sizeof(key));
 +    return 1;
 +}
@@ -79,13 +87,13 @@ index 8adba0b..eb704a9 100644
  int np_psnr_connect(const char* comm_id)
  {
      char host[256];
-@@ -138,14 +187,20 @@ int np_psnr_connect(const char* comm_id)
+@@ -138,14 +195,20 @@ int np_psnr_connect(const char* comm_id)
      char* colon = strrchr(host, ':');
      if (colon) { *colon = 0; port = (uint16_t)atoi(colon + 1); }
  
 -    s_client = psnr_connect(host, port, comm_id, np_psnr_online_id(),
 -                            np_psnr_p2p_port(), &user_id, ip);
-+    s_client = setup_security()
++    s_client = setup_security(host)
 +        ? psnr_connect(host, port, comm_id, np_psnr_online_id(), np_psnr_p2p_port(), &user_id, ip)
 +        : NULL;
      s_user_id = user_id;
@@ -103,7 +111,7 @@ index 8adba0b..eb704a9 100644
          printf("[psnr] %s:%u: another player there is already \"%s\" -- pick another "
                 "with --username. NP stays offline\n", host, port, np_psnr_online_id());
 diff --git a/libs/network/psnr/psnr.c b/libs/network/psnr/psnr.c
-index a1ae943..796648a 100644
+index a1ae943..dbfa5a2 100644
 --- a/libs/network/psnr/psnr.c
 +++ b/libs/network/psnr/psnr.c
 @@ -43,8 +43,30 @@
@@ -217,7 +225,7 @@ index a1ae943..796648a 100644
          if (k < 0) break;
          c->rx_len += (size_t)k;
      }
-@@ -187,6 +258,50 @@ void psnr_msg_free(psnr_msg* m)
+@@ -187,6 +258,54 @@ void psnr_msg_free(psnr_msg* m)
  
  static int s_connect_error;
  
@@ -250,7 +258,11 @@ index a1ae943..796648a 100644
 +        return -1;
 +    }
 +    if (s_sec.have_pin) {
++#  if OPENSSL_VERSION_NUMBER >= 0x30000000L
++        X509* cert = SSL_get1_peer_certificate(c->ssl);
++#  else
 +        X509* cert = SSL_get_peer_certificate(c->ssl);
++#  endif
 +        unsigned char md[EVP_MAX_MD_SIZE];
 +        unsigned int n = 0;
 +        int ok = cert && X509_digest(cert, EVP_sha256(), md, &n) == 1 && n == 32 &&
@@ -268,7 +280,7 @@ index a1ae943..796648a 100644
  psnr_client* psnr_connect(const char* host, uint16_t port,
                            const char* comm_id, const char* online_id, uint16_t p2p_port,
                            uint32_t* out_user_id, uint8_t out_public_ip[4])
-@@ -218,14 +333,35 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
+@@ -218,14 +337,35 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
          int one = 1;
          setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
      }
@@ -307,7 +319,7 @@ index a1ae943..796648a 100644
      {   /* UDP goes to the same server address and port; the local end is
           * this machine's address on the way to the server, for peers on the
           * same network. */
-@@ -239,14 +375,16 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
+@@ -239,14 +379,16 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
          if (getsockname(s, (struct sockaddr*)&a, &n) == 0) memcpy(c->local_ip, &a.sin_addr, 4);
      }
  
@@ -328,7 +340,7 @@ index a1ae943..796648a 100644
          psnr_close(c);
          return NULL;
      }
-@@ -408,6 +546,10 @@ void psnr_close(psnr_client* c)
+@@ -408,6 +550,10 @@ void psnr_close(psnr_client* c)
  {
      psnr_msg m;
      if (!c) return;
