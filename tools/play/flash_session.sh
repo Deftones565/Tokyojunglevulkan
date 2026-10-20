@@ -83,7 +83,7 @@ env -u TJ_HEADLESS -u PAD_SCRIPT -u PAD_FILE -u PS3_STRICT_LIFT -u SDL_AUDIODRIV
   WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0} DISPLAY=${DISPLAY:-:1} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} \
   PS3_VERBOSE=0 TJ_TICK_STATS=1 GCM_WAIT_STATS=1 TJ_RUN_DIR=$PWD/$vfs TJ_PERF_FILE=$PWD/$d/flips.txt \
   RSX_FLASH_DETECT=1 "${profenv[@]}" "${pdenv[@]}" \
-  "${gdbargs[@]}" ./$bin input/EBOOT.ELF > $d.txt 2>&1
+  "${gdbargs[@]}" ./$bin gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF > $d.txt 2>&1
 echo "$name: FATAL $(grep -ac FATAL $d.txt); LIFT-GAP $(grep -ac LIFT-GAP $d.txt); flashes $(grep -ac '\[flash\] frame' $d.txt)"
 .agents/talk say $POSTER "RUN done: $name" >/dev/null
 wait

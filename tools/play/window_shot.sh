@@ -19,7 +19,7 @@ title="tj-shot-$name"
 ( cd $d/cwd && SDL_VIDEODRIVER=x11 PS3_TITLE=$title PS3_VERBOSE=0 SDL_AUDIODRIVER=dummy \
     TJ_RUN_DIR=$vfs TJ_SETTINGS=$d/settings.ini \
     timeout -s KILL $secs /opt/git/tokyoJungleRecomp/$B/tokyojungle \
-        /opt/git/tokyoJungleRecomp/input/EBOOT.ELF > $d/log.txt 2>&1 ) &
+        /opt/git/tokyoJungleRecomp/gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF > $d/log.txt 2>&1 ) &
 pid=$!
 t0=$(date +%s)
 for t in "$@"; do

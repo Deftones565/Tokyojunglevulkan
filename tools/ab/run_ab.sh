@@ -10,7 +10,7 @@ vfs=${VFS:-$B/vfs-$name}; rm -rf "$vfs"
 PS3_VERBOSE=0 TJ_HEADLESS=1 SDL_AUDIODRIVER=dummy TJ_TICK_STATS=1 TJ_RUN_DIR=$PWD/$vfs \
   TJ_FRAME_DUMP=$PWD/$fd TJ_FRAME_DUMP_EVERY=10 TJ_FRAME_DUMP_SKIP=1050 TJ_FRAME_DUMP_MAX=200 \
   PAD_SCRIPT="30:0x4000,36:0x4000,42:0x4000,48:0x4000,54:0x4000,60:0x4000,66:0x4000,72:0x4000,100:0x4000,105:0x4000,110:0x4000" \
-  timeout -s KILL 240 ./$B/tokyojungle input/EBOOT.ELF > $log 2>&1
+  timeout -s KILL 240 ./$B/tokyojungle gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF > $log 2>&1
 echo "$name: FATAL $(grep -c FATAL $log); effect.efd $(grep -c effect.efd $log); frames $(ls $fd | wc -l)"
 grep tick-stats $log | tail -1
 .agents/talk say $POSTER "RUN done: $name" >/dev/null

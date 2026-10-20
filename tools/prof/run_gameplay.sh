@@ -23,7 +23,7 @@ env PS3_VERBOSE=0 TJ_HEADLESS=1 SDL_AUDIODRIVER=dummy TJ_TICK_STATS=1 GCM_WAIT_S
   TJ_FRAME_DUMP=$out/frames TJ_FRAME_DUMP_EVERY=15 TJ_FRAME_DUMP_MAX=2000 \
   PROF_OUT=$out/prof.bin PROF_WALL_HZ=200 PROF_START_S=80 PROF_END_S=145 LD_PRELOAD=$R/build-runs/sigprof.so \
   PAD_SCRIPT="$($R/tools/play/fast_pad.sh)" \
-  "$@" timeout -s KILL ${RUN_S:-150} "$bin" $R/input/EBOOT.ELF > "$log" 2>&1 || true
+  "$@" timeout -s KILL ${RUN_S:-150} "$bin" $R/gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF > "$log" 2>&1 || true
 cd $R; rm -rf "$out/cwd" "$out/vfs"
 echo "$name: FATAL $(grep -c FATAL $log); LIFT-GAP $(grep -c LIFT-GAP $log); effect.efd $(grep -c effect.efd $log)"
 grep '\[gcm-wait\]' $log | tail -2 || true

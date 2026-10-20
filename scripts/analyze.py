@@ -16,7 +16,7 @@ Output goes under generated/ (gitignored: it is derived from the game):
 
 Paths default from config/tokyojungle.toml. Run it with the project venv:
 
-  .venv/bin/python scripts/analyze.py              # input/EBOOT.ELF
+  .venv/bin/python scripts/analyze.py              # gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF
   .venv/bin/python scripts/analyze.py --elf other.elf --out /tmp/x
 
 This replaces the prior port's analyze.py + gen_stubs.py + post_lift.py.

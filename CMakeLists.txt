@@ -57,7 +57,7 @@ if(NOT EXISTS "${RECOMP_DIR}/ppu_recomp.h")
         "No ppu_recomp.h in ${RECOMP_DIR}.\n"
         "That header and the lifted sources beside it are what "
         "tools/ppu_lifter.py writes. Run scripts/analyze.py (it lifts "
-        "input/EBOOT.ELF into generated/ppu), or point -DRECOMP_DIR= at "
+        "gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF into generated/ppu), or point -DRECOMP_DIR= at "
         "wherever a lift already is.")
 endif()
 
@@ -346,9 +346,9 @@ set_source_files_properties(src/settings_menu.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/libs/font")
 
 # TJ: where the runner looks for the game data when it is not told: the
-# extracted/ tree tools/extract/ fills (PARAM.SFO + USRDIR/).
+# gamefiles/games/NPUA80523/ tree tools/extract/ fills (PARAM.SFO + USRDIR/).
 target_compile_definitions(${PROJECT_NAME} PRIVATE
-    TJ_DEFAULT_GAME_DIR="${CMAKE_CURRENT_SOURCE_DIR}/extracted")
+    TJ_DEFAULT_GAME_DIR="${CMAKE_CURRENT_SOURCE_DIR}/gamefiles/games/NPUA80523")
 
 # The runtime is C++, and on Apple also Objective-C. Letting CMake infer the
 # link language from the generated C would leave the C++ standard library out.

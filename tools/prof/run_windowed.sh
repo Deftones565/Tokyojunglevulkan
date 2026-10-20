@@ -27,7 +27,7 @@ env -u TJ_HEADLESS "${dump[@]}" WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0} DI
   PS3_VERBOSE=0 SDL_AUDIODRIVER=dummy TJ_TICK_STATS=1 GCM_WAIT_STATS=1 TJ_RUN_DIR=$out/vfs \
   TJ_SETTINGS=$out/settings.ini TJ_PERF_FILE=$out/flips.txt \
   PAD_SCRIPT="$($R/tools/play/fast_pad.sh)" \
-  "$@" timeout -s KILL ${RUN_S:-240} "$bin" $R/input/EBOOT.ELF > "$log" 2>&1 || true
+  "$@" timeout -s KILL ${RUN_S:-240} "$bin" $R/gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF > "$log" 2>&1 || true
 cd $R; rm -rf "$out/cwd" "$out/vfs"
 echo "$name: FATAL $(grep -ac FATAL $log); LIFT-GAP $(grep -ac LIFT-GAP $log); effect.efd $(grep -ac effect.efd $log)"
 grep -a '\[tick-stats\]' $log | tail -1 || true

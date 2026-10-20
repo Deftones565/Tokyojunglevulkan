@@ -765,7 +765,7 @@ static int ensure_link(const char* link, const char* target)
 }
 
 /* <game> from, in order: argv[2], $TJ_GAME_DIR, the ELF's own location when it
- * sits in a USRDIR (<game>/USRDIR/EBOOT.ELF), or this checkout's extracted/,
+ * sits in a USRDIR (<game>/USRDIR/EBOOT.ELF), or this checkout's gamefiles/games/NPUA80523/,
  * which is where tools/extract/ unpacks the PKGs (TJ_DEFAULT_GAME_DIR, set by
  * CMakeLists.txt). */
 static bool find_game_dir(const char* eboot, const char* arg, char* out, size_t cap)

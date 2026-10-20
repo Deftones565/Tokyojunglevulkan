@@ -11,7 +11,7 @@ version = "01.01"
 [input]
 # The decrypted PPU ELF. Supplied by the extraction step (BALTHASAR-2's
 # tools/extract/), never committed.
-elf_path = "input/EBOOT.ELF"
+elf_path = "gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF"
 
 [output]
 # Root for everything derived from the game: analysis/ and ppu/ (the lift) go

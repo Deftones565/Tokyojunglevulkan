@@ -11,7 +11,7 @@ its text through the firmware's own font stack, statically lifted. Nothing is in
 
 ## How to build it
 ```sh
-tools/firmware/decrypt_prx.sh                 # dev_flash -> input/firmware/<module>.prx
+tools/firmware/decrypt_prx.sh                 # dev_flash -> gamefiles/firmware/modules/<module>.prx
 .venv/bin/python scripts/lift_firmware.py     # -> generated/prx/
 cmake -S . -B build && cmake --build build
 ```

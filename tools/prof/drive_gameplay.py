@@ -118,7 +118,7 @@ def main():
     shutil.copy2(os.path.realpath(a.binary), out + '/tokyojungle')
     say(f'RUN start: {a.name} ({a.binary}, closed-loop gameplay perf, scratch CWD) {" ".join(a.env)}')
     logf = open(log, 'wb')
-    p = subprocess.Popen([os.path.realpath(a.binary), R + '/input/EBOOT.ELF'], cwd=cwd, env=env,
+    p = subprocess.Popen([os.path.realpath(a.binary), R + '/gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF'], cwd=cwd, env=env,
                          stdout=logf, stderr=subprocess.STDOUT)
     t0 = time.time(); last_press = 0; n_press = 0; loading_t = None; hud_t = None; hud_frame = None
     started_skip = False; result = 'no HUD'

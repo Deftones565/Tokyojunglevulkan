@@ -13,6 +13,6 @@ env -u TJ_HEADLESS WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0} DISPLAY=${DISPL
   XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} SDL_AUDIODRIVER=dummy \
   PS3_VERBOSE=0 TJ_TICK_STATS=1 TJ_RUN_DIR=$PWD/$vfs TJ_FPS_LOG=1 TJ_DISPLAY_MODE_AT=$modes $set_env \
   PAD_SCRIPT="30:0x4000,36:0x4000,42:0x4000,48:0x4000,54:0x4000,60:0x4000,66:0x4000,72:0x4000,100:0x4000,105:0x4000,110:0x4000" \
-  timeout -s KILL 210 ./$B/tokyojungle input/EBOOT.ELF > $log 2>&1
+  timeout -s KILL 210 ./$B/tokyojungle gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF > $log 2>&1
 grep -n '\[settings\] display\|window swapchain\|\[fps\]' $log | awk -F: '{printf "%s ", $2} END{print ""}' | fold -w 200
 .agents/talk say $POSTER "RUN done: $name" >/dev/null

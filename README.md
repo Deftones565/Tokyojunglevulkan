@@ -10,8 +10,17 @@ against ps3recomp's built-in boot test. **The game itself hasn't been lifted
 yet.** That's waiting on a decryption licence (see step 1).
 
 **This repo contains no game data.** You need your own copies of the game's PSN
-packages and your own licence. Everything derived from them (`input/`,
-`extracted/`, `generated/`) is gitignored and must never be committed.
+packages and your own licence. All of it lives under `gamefiles/` (packages, RAPs,
+firmware, the decrypted game, saves), which, like `generated/`, is gitignored and must
+never be committed:
+
+| `gamefiles/` | |
+|---|---|
+| `packages/` | your `.pkg` files |
+| `raps/` | your licences (`.rap`) |
+| `firmware/` | `PS3UPDAT.PUP`, and `modules/` (firmware PRX decrypted for lifting) |
+| `games/NPUA80523/` | the decrypted game: `PARAM.SFO`, `USRDIR/` (with `EBOOT.ELF`) |
+| `saves/gamedata/` | saves and trophies (`gamedata` in the repo root links here, because the game keeps them in `gamedata/` under its working directory) |
 
 ## Requirements
 
@@ -27,7 +36,7 @@ Versions known to work are listed in [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md).
 
 ### 1. Inputs
 
-Put these in `input/`:
+Put these in `gamefiles/packages/` and `gamefiles/raps/`:
 
 | File | What it is |
 |---|---|
@@ -42,16 +51,16 @@ tools/extract/setup_game.sh
 ```
 
 It installs both packages into RPCS3, decrypts the 1.01 EBOOT to
-`input/EBOOT.ELF`, and copies the game data to `extracted/USRDIR/`.
+`gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF`, and copies the game data to `gamefiles/games/NPUA80523/USRDIR/`.
 
 ### 2. Firmware (once)
 
 The PS3's system fonts and the RPCS3 reference both need the firmware. Download
 the current `PS3UPDAT.PUP` from Sony's PS3 system-software update page into
-`input/`, then:
+`gamefiles/firmware/`, then:
 
 ```sh
-flatpak run --filesystem="$PWD/input:ro" net.rpcs3.RPCS3 --installfw "$PWD/input/PS3UPDAT.PUP"
+flatpak run --filesystem="$PWD/gamefiles/firmware:ro" net.rpcs3.RPCS3 --installfw "$PWD/gamefiles/firmware/PS3UPDAT.PUP"
 ```
 
 Close the window when it finishes. Don't add `--headless`: that aborts without
@@ -65,7 +74,7 @@ python3 -m venv .venv && .venv/bin/pip install -r third_party/ps3recomp/requirem
 ```
 
 This runs ps3recomp's `ppu_loader`, then `find_functions`, then `ppu_lifter`
-on `input/EBOOT.ELF`, writing to `generated/ppu/`. Add `--clean` when re-lifting
+on `gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF`, writing to `generated/ppu/`. Add `--clean` when re-lifting
 so no stale source files survive.
 
 ### 4. Build
@@ -93,12 +102,12 @@ cmake --build build
 ### 5. Run
 
 ```sh
-PS3_VERBOSE=0 ./build/tokyojungle input/EBOOT.ELF
+PS3_VERBOSE=0 ./build/tokyojungle gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF
 ```
 
-- The game data is read from `extracted/` by default.
+- The game data is read from `gamefiles/games/NPUA80523/` (the folder holding the EBOOT's `USRDIR`).
 - The runner builds a PS3-shaped directory tree in `build/vfs/` that links to
-  that data, so saves land there rather than in `extracted/`.
+  that data; saves and trophies go to `gamedata/` in the working directory.
 - **Use `PS3_VERBOSE=0`.** Redirecting stderr otherwise turns on the full
   runtime log, which is heavy enough to change how the game behaves.
 
@@ -125,7 +134,7 @@ When the recomp goes wrong, run the real game in RPCS3 and find where the two di
 
 ```sh
 tools/oracle/run_rpcs3.sh -s 90                      # -> build-oracle/<timestamp>/
-TTY_NO_DEDUPE=1 PS3_VERBOSE=0 ./build/tokyojungle input/EBOOT.ELF > recomp.log 2>&1
+TTY_NO_DEDUPE=1 PS3_VERBOSE=0 ./build/tokyojungle gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF > recomp.log 2>&1
 tools/oracle/tty_diff.py build-oracle/<timestamp>/TTY.log recomp.log
 ```
 
@@ -149,7 +158,7 @@ See [tools/oracle/README.md](tools/oracle/README.md).
 | `tools/oracle/` | RPCS3 reference runs and TTY diffing |
 | `third_party/ps3recomp` | the toolkit (submodule, pinned) |
 | `third_party/tokyojungle-ref` | the earlier Windows port, for reference only |
-| `input/`, `extracted/`, `generated/`, `build*/` | game-derived or built; gitignored |
+| `gamefiles/`, `gamedata` (link), `generated/`, `build*/` | game-derived or built; gitignored |
 
 ## Docs
 

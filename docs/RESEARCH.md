@@ -64,9 +64,9 @@ ps3recomp.
 
 | Item | Where | State |
 |---|---|---|
-| Base 1.00 + 1.01 update PKGs | `input/*.pkg` | yours, gitignored |
-| Game data (v01.01, 2.4 GB) | `extracted/USRDIR/` | extracted, gitignored. Only `data/tj.edat` is NPDRM-encrypted. |
-| Decrypted executable | `input/EBOOT.ELF` | **blocked: needs your .rap** |
+| Base 1.00 + 1.01 update PKGs | `gamefiles/packages/*.pkg` | yours, gitignored |
+| Game data (v01.01, 2.4 GB) | `gamefiles/games/NPUA80523/USRDIR/` | extracted, gitignored. Only `data/tj.edat` is NPDRM-encrypted. |
+| Decrypted executable | `gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF` | **blocked: needs your .rap** |
 | Extraction pipeline | `tools/extract/setup_game.sh` | ready |
 | ps3recomp + prior port | `third_party/` | submodules |
 | Toolchain check | `docs/TOOLCHAIN.md` | Vulkan backend builds and runs on this machine |
@@ -82,5 +82,5 @@ same way (tested: RPCS3 asks for the RAP). Ways to get your own:
 2. **If you already set this game up in RPCS3 somewhere else**, copy the `.rap` from
    `dev_hdd0/home/00000001/exdata/`.
 
-Put it at `input/UP9000-NPUA80523_00-TOKYOJUNGLE00001.rap` and run `tools/extract/setup_game.sh`.
+Put it at `gamefiles/raps/UP9000-NPUA80523_00-TOKYOJUNGLE00001.rap` and run `tools/extract/setup_game.sh`.
 It's gitignored and never leaves this machine.

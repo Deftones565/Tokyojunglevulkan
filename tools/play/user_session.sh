@@ -13,7 +13,7 @@ env -u TJ_HEADLESS -u PAD_SCRIPT -u PAD_FILE -u PS3_STRICT_LIFT -u SDL_AUDIODRIV
   WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0} DISPLAY=${DISPLAY:-:1} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} \
   PS3_VERBOSE=0 TJ_TICK_STATS=1 TJ_RUN_DIR=$PWD/$vfs \
   TJ_FRAME_DUMP=$PWD/$d/frames TJ_FRAME_DUMP_EVERY=${DUMP_EVERY:-300} SGSDIAG_OUT=$PWD/$d/sgsdiag TJ_FRAME_DUMP_MAX=100000 \
-  ./${B:-build}/tokyojungle input/EBOOT.ELF > $d.txt 2>&1
+  ./${B:-build}/tokyojungle gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF > $d.txt 2>&1
 rc=$?
 echo "$name: exit $rc; FATAL $(grep -c FATAL $d.txt); LIFT-GAP $(grep -c LIFT-GAP $d.txt); frames $(ls $d/frames | wc -l)"
 .agents/talk say $POSTER "RUN done: $name (exit $rc)" >/dev/null

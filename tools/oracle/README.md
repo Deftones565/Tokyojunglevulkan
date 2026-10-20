@@ -16,11 +16,11 @@ inferring the answer instead of checking it against a working run.
 
 1. **RPCS3:** the flatpak, `flatpak install --user flathub net.rpcs3.RPCS3`.
    Tested with 0.0.43-20251.
-2. **Firmware.** `input/PS3UPDAT.PUP` is 4.93, downloaded from Sony's update
+2. **Firmware.** `gamefiles/firmware/PS3UPDAT.PUP` is 4.93, downloaded from Sony's update
    server (`ps3-updatelist.txt`, `dus01.ps3.update.playstation.net`). Install it:
 
    ```sh
-   flatpak run --filesystem="$PWD/input:ro" net.rpcs3.RPCS3 --installfw "$PWD/input/PS3UPDAT.PUP"
+   flatpak run --filesystem="$PWD/input:ro" net.rpcs3.RPCS3 --installfw "$PWD/gamefiles/firmware/PS3UPDAT.PUP"
    ```
 
    - **Don't add `--headless`.** That combination aborts (exit 134) and installs nothing.
@@ -30,7 +30,7 @@ inferring the answer instead of checking it against a working run.
    - The recomp's runner uses this same `dev_flash` for system fonts.
 3. **The game:** `tools/extract/setup_game.sh` installs 1.00 and the 1.01 update
    into RPCS3's `dev_hdd0/game/NPUA80523`, using the licence from
-   `input/UP9000-NPUA80523_00-TOKYOJUNGLE00001.rap`.
+   `gamefiles/raps/UP9000-NPUA80523_00-TOKYOJUNGLE00001.rap`.
    **Without that licence RPCS3 can't run the game.** It stops with
    `Failed to decrypt content`.
 
@@ -58,7 +58,7 @@ tools/oracle/run_rpcs3.sh -s 90 -- --config my.yml   # extra arguments go to RPC
 ### Diffing against the recomp
 
 ```sh
-PS3_VERBOSE=0 ./build/tokyojungle input/EBOOT.ELF 2> recomp.log   # stop it after a similar time
+PS3_VERBOSE=0 ./build/tokyojungle gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF 2> recomp.log   # stop it after a similar time
 tools/oracle/tty_diff.py build-oracle/<run>/TTY.log recomp.log
 ```
 
