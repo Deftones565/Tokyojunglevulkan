@@ -18,3 +18,9 @@ __pycache__/
 .claude/settings.local.json
 # Steam Deck release output (tools/release/)
 /release/
+# in-source CMake builds of the dashboard (build into build-*/ instead)
+/dashboard/CMakeCache.txt
+/dashboard/CMakeFiles/
+/dashboard/Makefile
+/dashboard/cmake_install.cmake
+/dashboard/tjdash
