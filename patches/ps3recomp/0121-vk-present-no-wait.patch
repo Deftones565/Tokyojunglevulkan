@@ -1,0 +1,368 @@
+--- a/libs/video/rsx_vulkan_backend.c	2026-10-20 21:43:03.057073819 +0400
++++ b/libs/video/rsx_vulkan_backend.c	2026-10-20 21:43:03.059059041 +0400
+@@ -558,9 +558,12 @@
+     memset(im, 0, sizeof *im);
+ }
+ 
++static void vk_pg_idle(void);
++
+ static void vk_destroy_image(vk_image* im)
+ {
+     vk_batch_flush();                /* a recorded draw may still use it */
++    vk_pg_idle();                    /* or the last frame's, still on the GPU */
+     vk_destroy_image_now(im);
+ }
+ 
+@@ -571,18 +574,66 @@
+  * ~20% of the FIFO thread in Tokyo Jungle gameplay (mg5-p2). */
+ #define VK_GRAVEYARD_MAX 256
+ static vk_image s_graveyard[VK_GRAVEYARD_MAX];
++static u8       s_graveyard_gen[VK_GRAVEYARD_MAX];
+ static u32      s_graveyard_n;
+ 
++/* Presents that do not wait (vk_present_window). The frame is submitted and
++ * presented, and the CPU goes on to the next one while the GPU draws it: the
++ * FIFO thread used to wait for the whole frame's GPU work at every present
++ * (Steam Deck: ~12 of 33 ms a frame), and the game's main thread waited on
++ * the FIFO thread. What the batch owns until its GPU work is done -- the
++ * rings, upload staging, descriptor pool, graveyard and the present's own
++ * command buffer, fence, acquire semaphore and overlay buffer -- is kept per
++ * frame, in VK_PGEN generations: frame N records into generation N % 2, and
++ * the present of frame N waits for frame N-1's GPU work (its present's fence)
++ * before recycling that generation. So the GPU runs at most one frame behind.
++ * GPU order is unchanged (one queue, a global barrier in front of every
++ * recorded operation); anything that destroys an object waits for both.
++ * PS3RECOMP_VK_PRESENT_WAIT=1 waits at every present, as before. */
++#define VK_PGEN 2
++static struct {
++    int             ready;           /* the objects below exist             */
++    int             cur;             /* generation now recording            */
++    VkCommandBuffer cb[VK_PGEN];
++    VkFence         fence[VK_PGEN];
++    VkSemaphore     acq[VK_PGEN];
++    int             pending[VK_PGEN];
++} s_pg;
++
++static void vk_pg_wait(int g)
++{
++    if (!s_pg.pending[g]) return;
++    pvkWaitForFences(s_vk.device, 1, &s_pg.fence[g], VK_TRUE, UINT64_MAX);
++    s_pg.pending[g] = 0;
++}
++
++static void vk_pg_idle(void)
++{
++    for (int g = 0; g < VK_PGEN; g++) vk_pg_wait(g);
++}
++
+ static void vk_graveyard_empty(void)
+ {
+     for (u32 i = 0; i < s_graveyard_n; i++) vk_destroy_image_now(&s_graveyard[i]);
+     s_graveyard_n = 0;
+ }
+ 
++/* The images generation g released: its GPU work is done. */
++static void vk_graveyard_empty_gen(int g)
++{
++    u32 n = 0;
++    for (u32 i = 0; i < s_graveyard_n; i++) {
++        if (s_graveyard_gen[i] == g) { vk_destroy_image_now(&s_graveyard[i]); continue; }
++        s_graveyard[n] = s_graveyard[i]; s_graveyard_gen[n] = s_graveyard_gen[i]; n++;
++    }
++    s_graveyard_n = n;
++}
++
+ static void vk_destroy_image_later(vk_image* im)
+ {
+     extern int vk_batch_is_open(void);
+     if (!vk_batch_is_open() || s_graveyard_n >= VK_GRAVEYARD_MAX) { vk_destroy_image(im); return; }
++    s_graveyard_gen[s_graveyard_n] = (u8)s_pg.cur;
+     s_graveyard[s_graveyard_n++] = *im;
+     memset(im, 0, sizeof *im);
+ }
+@@ -650,6 +701,7 @@
+ static void vk_destroy_buffer(vk_buffer* b)
+ {
+     vk_batch_flush();
++    vk_pg_idle();
+     if (b->ptr) pvkUnmapMemory(s_vk.device, b->mem);
+     if (b->buf) pvkDestroyBuffer(s_vk.device, b->buf, NULL);
+     if (b->mem) pvkFreeMemory(s_vk.device, b->mem, NULL);
+@@ -755,7 +807,7 @@
+  * barrier every recorded operation starts with keep the GPU order unchanged.
+  * A wait (vk_submit_and_wait) waits for every kicked buffer too.
+  * PS3RECOMP_VK_KICK=0 turns kicks off. */
+-#define VK_KICK_MAX 4
++#define VK_KICK_MAX 16              /* a frame's kicks: the GPU may run a frame behind */
+ static struct {
+     int             ready;           /* the pool exists                     */
+     int             cur;             /* cb[cur] is s_vk.cmd                 */
+@@ -784,19 +836,20 @@
+ static void vk_pass_end(void);
+ 
+ /* Submit what the open batch has recorded so far and carry on recording in
+- * the next command buffer, without waiting. */
+-static void vk_kick(void)
++ * the next command buffer, without waiting. 1 = submitted, 0 = nothing to do
++ * or kicks are off, -1 = failed. */
++static int vk_kick(void)
+ {
+-    if (!s_kick.ready || !s_batch.open || s_batch.off || !vk_kick_on()) return;
++    if (!s_kick.ready || !s_batch.open || s_batch.off || !vk_kick_on()) return 0;
+     s_kick.since = 0;
+     vk_pass_end();
+-    if (pvkEndCommandBuffer(s_vk.cmd) != VK_SUCCESS) return;
++    if (pvkEndCommandBuffer(s_vk.cmd) != VK_SUCCESS) return -1;
+     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
+     pvkResetFences(s_vk.device, 1, &s_vk.fence);
+     if (pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence) != VK_SUCCESS) {
+         VK_LOG("vkQueueSubmit (kick) failed\n");
+-        return;
++        return -1;
+     }
+     s_kick.pending[s_kick.cur] = 1;
+     const int nx = (s_kick.cur + 1) % VK_KICK_MAX;
+@@ -811,6 +864,7 @@
+     VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                     .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+     pvkBeginCommandBuffer(s_vk.cmd, &bi);
++    return 1;
+ }
+ 
+ static int vk_batch_flush(void)
+@@ -851,6 +905,7 @@
+     if (st) clock_gettime(CLOCK_MONOTONIC, &t0);
+     VK_CHECK(pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+     vk_kick_wait_all();                  /* buffers kicked before this one */
++    vk_pg_idle();                        /* and presents: done, as they came first */
+     if (st) {
+         static double wait_ms, t_last; static unsigned long subs, draws_at;
+         extern unsigned long g_vk_draws_total;
+@@ -2744,8 +2799,8 @@
+  * frame is blitted there (vkCmdCopyBufferToImage, so no pipeline or shader),
+  * which keeps it out of the guest's surfaces, the readback and frame dumps.
+  * White and black are the same bytes in every 8-bit four-channel format. The
+- * buffer is rewritten each present; vk_present_window waits for its fence, so
+- * the previous copy has finished.
++ * buffer is rewritten each present: one per present generation (s_pg), whose
++ * last copy has finished by the time the generation records again.
+  * -------------------------------------------------------------------------*/
+ #define OVL_SCALE  3
+ #define OVL_MAXCH  24
+@@ -2753,9 +2808,12 @@
+ #define OVL_W      (OVL_MAXCH * 6 * OVL_SCALE + 2 * OVL_PAD)
+ #define OVL_H      (7 * OVL_SCALE + 2 * OVL_PAD)
+ static char           s_ovl_text[OVL_MAXCH + 1];
+-static VkBuffer       s_ovl_buf;
+-static VkDeviceMemory s_ovl_mem;
+-static u32*           s_ovl_px;
++static VkBuffer       s_ovl_bufs[VK_PGEN];
++static VkDeviceMemory s_ovl_mems[VK_PGEN];
++static u32*           s_ovl_pxs[VK_PGEN];
++#define s_ovl_buf s_ovl_bufs[s_pg.cur]
++#define s_ovl_mem s_ovl_mems[s_pg.cur]
++#define s_ovl_px  s_ovl_pxs[s_pg.cur]
+ 
+ /* 5x7 glyphs, one byte per row, bit 4 = leftmost column. */
+ static const unsigned char* ovl_glyph(char c)
+@@ -2851,9 +2909,39 @@
+ 
+ static void vk_overlay_destroy(void)
+ {
+-    if (s_ovl_buf) pvkDestroyBuffer(s_vk.device, s_ovl_buf, NULL);
+-    if (s_ovl_mem) pvkFreeMemory(s_vk.device, s_ovl_mem, NULL);
+-    s_ovl_buf = VK_NULL_HANDLE; s_ovl_mem = VK_NULL_HANDLE; s_ovl_px = NULL;
++    for (int g = 0; g < VK_PGEN; g++) {
++        if (s_ovl_bufs[g]) pvkDestroyBuffer(s_vk.device, s_ovl_bufs[g], NULL);
++        if (s_ovl_mems[g]) pvkFreeMemory(s_vk.device, s_ovl_mems[g], NULL);
++        s_ovl_bufs[g] = VK_NULL_HANDLE; s_ovl_mems[g] = VK_NULL_HANDLE; s_ovl_pxs[g] = NULL;
++    }
++}
++
++static void vk_pg_next(void);
++
++static int vk_pg_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("PS3RECOMP_VK_PRESENT_WAIT"); on = !(e && e[0] == '1'); }
++    return on;
++}
++
++static int vk_pg_create(void)
++{
++    VkCommandBufferAllocateInfo cai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
++                                        .commandPool = s_vk.pool,
++                                        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
++                                        .commandBufferCount = VK_PGEN };
++    if (pvkAllocateCommandBuffers(s_vk.device, &cai, s_pg.cb) != VK_SUCCESS) return -1;
++    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
++    VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
++    for (int g = 0; g < VK_PGEN; g++)
++        if (pvkCreateFence(s_vk.device, &fci, NULL, &s_pg.fence[g]) != VK_SUCCESS ||
++            pvkCreateSemaphore(s_vk.device, &semi, NULL, &s_pg.acq[g]) != VK_SUCCESS) {
++            VK_LOG("present: no fences/semaphores for presenting without a wait; waiting\n");
++            return -1;
++        }
++    s_pg.ready = 1;
++    return 0;
+ }
+ 
+ /* Blit the offscreen target into the next swapchain image and present it. */
+@@ -2880,9 +2968,20 @@
+         }
+     }
+ 
++    /* Without a wait (s_pg): the open batch goes to the GPU as it is, and the
++     * present is recorded into the generation's own command buffer behind it.
++     * The settings UI uploads its pixels, which may flush mid-recording, so
++     * while it is shown every present waits, as before. */
++    static int pg_failed;
++    int nowait = vk_pg_on() && !pg_failed && !vk_ui_wanted();
++    if (nowait && !s_pg.ready && vk_pg_create()) { pg_failed = 1; nowait = 0; }
++    if (nowait && s_batch.open && vk_kick() != 1) nowait = 0;
++    const int gen = s_pg.cur;
++    const VkSemaphore acq = nowait ? s_pg.acq[gen] : s_vk.sem_acquire;
++
+     u32 idx = 0;
+     VkResult r = pvkAcquireNextImageKHR(s_vk.device, s_vk.swapchain, UINT64_MAX,
+-                                        s_vk.sem_acquire, VK_NULL_HANDLE, &idx);
++                                        acq, VK_NULL_HANDLE, &idx);
+     if (r == VK_ERROR_OUT_OF_DATE_KHR) { vk_swapchain_lost(); return; }
+     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+         VK_LOG("vkAcquireNextImageKHR failed (VkResult %d)\n", (int)r); return;
+@@ -2894,12 +2993,22 @@
+     if (ui && vk_ui_targets()) { s_disp.failed = 1; ui = 0;
+                                  VK_LOG("ui: could not be set up; the settings UI stays hidden\n"); }
+     int fxaa = s_fxaa.on && !s_fxaa.failed && s_disp.src && s_disp.src_view;
++    if (fxaa && nowait) vk_pg_wait((gen + 1) % VK_PGEN);  /* the last present used its set */
+     if (fxaa && vk_fxaa_setup(s_disp.src_w, s_disp.src_h)) {
+         s_fxaa.failed = 1; fxaa = 0;
+         VK_LOG("fxaa: could not be set up; presenting without it\n");
+     }
+ 
+-    if (vk_begin()) return;
++    const VkCommandBuffer batch_cmd = s_vk.cmd;
++    if (nowait) {
++        s_vk.cmd = s_pg.cb[gen];
++        VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                                        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
++        if (pvkResetCommandBuffer(s_vk.cmd, 0) != VK_SUCCESS ||
++            pvkBeginCommandBuffer(s_vk.cmd, &bi) != VK_SUCCESS) {
++            VK_LOG("present: vkBeginCommandBuffer failed\n"); s_vk.cmd = batch_cmd; return;
++        }
++    } else if (vk_begin()) return;
+     if (ui && vk_ui_upload()) ui = 0;
+     const VkImage src = s_disp.src ? s_disp.src : s_vk.color.img;
+     const u32 sw = s_disp.src ? s_disp.src_w : s_vk.width;
+@@ -2970,21 +3079,25 @@
+         pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                               0, 0, NULL, 0, NULL, 1, &b);
+     }
+-    if (pvkEndCommandBuffer(s_vk.cmd) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer failed\n"); return; }
++    const VkCommandBuffer pcmd = s_vk.cmd;
++    if (nowait) s_vk.cmd = batch_cmd;
++    if (pvkEndCommandBuffer(pcmd) != VK_SUCCESS) { VK_LOG("vkEndCommandBuffer failed\n"); return; }
+ 
+     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+     VkSubmitInfo si = {
+         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+-        .waitSemaphoreCount = 1, .pWaitSemaphores = &s_vk.sem_acquire,
++        .waitSemaphoreCount = 1, .pWaitSemaphores = &acq,
+         .pWaitDstStageMask = &wait_stage,
+-        .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd,
++        .commandBufferCount = 1, .pCommandBuffers = &pcmd,
+         .signalSemaphoreCount = 1, .pSignalSemaphores = &s_vk.sc_done[idx],
+     };
+-    pvkResetFences(s_vk.device, 1, &s_vk.fence);
+-    if (pvkQueueSubmit(s_vk.queue, 1, &si, s_vk.fence) != VK_SUCCESS) {
++    const VkFence fence = nowait ? s_pg.fence[gen] : s_vk.fence;
++    pvkResetFences(s_vk.device, 1, &fence);
++    if (pvkQueueSubmit(s_vk.queue, 1, &si, fence) != VK_SUCCESS) {
+         VK_LOG("vkQueueSubmit (window) failed\n"); return;
+     }
+-    pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
++    if (nowait) s_pg.pending[gen] = 1;
++    else        pvkWaitForFences(s_vk.device, 1, &fence, VK_TRUE, UINT64_MAX);
+ 
+     VkPresentInfoKHR pi = {
+         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+@@ -2994,6 +3107,7 @@
+     r = pvkQueuePresentKHR(s_vk.queue, &pi);
+     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) vk_swapchain_lost();
+     else if (r != VK_SUCCESS) VK_LOG("vkQueuePresentKHR failed (VkResult %d)\n", (int)r);
++    if (nowait) vk_pg_next();
+ }
+ 
+ static void vk_dump_ppm(const unsigned char* rgba)
+@@ -4020,6 +4134,7 @@
+ static void vk_eng_drop_framebuffers(void)
+ {
+     vk_batch_flush();
++    vk_pg_idle();
+     for (u32 i = 0; i < s_e2.fb_count; i++)
+         if (s_e2.fb[i].fb) pvkDestroyFramebuffer(s_vk.device, s_e2.fb[i].fb, NULL);
+     s_e2.fb_count = 0;
+@@ -4263,6 +4378,7 @@
+     if (!pipeline || pipeline > VK_ENG_MAX_PIPE || !s_epipe[pipeline - 1].used) return;
+     vk_eng_pipe* P = &s_epipe[pipeline - 1];
+     vk_batch_flush();
++    vk_pg_idle();
+     for (u32 t = 0; t < VK_ENG_TOPOLOGIES; t++)
+         if (P->variant[t]) pvkDestroyPipeline(s_vk.device, P->variant[t], NULL);
+     if (P->vs) pvkDestroyShaderModule(s_vk.device, P->vs, NULL);
+@@ -4432,8 +4548,42 @@
+     s_bs.sets = 0;
+ }
+ 
++/* The other generation's batch storage (s_pg): swapped with s_bs/s_bst at
++ * each non-waiting present. vsc/psc stay: they are the bound constants. */
++static struct {
++    vk_buffer        v, i, u, bst;
++    VkDescriptorPool pool;
++    u32              sets;
++} s_pg_store[VK_PGEN];
++
++/* After the present of the frame generation s_pg.cur recorded: wait for the
++ * other generation's last frame, recycle what it owned and record into it. */
++static void vk_pg_next(void)
++{
++    const int g = s_pg.cur, n = (g + 1) % VK_PGEN;
++    vk_pg_wait(n);
++    s_pg_store[g].v = s_bs.v; s_pg_store[g].i = s_bs.i; s_pg_store[g].u = s_bs.u;
++    s_pg_store[g].bst = s_bst; s_pg_store[g].pool = s_bs.pool; s_pg_store[g].sets = s_bs.sets;
++    s_bs.v = s_pg_store[n].v; s_bs.i = s_pg_store[n].i; s_bs.u = s_pg_store[n].u;
++    s_bst = s_pg_store[n].bst; s_bs.pool = s_pg_store[n].pool; s_bs.sets = s_pg_store[n].sets;
++    memset(&s_pg_store[n], 0, sizeof s_pg_store[n]);
++    s_pg.cur = n;
++    vk_graveyard_empty_gen(n);
++    vk_batch_reset();
++    s_batch.draws = 0;
++}
++
+ static void vk_batch_shutdown(void)
+ {
++    vk_pg_idle();
++    for (int g = 0; g < VK_PGEN; g++) {
++        vk_destroy_buffer(&s_pg_store[g].v);
++        vk_destroy_buffer(&s_pg_store[g].i);
++        vk_destroy_buffer(&s_pg_store[g].u);
++        vk_destroy_buffer(&s_pg_store[g].bst);
++        if (s_pg_store[g].pool) pvkDestroyDescriptorPool(s_vk.device, s_pg_store[g].pool, NULL);
++        memset(&s_pg_store[g], 0, sizeof s_pg_store[g]);
++    }
+     vk_destroy_buffer(&s_bs.v);
+     vk_destroy_buffer(&s_bs.i);
+     vk_destroy_buffer(&s_bs.u);
+@@ -5146,6 +5296,11 @@
+             pvkDestroyFence(s_vk.device, s_vk.fence, NULL);
+         }
+         memset(&s_kick, 0, sizeof s_kick);
++        for (int g = 0; g < VK_PGEN; g++) {
++            if (s_pg.fence[g]) pvkDestroyFence(s_vk.device, s_pg.fence[g], NULL);
++            if (s_pg.acq[g])   pvkDestroySemaphore(s_vk.device, s_pg.acq[g], NULL);
++        }
++        memset(&s_pg, 0, sizeof s_pg);
+         if (s_vk.pool)  pvkDestroyCommandPool(s_vk.device, s_vk.pool, NULL);
+         pvkDestroyDevice(s_vk.device, NULL);
+     }
