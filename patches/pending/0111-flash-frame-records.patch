@@ -1,0 +1,396 @@
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -22,6 +22,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
++static void fr_note(char kind, unsigned surf);   /* RSX_FLASH_DETECT frame records */
+ 
+ /* Guest memory and the RSX offset resolvers, declared the way every backend
+  * that reads guest data declares them (rsx_vertex_fetch.h). */
+@@ -941,6 +942,7 @@
+     /* As after a draw into it: the target holds the pixels, guest memory not. */
+     D->color_serial = ++g.write_serial;
+     D->guest_dirty = 1;
++    fr_note('x', ds);
+     if (eng_coherence_log())
+         fprintf(stderr, "[rsx engine] gpu_copy %ux%u surface 0x%08X at %u,%u -> 0x%08X at %u,%u\n",
+                 w, h, S->offset, sx, sy, D->offset, dx, dy);
+@@ -971,6 +973,7 @@
+     u8* rows = eng_coherence_buffer(w * 4u * h);
+     if (!rows) return;
+     g.be->submit_and_wait(g.be->user, RSX_BE_FLUSH_GUEST_REFERENCE);
++    fr_note('r', slot);
+     g.be->readback(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+     if (eng_coherence_log())
+         fprintf(stderr, "[rsx engine] guest_read %u:0x%08X %ux%u <- surface 0x%08X at %u,%u:"
+@@ -1026,6 +1029,7 @@
+         fprintf(stderr, "[rsx engine] guest_wrote %u:0x%08X %ux%u -> surface 0x%08X at %u,%u:"
+                         " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
+                 eng_nonzero_pixels(rows, w * h));
++    fr_note('w', slot);
+     g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
+ }
+ 
+@@ -1750,6 +1754,66 @@
+     z->used_h = sf->clip_h ? sf->clip_h : g.height;
+ }
+ 
++/* RSX_FLASH_DETECT=1 (diag): what each frame wrote where, as runs of
++ * <kind><surface> x<count> in command order -- d draw with colour writes,
++ * z draw without, c clear, x GPU copy into, w CPU/SPU write pushed into --
++ * kept for the last 8 frames. When the flash detector flags a frame, the
++ * flash frame and its neighbours are printed: did the world's draws go to a
++ * different surface, not run at all, or run where we did not present? */
++enum { FR_RUNS = 64 };
++typedef struct {
++    u32 frame, flip_buf, target, disp_loc, disp_off, draws, n_runs, dropped, gcm_anom, gcm_wraps;
++    struct { u32 n; u16 surf; char kind; } run[FR_RUNS];
++} eng_frame_rec;
++static eng_frame_rec s_fr[8];
++static int fr_on(void)
++{
++    static int on = -1;
++    if (on < 0) on = getenv("RSX_FLASH_DETECT") ? 1 : 0;
++    return on;
++}
++static eng_frame_rec* fr_cur(void)
++{
++    eng_frame_rec* r = &s_fr[g.frames & 7u];
++    if (r->frame != g.frames || !r->n_runs) {
++        if (r->frame != g.frames) { memset(r, 0, sizeof *r); r->frame = g.frames; }
++    }
++    return r;
++}
++static void fr_note(char kind, unsigned surf)
++{
++    if (!fr_on()) return;
++    eng_frame_rec* r = fr_cur();
++    if (r->n_runs && r->run[r->n_runs - 1].surf == (u16)surf && r->run[r->n_runs - 1].kind == kind) {
++        r->run[r->n_runs - 1].n++;
++        return;
++    }
++    if (r->n_runs < FR_RUNS) {
++        r->run[r->n_runs].surf = (u16)surf; r->run[r->n_runs].kind = kind; r->run[r->n_runs].n = 1;
++        r->n_runs++;
++    } else r->dropped++;
++}
++u32 rsx_draw_engine_frame_no(void) { return g.frames; }
++void rsx_draw_engine_print_frame(u32 frame, const char* tag)
++{
++    const eng_frame_rec* r = &s_fr[frame & 7u];
++    if (r->frame != frame) { fprintf(stderr, "[flash]   %s frame %u: record gone\n", tag, frame); return; }
++    char line[2048]; int n = 0;
++    for (u32 i = 0; i < r->n_runs && n < (int)sizeof line - 32; i++)
++        n += snprintf(line + n, sizeof line - n, " %c%u x%u", r->run[i].kind, r->run[i].surf, r->run[i].n);
++    fprintf(stderr, "[flash]   %s frame %u buf %u (loc %u off 0x%08X) -> surface %u, draws %u, gcm resync/recycle %u, wraps %u, runs%s%s\n",
++            tag, r->frame, r->flip_buf, r->disp_loc, r->disp_off, r->target, r->draws, r->gcm_anom,
++            r->gcm_wraps, line, r->dropped ? " (+more)" : "");
++}
++void rsx_draw_engine_print_surfaces(void)
++{
++    for (u32 k = 0; k < g.n_surfaces; k++)
++        fprintf(stderr, "[flash]   surface %u loc %u off 0x%08X %ux%u pitch %u fmt %d serial %llu%s\n",
++                k, g.surfaces[k].location, g.surfaces[k].offset, g.surfaces[k].w, g.surfaces[k].h,
++                g.surfaces[k].pitch, (int)g.surfaces[k].fmt,
++                (unsigned long long)g.surfaces[k].color_serial, g.surfaces[k].handle ? "" : " (no handle)");
++}
++
+ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
+ {
+     const u64 serial = ++g.write_serial;
+@@ -3029,6 +3093,7 @@
+      * the test hook means: a draw through the built-in pair is a draw, not
+      * evidence that the decompile-translate-compile path worked. */
+     if (!pipeline_is_fixed) g.guest_draws++;
++    fr_note(rs.color_mask ? 'd' : 'z', targets[0]);
+ 
+     if (rs.color_mask) eng_surfaces_wrote(targets, n_targets);
+     if (zslot != ENG_INVALID && rs.depth_test && rs.depth_write) {
+@@ -3044,6 +3109,7 @@
+     u32 targets[RSX_BE_MAX_COLOR_TARGETS];
+     const u32 n_targets = eng_current_target_set(targets);
+     if (!n_targets) return;
++    fr_note('c', targets[0]);
+     if (pd_capturing()) {
+         rsx_dsp_surface zs;
+         rsx_dsp_get_surface(&g.rsx, &zs);
+@@ -3168,11 +3234,56 @@
+ {
+     if (buffer_id < 8 && g.display_buffers[buffer_id].valid) {
+         const eng_display_buffer* d = &g.display_buffers[buffer_id];
+-        for (u32 i = 0; i < g.n_surfaces; i++)
+-            if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
+-                g.surfaces[i].offset == d->offset)
+-                return i;
+-    }
++        { static int on = -1; static unsigned n;            /* RSX_PRESENT_DIAG */
++          if (on < 0) on = getenv("RSX_PRESENT_DIAG") ? 1 : 0;
++          if (on && n < 400) {
++              u32 m = 0;
++              for (u32 i = 0; i < g.n_surfaces; i++)
++                  if (g.surfaces[i].handle && g.surfaces[i].location == d->location &&
++                      g.surfaces[i].offset == d->offset) m++;
++              if (m != 1) {
++                  n++;
++                  fprintf(stderr, "[present] frame %u buf %u loc %u off 0x%08X %ux%u: %u matches, current %u\n",
++                          g.frames, buffer_id, d->location, d->offset, d->width, d->height, m,
++                          eng_current_surface());
++                  for (u32 i = 0; i < g.n_surfaces; i++)
++                      fprintf(stderr, "[present]   surface %u loc %u off 0x%08X %ux%u handle %u\n",
++                              i, g.surfaces[i].location, g.surfaces[i].offset,
++                              g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
++              }
++          } }
++        /* Several surfaces can share the display buffer's address (Tokyo
++         * Jungle aliases a 1280x720 offscreen target and a 32x720 strip onto
++         * its display buffers). Taking the first match presented one of those
++         * for a frame -- the world vanished to a bright image, sometimes every
++         * other frame for seconds. On hardware the buffer holds whatever was
++         * written to that memory last, so take the most recently drawn match,
++         * preferring one that covers the whole display buffer. */
++        u32 best = ENG_INVALID; int best_cover = -1; u64 best_serial = 0;
++        for (u32 i = 0; i < g.n_surfaces; i++) {
++            const eng_surface* sf = &g.surfaces[i];
++            if (!sf->handle || sf->location != d->location || sf->offset != d->offset) continue;
++            const int cover = sf->w >= d->width && sf->h >= d->height;
++            if (cover > best_cover || (cover == best_cover && sf->color_serial > best_serial)) {
++                best = i; best_cover = cover; best_serial = sf->color_serial;
++            }
++        }
++        if (best != ENG_INVALID) return best;
++    }
++    /* RSX_PRESENT_DIAG=1: a flip whose display buffer has no surface falls
++     * back to whatever surface is bound -- log those, with the candidates. */
++    { static int on = -1; static unsigned n;
++      if (on < 0) on = getenv("RSX_PRESENT_DIAG") ? 1 : 0;
++      if (on && n++ < 200) {
++          const int v = buffer_id < 8 && g.display_buffers[buffer_id].valid;
++          fprintf(stderr, "[present-fallback] buf %u valid %d loc %u off 0x%08X -> current %u (frame %u)\n",
++                  buffer_id, v, v ? g.display_buffers[buffer_id].location : 0,
++                  v ? g.display_buffers[buffer_id].offset : 0, eng_current_surface(), g.frames);
++          for (u32 i = 0; i < g.n_surfaces; i++)
++              fprintf(stderr, "[present-fallback]   surface %u loc %u off 0x%08X %ux%u handle %u\n",
++                      i, g.surfaces[i].location, g.surfaces[i].offset,
++                      g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
++      } }
+     return eng_current_surface();
+ }
+ 
+@@ -3190,6 +3301,32 @@
+                     i, g.surfaces[i].location, g.surfaces[i].offset,
+                     g.surfaces[i].w, g.surfaces[i].h, g.surfaces[i].handle);
+     }
++    { static int on = -1; static unsigned n; static u32 last_t[8] = {ENG_INVALID,ENG_INVALID,ENG_INVALID,ENG_INVALID,ENG_INVALID,ENG_INVALID,ENG_INVALID,ENG_INVALID};
++      if (on < 0) on = getenv("RSX_PRESENT_DIAG") ? 1 : 0;   /* a buffer's surface changed */
++      if (on && g.guest_draws && buffer_id < 8 && target != last_t[buffer_id]) {
++          if (n++ < 300) {
++              const eng_display_buffer* d = &g.display_buffers[buffer_id];
++              fprintf(stderr, "[present] frame %u flip-buf %u (loc %u off 0x%08X %ux%u) -> surface %u (was %u), current %u, draws %u, serial now %llu\n",
++                      g.frames, buffer_id, d->location, d->offset, d->width, d->height, target,
++                      last_t[buffer_id], eng_current_surface(), g.guest_draws,
++                      (unsigned long long)g.write_serial);
++              for (u32 k = 0; k < g.n_surfaces; k++)
++                  fprintf(stderr, "[present]   surface %u loc %u off 0x%08X %ux%u pitch %u fmt %d serial %llu%s\n",
++                          k, g.surfaces[k].location, g.surfaces[k].offset, g.surfaces[k].w,
++                          g.surfaces[k].h, g.surfaces[k].pitch, (int)g.surfaces[k].fmt,
++                          (unsigned long long)g.surfaces[k].color_serial,
++                          g.surfaces[k].handle ? "" : " (no handle)");
++          }
++          last_t[buffer_id] = target;
++      } }
++    if (fr_on()) {
++        extern u32 cellGcm_anomaly_count(void), cellGcm_wrap_count(void);
++        eng_frame_rec* r = fr_cur();
++        r->flip_buf = buffer_id; r->target = target; r->draws = g.guest_draws;
++        if (buffer_id < 8) { r->disp_loc = g.display_buffers[buffer_id].location;
++                             r->disp_off = g.display_buffers[buffer_id].offset; }
++        r->gcm_anom = cellGcm_anomaly_count(); r->gcm_wraps = cellGcm_wrap_count();
++    }
+     pd_present(target);
+     g.last_present_surface = target;
+     g.be->present(g.be->user, g.surfaces[target].handle);
+@@ -3364,6 +3501,9 @@
+     g.last_flip_buffer = buffer_id & 7u;
+ }
+ 
++/* Draws of the frame being presented (valid inside the backend's present). */
++u32 rsx_draw_engine_frame_draws(void) { return g.guest_draws; }
++
+ u32 rsx_draw_engine_guest_draws(void)
+ {
+     return g.last_guest_draws;
+--- a/libs/video/rsx_vulkan_backend.c
++++ b/libs/video/rsx_vulkan_backend.c
+@@ -3423,10 +3423,104 @@
+     vk_rec_end();
+ }
+ 
++/* RSX_FLASH_DETECT=1 (diag): a 64x36 luminance thumbnail of every presented
++ * frame, compared with its neighbours. A frame unlike both the one before and
++ * the one after, while those two match each other (A-B-A), is a one-frame
++ * flash -- the user's "world vanishes to the skybox" -- and is logged with
++ * its render stats next to its neighbours'. One small blit + readback per
++ * present. */
++extern unsigned cellGcm_flip_request_count(void);
++extern u32 rsx_draw_engine_frame_draws(void);
++extern u32 rsx_draw_engine_frame_no(void);
++extern void rsx_draw_engine_print_frame(u32 frame, const char* tag);
++extern void rsx_draw_engine_print_surfaces(void);
++static void vk_flash_probe(const vk_eng_obj* o, u32 surface)
++{
++    enum { TW = 64, TH = 36, N = TW * TH };
++    static int on = -1;
++    if (on < 0) on = getenv("RSX_FLASH_DETECT") ? 1 : 0;
++    if (!on || !o || o->fmt != VK_FORMAT_R8G8B8A8_UNORM) return;
++    if (!rsx_draw_engine_frame_draws()) return;    /* a re-present: not a new frame */
++    static vk_image im; static vk_buffer buf; static int ready;
++    if (!ready) {
++        if (vk_create_image(&im, VK_FORMAT_R8G8B8A8_UNORM, TW, TH,
++                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
++                            VK_IMAGE_ASPECT_COLOR_BIT) ||
++            vk_stage(&buf, (VkDeviceSize)N * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) { on = 0; return; }
++        if (vk_begin()) { on = 0; return; }
++        vk_barrier_image(im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
++        if (vk_submit_and_wait()) { on = 0; return; }
++        ready = 1;
++    }
++    if (vk_begin()) return;
++    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
++    VkImageBlit b = {
++        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .srcOffsets = { { 0, 0, 0 }, { (int32_t)o->iw, (int32_t)o->ih, 1 } },
++        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .dstOffsets = { { 0, 0, 0 }, { TW, TH, 1 } },
++    };
++    pvkCmdBlitImage(s_vk.cmd, o->im.img, VK_IMAGE_LAYOUT_GENERAL, im.img, VK_IMAGE_LAYOUT_GENERAL,
++                    1, &b, VK_FILTER_LINEAR);
++    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                           .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++                           .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT };
++    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                          VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
++                          0, 1, &mb, 0, NULL, 0, NULL);
++    VkBufferImageCopy region = {
++        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
++        .imageExtent = { TW, TH, 1 },
++    };
++    pvkCmdCopyImageToBuffer(s_vk.cmd, im.img, VK_IMAGE_LAYOUT_GENERAL, buf.buf, 1, &region);
++    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
++                          0, 1, &mb, 0, NULL, 0, NULL);
++    if (vk_submit_and_wait()) return;
++    vk_invalidate(&buf);
++
++    /* History of three: [0] oldest. */
++    typedef struct { u8 y[N]; u32 frame, flip, draws, surface, w, h; u32 mean; } shot;
++    static shot h[3]; static u32 nh, frame;
++    memmove(&h[0], &h[1], sizeof(shot) * 2);
++    shot* c = &h[2];
++    const u8* px = (const u8*)buf.ptr;
++    u32 sum = 0;
++    for (u32 i = 0; i < N; i++) {
++        c->y[i] = (u8)((px[i * 4] * 54u + px[i * 4 + 1] * 183u + px[i * 4 + 2] * 19u) >> 8);
++        sum += c->y[i];
++    }
++    c->mean = sum / N; c->frame = rsx_draw_engine_frame_no(); (void)frame; c->flip = cellGcm_flip_request_count();
++    c->draws = rsx_draw_engine_frame_draws(); c->surface = surface; c->w = o->iw; c->h = o->ih;
++    if (++nh < 3) return;
++    u32 d01 = 0, d12 = 0, d02 = 0;
++    for (u32 i = 0; i < N; i++) {
++        d01 += (u32)abs((int)h[0].y[i] - (int)h[1].y[i]);
++        d12 += (u32)abs((int)h[1].y[i] - (int)h[2].y[i]);
++        d02 += (u32)abs((int)h[0].y[i] - (int)h[2].y[i]);
++    }
++    d01 /= N; d12 /= N; d02 /= N;
++    if (d01 >= 12 && d12 >= 12 && d02 * 3 <= (d01 < d12 ? d01 : d12)) {
++        static u32 logged;
++        if (logged++ < 500) {
++            fprintf(stderr, "[flash] frame %u flip %u: diff %u/%u vs neighbours (they differ by %u)\n",
++                    h[1].frame, h[1].flip, d01, d12, d02);
++            for (int k = 0; k < 3; k++)
++                fprintf(stderr, "[flash]   %s frame %u flip %u surface %u %ux%u draws %u mean %u\n",
++                        k == 1 ? "FLASH" : "     ", h[k].frame, h[k].flip, h[k].surface,
++                        h[k].w, h[k].h, h[k].draws, h[k].mean);
++            rsx_draw_engine_print_frame(h[0].frame, "prev ");
++            rsx_draw_engine_print_frame(h[1].frame, "FLASH");
++            rsx_draw_engine_print_frame(h[2].frame, "next ");
++            if (logged <= 20 || logged % 50 == 0) rsx_draw_engine_print_surfaces();
++        }
++    }
++}
++
+ /* The named surface becomes the frame: blit it onto the display image, then
+  * the existing present does the readback, the PPM dump and the window. */
+ static void vk_eng_present(void* user, u32 surface)
+ {
++    vk_flash_probe(vk_eng_get(surface, VK_ENG_COLOR), surface);
+     (void)user;
+     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
+     /* The display image is read only by a frame dump (vk_cb_present reads
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -601,7 +601,10 @@
+     u32 cdata  = galloc ? galloc(16, 16) : 0;
+     if (cdata && gwrite32) {
+         gwrite32(cdata + 0x0, cmdbuf);              /* begin   */
+-        gwrite32(cdata + 0x4, cmdbuf + cmdSize);    /* end     */
++        /* end stops one word short: the buffer-full callback appends its
++         * JUMP-to-begin at `current`, which can be `end` itself. With `end` at
++         * the true end of the buffer that JUMP landed past it. */
++        gwrite32(cdata + 0x4, cmdbuf + cmdSize - 4); /* end / reserved JUMP */
+         gwrite32(cdata + 0x8, cmdbuf);              /* current */
+         /* Command-buffer-full callback: a guest OPD {func, toc} routed to
+          * hle_gcm_callback -> cellGcm_fifo_recycle. Without a real callback the
+@@ -1586,8 +1589,15 @@
+     return 1;
+ }
+ 
++/* RSX_FLASH_DETECT's frame records: how often the walker resynced or the
++ * drain thread recycled a ring (anomalies), and buffer-full wraps (normal). */
++static volatile u32 s_gcm_anom, s_gcm_wraps;
++u32 cellGcm_anomaly_count(void) { return s_gcm_anom; }
++u32 cellGcm_wrap_count(void) { return s_gcm_wraps; }
++
+ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
+ {
++    s_gcm_anom++;
+     static int n = 0;
+     if (n++ < 8)
+         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
+@@ -2554,7 +2564,19 @@
+      *
+      * ponytail: append the JUMP at `current` the way the SDK's own callback
+      * does, rather than tracking a second copy of the ring's geometry. */
+-    if (s_gcm_ctx_out_ea) {
++    /* Never on a ring whose buffer-full callback is the runtime's own
++     * (cellGcmSetupContext installs it): cellGcm_fifo_recycle wraps that ring
++     * and waits for the walker to take the tail. While it waits, `current`
++     * sits at `end`, which looked like an overrun here: this recycle then
++     * moved get to begin and DROPPED the unread tail -- a frame's world draws
++     * (Tokyo Jungle: the world vanished to the skybox for a frame) and its
++     * closing fence (the title then hung on it). The other Tokyo Jungle port
++     * (sp00nznet/tokyojungle) recycles only through the callback, and only
++     * once the walker has retired the tail. */
++    u32 cb_ctx = s_gcm_ctx_out_ea ? vm_read32(s_gcm_ctx_out_ea) : 0;
++    u32 cb_opd = cb_ctx ? vm_read32(cb_ctx + 0xC) : 0;
++    const int runtime_cb = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
++    if (s_gcm_ctx_out_ea && !runtime_cb) {
+         u32 ctx = vm_read32(s_gcm_ctx_out_ea);
+         u32 begin = ctx ? vm_read32(ctx + 0x0) : 0;
+         u32 end   = ctx ? vm_read32(ctx + 0x4) : 0;
+@@ -2612,6 +2634,7 @@
+                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
+                 s_fifo_getoff = io_begin;                          /* get */
+                 put = io_begin;
++                s_gcm_anom++;
+                 static int n = 0;
+                 if (n++ < 8)
+                     fprintf(stderr, "[cellGcmSys] recycled the title's own ring "
+@@ -2662,6 +2685,7 @@
+ void cellGcm_fifo_recycle(u32 ctx_ea)
+ {
+     if (!ctx_ea) return;
++    s_gcm_wraps++;
+     u32 begin   = vm_read32(ctx_ea + 0x0);
+     u32 current = vm_read32(ctx_ea + 0x8);
+     if (current <= begin) return;                       /* nothing to recycle */
