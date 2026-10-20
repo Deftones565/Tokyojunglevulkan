@@ -1,0 +1,36 @@
+--- a/libs/video/sys_rsx.c
++++ b/libs/video/sys_rsx.c
+@@ -209,8 +209,6 @@
+  * on. A dropped 0xEB00 therefore parks the emulator permanently.
+  *
+  * Called from the FIFO walker in cellGcmSys.c. */
+-extern uint32_t g_gcm_handler_mask;     /* cellGcmSys.c: bits per Set*Handler */
+-
+ void rsx_raise_user_cmd(uint32_t arg)
+ {
+     { static unsigned long n = 0;
+@@ -229,15 +227,15 @@
+         return;
+     }
+     /* No ISR queue: the title imports cellGcmSys instead of linking libgcm, so
+-     * the HLE library is its interrupt thread. Same rule as the event path --
+-     * nothing is raised unless cellGcmSetUserHandler set the 0x80 bit -- and
+-     * the handler then runs from ppu_gcm_pump with the command's argument,
+-     * like the flip and vblank handlers. Tokyo Jungle depends on it: it queues
+-     * SET_USER_COMMAND 0xF5AAC0DE, its handler signals the SPURS tasks that
+-     * finish the frame, and the main loop spins until they report back, so a
+-     * dropped command stopped the main loop at the first menu pick. */
+-    if (g_gcm_handler_mask & SYS_RSX_EVENT_USER_CMD)
+-        cellGcmQueueUserCommand(arg);
++     * the HLE library is its interrupt thread and the handler runs from
++     * ppu_gcm_pump with the command's argument, like the flip and vblank
++     * handlers. The FIFO walker queues it for the pump itself (cellGcmSys.c,
++     * method 0xEB00, when cellGcmSetUserHandler gave it a handler). Queueing
++     * it here as well ran Tokyo Jungle's handler twice per command: it counts
++     * the commands into label 0xFB and signals the SPU MLAA tasks, so two
++     * signals landed in one task wake-up -- an MLAA round lost -- and the
++     * frame was copied back from the SPUs' buffer with squares of older
++     * frames in it. */
+ }
+ 
+ static void rsx_isr_queue_bringup(void)

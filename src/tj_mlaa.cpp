@@ -18,14 +18,22 @@
 #include "ppu_recomp.h"
 #include "settings_menu.h"
 
+#include <chrono>
 #include <stdio.h>
+#include <stdlib.h>
 
 extern "C" void __real__Z13func_001536ECP11ppu_context(ppu_context* ctx);
 
 extern "C" void __wrap__Z13func_001536ECP11ppu_context(ppu_context* ctx)
 {
     /* Read every frame: the menu switches it live. */
-    const bool skip = tj_settings_anti_aliasing() != TJ_AA_GAME_MLAA;
+    bool skip = tj_settings_anti_aliasing() != TJ_AA_GAME_MLAA;
+    /* TJ_MLAA_AFTER_S=<s> (tests): the game's MLAA stays off for the first s
+     * seconds, so a scripted run reaches gameplay on its usual timing. */
+    { static const char* e = getenv("TJ_MLAA_AFTER_S");
+      static const auto t0 = std::chrono::steady_clock::now();
+      if (!skip && e && *e && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(atoi(e)))
+          skip = true; }
     static int last = -1;
     if ((int)skip != last) {
         fprintf(stderr, "[tj-mlaa] game MLAA %s\n", skip ? "off" : "on");
