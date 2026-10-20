@@ -6,7 +6,7 @@ set -euo pipefail
 B=/out/.build; A=/out/.AppDir
 cmake -S /src -B $B -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 \
-      -DPS3RECOMP_FFMPEG_INCLUDE_DIR=/opt/ffmpeg/include
+      -DPS3RECOMP_FFMPEG_INCLUDE_DIR=/opt/ffmpeg/include ${CMAKE_EXTRA:-}
 nice -n 10 cmake --build $B -j${JOBS:-10}
 
 rm -rf $A; mkdir -p $A/usr/bin $A/usr/lib

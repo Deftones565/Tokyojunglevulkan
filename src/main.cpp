@@ -271,9 +271,9 @@ static void tj_flip_promote_vblank(void)
     }
     if (tj_be32(TJ_GOV_LIMIT) != limit) tj_wbe32(TJ_GOV_LIMIT, limit);
     /* The settings menu's Frame rate: "Aim for 60" (the default) switches
-     * CheckFlipMode30 off, so the game never drops to its 30 FPS mode and
-     * runs as fast as it can; "Game decides" restores the game's own check.
-     * TJ_FORCE_FLIP60=1 forces it on for scripted runs. */
+     * CheckFlipMode30 off and this hook picks the mode; "Game decides"
+     * restores the game's own check. TJ_FORCE_FLIP60=1 forces 60 for
+     * scripted runs. */
     static int force = -1;
     if (force < 0) force = getenv("TJ_FORCE_FLIP60") != nullptr;
     const bool target60 = force || tj_settings_target60();
@@ -282,10 +282,38 @@ static void tj_flip_promote_vblank(void)
     /* With the check off the game no longer drops to 30 on missed frames,
      * but it still sets 30 itself (the pause menu does), and nothing brings it
      * back: the return to 60 sits behind the same check. So aiming for 60
-     * also puts it back at one vblank per flip (user, 2026-10-19: locked at 30
-     * after opening the map). */
+     * puts it back at one vblank per flip (user, 2026-10-19: locked at 30
+     * after opening the map) -- unless the machine cannot keep up. The game
+     * steps its world by N vblanks a frame, so at N=1 a frame that takes two
+     * vblanks plays in slow motion (user, 2026-10-20, Steam Deck: every frame
+     * two vblanks, half speed). Over each 2 s (120 vblanks): at N=1, fewer
+     * than 80 flips (under 40 FPS) -> N=2, the game's own 30 FPS mode at the
+     * right speed; at N=2, back to 1 once the title is waiting for the flip,
+     * FIFO idle, at 90% of the vblanks (the frames fit in one).
+     * TJ_FLIP_ADAPT=0: always 60, as before. */
     if (target60) {
-        if (tj_be32(TJ_GOV_N) == 2) tj_wbe32(TJ_GOV_N, 1);
+        static int adapt = -1;
+        if (adapt < 0) { const char* a = getenv("TJ_FLIP_ADAPT"); adapt = !(a && a[0] == '0'); }
+        static uint32_t want = 1;
+        static unsigned vb, ready, f0;
+        if (adapt && !force) {
+            const uint32_t ctrl = ppu_hle_inject_base + 0x2000u;   /* CellGcmControl */
+            const uint64_t poll = cellGcm_last_flip_wait_poll_ns();
+            if (tj_be32(ctrl) == tj_be32(ctrl + 4) && poll && cellGcm_now_ns() - poll < 2000000ull)
+                ready++;
+            if (++vb >= 120) {
+                const unsigned flips = cellGcm_flip_request_count() - f0;
+                const uint32_t was = want;
+                if (want == 1 && flips < 80) want = 2;
+                else if (want == 2 && ready >= 108) want = 1;
+                if (want != was)
+                    fprintf(stderr, "[tj-flipgov] %s FPS mode (%u flips, ready at %u of 120 vblanks)\n",
+                            want == 1 ? "60" : "30", flips, ready);
+                vb = ready = 0;
+                f0 = cellGcm_flip_request_count();
+            }
+        }
+        if (tj_be32(TJ_GOV_N) != want) tj_wbe32(TJ_GOV_N, want);
         return;
     }
     if (tj_be32(TJ_GOV_N) != 2) return;
@@ -315,9 +343,10 @@ static void tj_flip_gov_trace(void)
     const auto now = std::chrono::steady_clock::now();
     if (now < next) return;
     next = now + std::chrono::seconds(1);
-    fprintf(stderr, "[tj-flipgov] N=%u limit=%u check30=%u ahead=%u promotes=%lu frames=%u\n",
+    fprintf(stderr, "[tj-flipgov] N=%u limit=%u check30=%u ahead=%u promotes=%lu frames=%u flips=%u\n",
             tj_be32(TJ_GOV_N), tj_be32(TJ_GOV_LIMIT), vm_base[TJ_GOV_CHECK30],
-            tj_be32(TJ_GOV_AHEAD), s_tj_promotes, (unsigned)g_frames_presented);
+            tj_be32(TJ_GOV_AHEAD), s_tj_promotes, (unsigned)g_frames_presented,
+            cellGcm_flip_request_count());
 }
 
 static void present_guest_frame(void)
