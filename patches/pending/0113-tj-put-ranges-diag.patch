@@ -1,0 +1,61 @@
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -3018,8 +3018,47 @@
+  * Verified against the guest: Create takes the chain in r4 (r3 is the CellSpurs)
+  * and passes 0x02932A80; Run then arrives with r3=0x02932A80. Join and Shutdown
+  * are the same one-argument shape. */
++/* TJ_PUT_RANGES=1 (diag): which main memory SPU images write (DMA PUT)
++ * between two job-chain starts -- bytes, distinct 64 KB pages, and how many
++ * of those pages the previous interval also wrote -- per image, printed at
++ * every 60th chain start. Answers whether the chains rewrite a stable set of
++ * buffers (which a copy could protect) or something different every frame. */
++int tj_put_ranges_on = -1;
++static unsigned char s_pr_cur[16][65536 / 8], s_pr_prev[16][65536 / 8];
++static unsigned long long s_pr_bytes[16];
++void tj_put_range_note(int img, uint32_t ea, uint32_t size)
++{
++    if (img < 0 || img >= 16 || !size) return;
++    __atomic_add_fetch(&s_pr_bytes[img], size, __ATOMIC_RELAXED);
++    for (uint32_t pg = ea >> 16; pg <= (ea + size - 1) >> 16; pg++)
++        __atomic_or_fetch(&s_pr_cur[img][pg >> 3], (unsigned char)(1u << (pg & 7)), __ATOMIC_RELAXED);
++}
++static void tj_put_ranges_interval(const char* who)
++{
++    if (tj_put_ranges_on < 0) tj_put_ranges_on = getenv("TJ_PUT_RANGES") ? 1 : 0;
++    if (!tj_put_ranges_on) return;
++    static unsigned n;
++    const int print = (++n % 60) == 0;
++    for (int img = 0; img < 16; img++) {
++        if (!s_pr_bytes[img]) continue;
++        unsigned cur = 0, both = 0, prev = 0;
++        for (int i = 0; i < 65536 / 8; i++) {
++            cur  += (unsigned)__builtin_popcount(s_pr_cur[img][i]);
++            prev += (unsigned)__builtin_popcount(s_pr_prev[img][i]);
++            both += (unsigned)__builtin_popcount(s_pr_cur[img][i] & s_pr_prev[img][i]);
++        }
++        if (print)
++            fprintf(stderr, "[put-ranges] %s #%u img %d: %llu bytes, %u pages (%u also last time, last time %u)\n",
++                    who, n, img, s_pr_bytes[img], cur, both, prev);
++        memcpy(s_pr_prev[img], s_pr_cur[img], sizeof s_pr_cur[img]);
++        memset(s_pr_cur[img], 0, sizeof s_pr_cur[img]);
++        s_pr_bytes[img] = 0;
++    }
++}
++
+ static s32 jc_start(u64 jc_ea, const char* who)
+ {
++    tj_put_ranges_interval(who);
+     static int s_off = -1;
+     if (s_off < 0) s_off = getenv("PS3_NO_JOBCHAIN") ? 1 : 0;
+ 
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -608,6 +608,8 @@
+               }
+           } }
+     } else if (mfc_is_put(cmd)) {
++        { extern int tj_put_ranges_on; extern void tj_put_range_note(int img, uint32_t ea, uint32_t size);
++          if (tj_put_ranges_on) tj_put_range_note(spu->image_id, (uint32_t)ea, size); }
+         /* PUT: local store -> main memory.
+          *
+          * A plain PUT is a store by another processor as far as every SPU

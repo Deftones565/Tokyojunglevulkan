@@ -1,0 +1,57 @@
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2880,6 +2880,27 @@
+ 
+ s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0); }
+ 
++/* A flip that does not fit before `end` of a ring the runtime owns: run the
++ * buffer-full callback first, as libgcm does for any command that does not
++ * fit, so the flip still goes INTO the command stream (at `begin`). The
++ * immediate fallback skipped the in-stream flip, and with it the RSX state
++ * reset the drain performs there: Tokyo Jungle's next world pass then kept
++ * the HUD's DEPTH_MASK 0, wrote no depth, and the depth-based composite
++ * covered the world with sky -- the one-frame flash, once per ring wrap.
++ * GCM_FLIP_WRAP_FIRST=0 restores the old fallback (for A/B). */
++void cellGcm_fifo_recycle(u32 ctx_ea);
++static void gcm_flip_make_room(u32 ctx, u32 need)
++{
++    const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
++    if (cur + need + GCM_RECYCLE_SLACK <= end) return;
++    const u32 cb_opd = vm_read32(ctx + 0xC);
++    if (!cb_opd || vm_read32(cb_opd) != GCM_FIFO_CALLBACK_SENTINEL_EA) return;
++    { static int on = -1;
++      if (on < 0) { const char* e = getenv("GCM_FLIP_WRAP_FIRST"); on = e ? atoi(e) : 1; }
++      if (!on) return; }
++    cellGcm_fifo_recycle(ctx);
++}
++
+ /* The real _cellGcmSetFlipCommand appends the flip to the command buffer, so
+  * the RSX flips once it has executed everything queued before it. Firing it
+  * at call time instead presented whatever the drain had reached by then --
+@@ -2893,6 +2914,7 @@
+ {
+     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
+         !s_display_buffer_set[bufferId]) return 0;
++    gcm_flip_make_room(ctx, 8);
+     const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
+     /* Never near the end: those bytes are the title's reserve before its
+      * ring wraps, and the recycle above keys on them. */
+@@ -3693,6 +3715,7 @@
+     const u32 c = (u32)(uintptr_t)ctx;
+     if (c && labelIndex < CELL_GCM_MAX_LABEL_COUNT &&
+         bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM && s_display_buffer_set[bufferId]) {
++        gcm_flip_make_room(c, 16 + 8);
+         const u32 end = vm_read32(c + 4), cur = vm_read32(c + 8);
+         if (cur + 16 + 8 + GCM_RECYCLE_SLACK <= end && gcm_ea2io(cur) != 0xFFFFFFFFu) {
+             vm_write32(cur + 0,  0x00040064u);   /* SEMAPHORE_OFFSET  */
+@@ -3704,6 +3727,10 @@
+                 return gcm_flip_request(bufferId, 1);
+             vm_write32(c + 8, cur);              /* no room for the flip */
+         }
++        { static unsigned n;                     /* should not happen any more */
++          if (n++ < 20 || n % 100 == 0)
++              fprintf(stderr, "[cellGcmSys] flip %u went out immediately, NOT in the command stream (#%u)\n",
++                      bufferId, n); }
+     }
+     return cellGcmSetFlipCommandWithWaitLabel(bufferId, labelIndex, labelValue);
+ }
