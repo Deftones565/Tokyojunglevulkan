@@ -1,0 +1,101 @@
+RSX_ENGINE_PASS_DUMP_ONLY=<hex offset> (diag); a gate alone starts the dump
+
+RSX_ENGINE_PASS_DUMP_ONLY keeps only the passes that render into, or sample,
+a surface at that RSX offset (and only those draws in draws.txt), and writes
+no presents, so one surface can be followed for minutes. With
+RSX_ENGINE_PASS_DUMP_GATE set, the gate file alone starts the capture; before,
+the min-draws condition also started it at boot. Off by default: no change
+without the variables. Used 2026-10-21 to show Tokyo Jungle's map-tag name
+sheet (local 0x03B40000) is never a render target: its text comes from the
+CPU font path, which led to the HLE cellFont (src/font_hle.cpp).
+
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -2570,7 +2570,12 @@
+  * mask, blend, depth state and the textures it samples.
+  *
+  * The question it answers is which pass of a multi-pass frame first comes out
+- * wrong. */
++ * wrong.
++ *
++ * RSX_ENGINE_PASS_DUMP_ONLY=<hex offset>: keep only the passes that render
++ * into a colour target at that offset or sample a texture at it (and only
++ * those draws in draws.txt), and no presents, so one surface can be followed
++ * for minutes (Tokyo Jungle's map-tag name sheet, local 0x03B40000). */
+ static struct {
+     int state;              /* 0 unread, 1 waiting, 2 capturing, 3 done/off */
+     const char* dir;
+@@ -2585,6 +2590,8 @@
+     u32 n_targets, targets[RSX_BE_MAX_COLOR_TARGETS], zslot;
+     u32 draws, clears;
+     char first[2048];
++    u32 only;               /* RSX_ENGINE_PASS_DUMP_ONLY offset, 0 = all */
++    int hit;                /* this pass touches it */
+ } s_pd;
+ 
+ static int pd_open_index(void)
+@@ -2612,6 +2619,8 @@
+         s_pd.after_s = a ? (u32)strtoul(a, NULL, 0) : 0u;
+         const char* x = getenv("RSX_ENGINE_PASS_DUMP_MAX");
+         s_pd.max_passes = x ? (u32)strtoul(x, NULL, 0) : 64u;
++        const char* o = getenv("RSX_ENGINE_PASS_DUMP_ONLY");
++        s_pd.only = o ? (u32)strtoul(o, NULL, 16) : 0u;
+         s_pd.start = time(NULL);
+         s_pd.state = (s_pd.dir && *s_pd.dir) ? 1 : 3;
+     }
+@@ -2738,6 +2747,7 @@
+ static void pd_close_pass(void)
+ {
+     if (!s_pd.open) return;
++    if (s_pd.only && !s_pd.hit) { s_pd.open = 0; return; }
+     char path[1024];
+     fprintf(s_pd.index, "pass %03u: draws %u clears %u |", s_pd.pass, s_pd.draws,
+             s_pd.clears);
+@@ -2787,7 +2797,19 @@
+         s_pd.zslot = zslot;
+         s_pd.draws = s_pd.clears = 0;
+         s_pd.first[0] = 0;
++        s_pd.hit = 0;
++        for (u32 k = 0; k < n_targets; k++)
++            if (s_pd.only && g.surfaces[targets[k]].offset == s_pd.only) s_pd.hit = 1;
++    }
++    int samples_only = 0;
++    for (u32 u = 0; rs && s_pd.only && u < RSX_BE_MAX_TEXTURES; u++) {
++        if (!(tex_mask & (1u << u))) continue;
++        rsx_dsp_texture t;
++        rsx_dsp_get_texture(&g.rsx, u, &t);
++        if (t.offset == s_pd.only) samples_only = 1;
+     }
++    if (samples_only) s_pd.hit = 1;
++    const int log_draw = !s_pd.only || s_pd.hit;
+     if (!rs) {
+         s_pd.clears++;
+         const u32 h = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
+@@ -2798,7 +2820,7 @@
+                  s_pd.draws, h & 0xFFFFu, v & 0xFFFFu, h >> 16, v >> 16);
+         return;
+     }
+-    if (s_pd.draws_log) {
++    if (s_pd.draws_log && log_draw) {
+         fprintf(s_pd.draws_log, "pass %03u draw %u: pipe %u cmask %08X blend %u %X/%X"
+                 " dt %u dw %u at %u |", s_pd.pass, s_pd.draws, pipeline, rs->color_mask,
+                 rs->blend_enable, rs->sf_rgb, rs->df_rgb, rs->depth_test, rs->depth_write,
+@@ -2880,7 +2902,9 @@
+ static void pd_present(u32 presented)
+ {
+     if (s_pd.state == 0) pd_capturing();
+-    if (s_pd.state == 1 && !s_pd.after_s && g.guest_draws >= s_pd.min_draws) {
++    /* With a gate file the gate alone starts it (pd_capturing). */
++    if (s_pd.state == 1 && !s_pd.after_s && !getenv("RSX_ENGINE_PASS_DUMP_GATE") &&
++        g.guest_draws >= s_pd.min_draws) {
+         if (pd_open_index())
+             fprintf(s_pd.index, "frame %u (after a frame of %u guest draws)\n",
+                     g.frames + 1, g.guest_draws);
+@@ -2890,6 +2914,7 @@
+         char path[1024];
+         pd_close_pass();
+         if (s_pd.state != 2) return;               /* that pass was the last */
++        if (s_pd.only) return;
+         snprintf(path, sizeof path, "%s/present%03u.ppm", s_pd.dir, s_pd.pass);
+         pd_write_surface(presented, path);
+         fprintf(s_pd.index, "present%03u: surface %u 0x%08X, %u guest draws\n",

@@ -210,6 +210,7 @@ add_executable(${PROJECT_NAME}
     src/main.cpp
     src/settings_menu.cpp
     src/stubs.cpp
+    src/font_hle.cpp         # cellFont/cellFontFT, HLE over stb_truetype
     src/tj_mlaa.cpp          # TJ_DISABLE_MLAA (linker --wrap below)
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
@@ -341,8 +342,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 # The settings menu draws its text with the stb_truetype the runtime already
-# compiles for cellFont; only that TU gets libs/font on its include path.
-set_source_files_properties(src/settings_menu.cpp PROPERTIES
+# compiles for cellFont, as does the HLE cellFont (src/font_hle.cpp); only those
+# TUs get libs/font on their include path.
+set_source_files_properties(src/settings_menu.cpp src/font_hle.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/libs/font")
 
 # TJ: where the runner looks for the game data when it is not told: the

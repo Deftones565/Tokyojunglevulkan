@@ -1,5 +1,12 @@
 # Fonts: Sony's libfont, lifted
 
+> **Superseded 2026-10-22 (user decision): the game's text now comes from an HLE cellFont,
+> `src/font_hle.cpp` (stb_truetype over the firmware's own TTF faces), matched to this lifted
+> libfont with `TJ_FONT_ORACLE=1`.** Reason: with the lifted libfont three of the nine pause-map
+> area names never reached the game's name sheet; the other port's stb_truetype HLE shows them all.
+> The lifted modules below are still built (libsail needs its table) and `TJ_FONT_LLE=1` runs
+> libfont again for A/B. See docs/STATUS.md, "Fonts: HLE cellFont".
+
 Decided 2026-10-14 (BALTHASAR-2, from MELCHIOR-1's findings). **Done 2026-10-14**: the game draws
 its text through the firmware's own font stack, statically lifted. Nothing is interpreted.
 

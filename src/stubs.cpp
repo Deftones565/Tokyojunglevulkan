@@ -48,6 +48,11 @@ extern "C" void tj_prx_register_exports(void);
 extern "C" void tj_prx_module_start(uint32_t sysmodule_id);
 #endif
 
+/* src/font_hle.cpp: cellFont/cellFontFT over stb_truetype. */
+extern "C" int tj_font_hle_enabled(void);
+extern "C" void tj_font_hle_register(void);
+extern "C" void tj_font_oracle_register(void);
+
 extern "C" void ps3_load_prx_modules(void)
 {
 #ifdef TJ_HAVE_PRX
@@ -116,7 +121,9 @@ void LoadModuleWithStart(ppu_context* ctx)
 {
     const u16 id = (u16)ctx->gpr[3];
     const s32 rc = cellSysmoduleLoadModule(id);
-    if (rc == CELL_OK) tj_prx_module_start(id);
+    /* 0x0019 is libfont: with the HLE cellFont its lifted copy is never
+     * called, so it is not started either. */
+    if (rc == CELL_OK && !(id == 0x0019 && tj_font_hle_enabled())) tj_prx_module_start(id);
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
 }
 #endif
@@ -149,9 +156,18 @@ extern "C" void tj_register_hle_overrides(void)
     tj_prx_register_exports();
     ps3_hle_register_ctx(NID_cellSysmoduleLoadModule, "cellSysmoduleLoadModule",
                          LoadModuleWithStart);
-#else
-    ps3_hle_register_ctx(0xF03DCC29u, "cellFontInitializeWithRevision", FontInitializeWithRevision);
 #endif
+    /* The game's text: cellFont answered natively (src/font_hle.cpp), over the
+     * lifted libfont's exports. TJ_FONT_LLE=1 keeps the lifted one. */
+    if (tj_font_hle_enabled()) {
+        tj_font_hle_register();
+    } else {
+#ifdef TJ_HAVE_PRX
+        tj_font_oracle_register();
+#else
+        ps3_hle_register_ctx(0xF03DCC29u, "cellFontInitializeWithRevision", FontInitializeWithRevision);
+#endif
+    }
     ps3_hle_register_ctx(0x9638F766u, "cellHttpInitCookie", HttpCookieOk);
     ps3_hle_register_ctx(0x61B2BADEu, "cellHttpEndCookie", HttpCookieOk);
 }
