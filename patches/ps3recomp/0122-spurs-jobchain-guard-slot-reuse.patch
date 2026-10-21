@@ -1,0 +1,158 @@
+SPURS job chains/guards: reuse the slots of chains that were shut down and joined
+
+Tokyo Jungle allocates a new job chain object, with two job guards, for every
+area it loads (func_001502B0), and tears the old one down with
+ShutdownJobChain + JoinJobChain and frees it (func_0014FBCC). The HLE's chain
+and guard registries never released a slot, so after 16 area loads (32 guard
+slots, two per load) cellSpursJobGuardInitialize returned
+CELL_SPURS_TASK_ERROR_AGAIN and the game went into its own error loop
+(sys_timer_sleep(1) forever): the game hung ~30 min into a session, every
+thread asleep except SPU job workers.
+
+A chain that was shut down and has been joined is now marked reusable, and so
+are its guards; their slots are handed out only when no free slot is left,
+so nothing changes until the point where the title used to stop.
+
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2243,6 +2243,7 @@
+     volatile long running;   /* 1 while a host thread walks this chain */
+     volatile long alive;     /* 1 until that host thread has actually exited  */
+     volatile long stop;      /* set by Shutdown: the walker must leave        */
++    volatile long joined;    /* shut down and joined: the slot may be reused  */
+ } s_jobchains[MAX_JOBCHAINS];
+ 
+ /* The stop flag of the chain this host thread walks (NULL off a walker thread).
+@@ -2259,6 +2260,7 @@
+ 
+ static void jc_dump_commands(const char* tag, u32 ea, int max_words)
+ {
++  if(!ps3_log_verbose()) return;
+     printf("[cellSpurs] %s chain@0x%08X commands:", tag, ea);
+     for (int i = 0; i < max_words; i++) {
+         u64 cmd = vm_read64(ea + (u32)i * 8);
+@@ -2313,20 +2315,40 @@
+ }
+ 
+ /* Register (or re-register) a job chain handle. Shared by both Create forms. */
++/* Slots are taken in this order: the chain's own (re-Create on the same EA),
++ * a free one, then one whose chain was shut down and joined. The last kind is
++ * what keeps the registry from filling: Tokyo Jungle allocates a fresh chain
++ * object for every area it loads, and shuts down, joins and frees the old one,
++ * so the EAs never repeat. Without reuse the table was full after a few dozen
++ * area loads and the guards (below) ran out first: JobGuardInitialize
++ * returned AGAIN and the title stopped in its own error loop (sleep(1)
++ * forever, the screen frozen) about half an hour into a session. */
+ static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
+                        const char* who)
+ {
+-    for (int i = 0; i < MAX_JOBCHAINS; i++) {
+-        if (!s_jobchains[i].jc_ea || s_jobchains[i].jc_ea == jc_ea) {
+-            s_jobchains[i].jc_ea     = jc_ea;
+-            s_jobchains[i].entry_ea  = entry_ea;
+-            s_jobchains[i].size_desc = size_desc;
+-            s_jobchains[i].max_grab  = max_grab;
+-            s_jobchains[i].run_count = 0;
+-            return CELL_OK;
+-        }
++    int i;
++    for (i = 0; i < MAX_JOBCHAINS; i++)
++        if (s_jobchains[i].jc_ea == jc_ea) break;
++    if (i == MAX_JOBCHAINS)
++        for (i = 0; i < MAX_JOBCHAINS; i++)
++            if (!s_jobchains[i].jc_ea) break;
++    if (i == MAX_JOBCHAINS)
++        for (i = 0; i < MAX_JOBCHAINS; i++)
++            if (s_jobchains[i].joined && !s_jobchains[i].running && !s_jobchains[i].alive) break;
++    if (i == MAX_JOBCHAINS) {
++        printf("[cellSpurs] %s: registry full\n", who);
++        return CELL_OK;
+     }
+-    printf("[cellSpurs] %s: registry full\n", who);
++    if (s_jobchains[i].jc_ea != jc_ea) {
++        s_jobchains[i].stop   = 0;
++        s_jobchains[i].joined = 0;
++    }
++    s_jobchains[i].jc_ea     = jc_ea;
++    s_jobchains[i].entry_ea  = entry_ea;
++    s_jobchains[i].size_desc = size_desc;
++    s_jobchains[i].max_grab  = max_grab;
++    s_jobchains[i].run_count = 0;
++    s_jobchains[i].joined    = 0;
+     return CELL_OK;
+ }
+ 
+@@ -2489,7 +2511,9 @@
+     u32 reset;       /* value to restore when autoReset is set             */
+     u32 pending;     /* notifications received, not yet consumed        */
+     u32 auto_reset;
++    u32 jc;          /* the chain it was initialised for                   */
+     int active;
++    int stale;       /* its chain was shut down and joined: reusable       */
+ } s_jobguards[MAX_JOBGUARDS];
+ 
+ static int jg_find(u32 ea)
+@@ -2508,21 +2532,32 @@
+ s32 cellSpursJobGuardInitialize(u64 jc_ea, u64 guard_ea, u32 notify_count,
+                                 u32 request_spu_count, u32 auto_reset)
+ {
+-    (void)jc_ea; (void)request_spu_count;
++    (void)request_spu_count;
+     u32 ea = (u32)guard_ea;
+     if (!ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
+ 
++    /* Own slot, else a free one, else one whose chain is gone (see
++     * jc_register: these were never released, and running out is fatal to the
++     * title). */
+     int i = jg_find(ea);
+     if (i < 0)
+         for (i = 0; i < MAX_JOBGUARDS; i++) if (!s_jobguards[i].active) break;
+-    if (i >= MAX_JOBGUARDS) return CELL_SPURS_TASK_ERROR_AGAIN;
++    if (i >= MAX_JOBGUARDS)
++        for (i = 0; i < MAX_JOBGUARDS; i++) if (s_jobguards[i].stale) break;
++    if (i >= MAX_JOBGUARDS) {
++        printf("[cellSpurs] JobGuardInitialize(guard=0x%08X): all %d guards in use\n",
++               ea, MAX_JOBGUARDS);
++        return CELL_SPURS_TASK_ERROR_AGAIN;
++    }
+ 
+     s_jobguards[i].ea         = ea;
+     s_jobguards[i].count      = notify_count;
+     s_jobguards[i].reset      = notify_count;
+     s_jobguards[i].pending    = 0;
+     s_jobguards[i].auto_reset = auto_reset;
++    s_jobguards[i].jc         = (u32)jc_ea;
+     s_jobguards[i].active     = 1;
++    s_jobguards[i].stale      = 0;
+ 
+     /* Mirror the count into guest memory. The SPU side reads the guard on
+      * hardware; keeping the two consistent costs nothing and makes a guest-side
+@@ -3062,8 +3097,9 @@
+                 usleep(100);
+ #endif
+             }
+-            s_jobchains[i].stop  = 0;
+-            s_jobchains[i].alive = 1;
++            s_jobchains[i].stop   = 0;
++            s_jobchains[i].joined = 0;
++            s_jobchains[i].alive  = 1;
+             HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
+             if (th) CloseHandle(th);
+             else { s_jobchains[i].alive = 0; s_jobchains[i].running = 0; }
+@@ -3131,6 +3167,16 @@
+             usleep(0);
+ #endif
+         }
++        /* Shut down and now stopped: the title is done with this chain (it
++         * frees the object next). Its slot and its guards may be reused once
++         * the tables are otherwise full; a Create or Run on it first takes it
++         * back. */
++        if (s_jobchains[i].stop) {
++            s_jobchains[i].joined = 1;
++            for (int g = 0; g < MAX_JOBGUARDS; g++)
++                if (s_jobguards[g].active && s_jobguards[g].jc == (u32)jc_ea)
++                    s_jobguards[g].stale = 1;
++        }
+     }
+     return CELL_OK;
+ }
