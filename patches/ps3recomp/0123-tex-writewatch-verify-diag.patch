@@ -1,0 +1,33 @@
+RSX_TEX_WW_VERIFY=1 (diag): check the texture write watch
+
+Textures the write watch (0099) calls unchanged are hashed anyway; a changed
+one is logged as [ww-miss] (location, offset, size, format, frame) and
+re-uploaded. Off by default: no change without the variable. Used 2026-10-21
+to rule the write watch out for the missing map-tag names (0 misses).
+
+--- a/libs/video/rsx_draw_engine.c
++++ b/libs/video/rsx_draw_engine.c
+@@ -1371,11 +1371,22 @@
+             const int written = eng_ww_changed(eng_guest_ptr(NULL, location, offset, span),
+                                                span, &e->ww_stamp);
+             if (written < 0) s_ww_unknown++;
+-            if (!written) { s_ww_skipped++; goto hit; }
++            /* RSX_TEX_WW_VERIFY=1 (diag): hash the textures the write watch
++             * calls unchanged as well, and log (and re-upload) any whose bytes
++             * did change: a write the watch missed. */
++            static int verify = -1;
++            if (verify < 0) verify = getenv("RSX_TEX_WW_VERIFY") ? 1 : 0;
++            if (!written && !verify) { s_ww_skipped++; goto hit; }
+             s_ww_hashed++;
+             int readable = 0;
+             const u64 hash = eng_texture_content_hash(location, offset, span,
+                                                       &readable);
++            if (!written && readable && hash != e->content_hash) {
++                static unsigned n_miss = 0;
++                if (n_miss++ < 200)
++                    fprintf(stderr, "[ww-miss] loc=%u offset=0x%08X span=%u fmt=0x%02X %ux%u pitch=%u frame=%u\n",
++                            location, offset, span, fmt, w, h, pitch, g.frames);
++            }
+             if (readable && hash != e->content_hash) {
+                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
+                                                      levels, pitch, cube, remap);
