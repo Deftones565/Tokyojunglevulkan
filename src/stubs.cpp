@@ -40,22 +40,15 @@
  * answers those modules instead.
  * -----------------------------------------------------------------------*/
 
-#ifdef TJ_HAVE_PRX
-/* generated/prx/prx_modules.cpp (scripts/lift_firmware.py): the firmware's
- * libsail and libpamf (loading movies), lifted. */
-extern "C" void tj_prx_load_images(void);
-extern "C" void tj_prx_register_exports(void);
-extern "C" void tj_prx_module_start(uint32_t sysmodule_id);
-#endif
-
 /* src/font_hle.cpp: cellFont/cellFontFT over stb_truetype. */
 extern "C" void tj_font_hle_register(void);
+/* src/sail_hle.cpp: cellSail (movies) and its two cellPamf calls. */
+extern "C" void tj_sail_hle_register(void);
 
+/* No system PRX runs lifted: every firmware module the game uses is answered
+ * natively (fonts, movies) or by ps3recomp's HLE. */
 extern "C" void ps3_load_prx_modules(void)
 {
-#ifdef TJ_HAVE_PRX
-    tj_prx_load_images();
-#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -90,26 +83,10 @@ void LoadModuleEx(ppu_context* ctx)   { ps3_hle_call(NID_cellSysmoduleLoadModule
 void UnloadModuleEx(ppu_context* ctx) { ps3_hle_call(NID_cellSysmoduleUnloadModule, ctx); }
 
 /* cellSysmodule{Load,Unload}ModuleInternal(u16 id): what firmware modules call
- * to pull in their own dependencies (libsail imports both). Same argument as
- * the public calls, so they take the same path -- including module_start for a
- * module this port runs lifted. */
+ * to pull in their own dependencies. Same argument as the public calls, so
+ * they take the same path. */
 void LoadModuleInternal(ppu_context* ctx)   { ps3_hle_call(NID_cellSysmoduleLoadModule, ctx); }
 void UnloadModuleInternal(ppu_context* ctx) { ps3_hle_call(NID_cellSysmoduleUnloadModule, ctx); }
-
-#ifdef TJ_HAVE_PRX
-extern "C" s32 cellSysmoduleLoadModule(u16 id);   /* libs/system/cellSysmodule.c */
-
-/* cellSysmoduleLoadModule(id): the runtime's bookkeeping, then -- for a module
- * this port runs as lifted firmware -- that module's own module_start, which
- * the firmware runs when a title loads it. LoadModuleEx forwards here too. */
-void LoadModuleWithStart(ppu_context* ctx)
-{
-    const u16 id = (u16)ctx->gpr[3];
-    const s32 rc = cellSysmoduleLoadModule(id);
-    if (rc == CELL_OK) tj_prx_module_start(id);
-    ctx->gpr[3] = (uint64_t)(int64_t)rc;
-}
-#endif
 
 /* cellHttpInitCookie(pool, poolSize) / cellHttpEndCookie(): cookie storage for
  * HTTP requests this port never makes (no network). Accepting them is the
@@ -132,15 +109,10 @@ extern "C" void tj_register_hle_overrides(void)
     ps3_hle_register_ctx(0xFD0E1CACu, "cellSysmoduleUnloadModuleEx", UnloadModuleEx);
     ps3_hle_register_ctx(0xD9B8C0EEu, "cellSysmoduleLoadModuleInternal", LoadModuleInternal);
     ps3_hle_register_ctx(0xB498BF77u, "cellSysmoduleUnloadModuleInternal", UnloadModuleInternal);
-#ifdef TJ_HAVE_PRX
-    /* libsail and libpamf run lifted from the firmware; this binds every
-     * export they have. */
-    tj_prx_register_exports();
-    ps3_hle_register_ctx(NID_cellSysmoduleLoadModule, "cellSysmoduleLoadModule",
-                         LoadModuleWithStart);
-#endif
-    /* The game's text: cellFont answered natively (src/font_hle.cpp). */
+    /* The game's text and movies, answered natively (src/font_hle.cpp,
+     * src/sail_hle.cpp). */
     tj_font_hle_register();
+    tj_sail_hle_register();
     ps3_hle_register_ctx(0x9638F766u, "cellHttpInitCookie", HttpCookieOk);
     ps3_hle_register_ctx(0x61B2BADEu, "cellHttpEndCookie", HttpCookieOk);
 }

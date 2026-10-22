@@ -11,6 +11,8 @@
 # START (pause menu with the map), TRIANGLE (zoom out: all nine surface tags),
 # SQUARE (underground layer). Frames: build-runs/<run>/map-surface.png and
 # map-underground.png; the run dir (with the save copy) is deleted after.
+# LOADSNAP=1 also keeps a frame every 2 s of the street's loading screen (the
+# load_short.pam movie): build-runs/<run>/load-NN.png.
 TJ_DATA="${TJ_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/TokyoJungleRecomp}"
 set -e
 R=/opt/git/tokyoJungleRecomp
@@ -24,17 +26,22 @@ $R/.agents/talk say ${POSTER:?set POSTER} "RUN start: $name ($bin, map check, co
   TJ_FRAME_DUMP=$out/frames TJ_FRAME_DUMP_EVERY=30 TJ_FRAME_DUMP_MAX=100000 "$@" \
   timeout -s KILL 300 "$bin" $TJ_DATA/games/NPUA80523/USRDIR/EBOOT.ELF > "$out.txt" 2>&1) &
 press() { echo "$1" > "$out/pad.txt"; sleep "$2"; ls "$out/frames" | head -n -20 | sed "s|^|$out/frames/|" | xargs -r rm -f; }
-snap() { magick "$out/frames/$(ls -t "$out/frames" | head -1)" "$out/$1.png"; }
+snap() { local f; f=$(ls -t "$out/frames" | head -1); magick "$out/frames/$f" "$out/$1.png"; echo "$1 $f" >> "$out/snaps.txt"; }
 sleep 12
 for i in $(seq 11); do press 0x0008 2; done      # boot screens to the main menu
 for i in 1 2 3; do press 0x4000 5; done          # SURVIVAL, NEW GAME, SINGLE PLAYER
-press 0x4000 26                                  # Pomeranian; the street loads
+if [ -n "$LOADSNAP" ]; then                      # Pomeranian; the street loads
+  snap load-00; echo 0x4000 > "$out/pad.txt"; sleep 1; echo 0x0000 > "$out/pad.txt"
+  for i in $(seq -w 1 12); do sleep 2; snap load-$i; done; sleep 1
+else
+  press 0x4000 26
+fi
 press 0x0008 8                                   # START: pause menu (zoomed map)
 press 0x1000 5; snap map-surface                 # TRIANGLE: all nine surface tags
 press 0x8000 5; snap map-underground             # SQUARE: underground layer
 pkill -KILL -f "PAD_FILE=$out/pad.txt" 2>/dev/null || true
 for p in $(pgrep -x tokyojungle); do [ "$(readlink /proc/$p/cwd)" = "$out/cwd" ] && kill -9 $p; done
-mv "$out/map-surface.png" "$out/map-underground.png" "$R/build-runs/" 2>/dev/null || true
-rm -rf "$out"; mkdir -p "$out"; mv "$R/build-runs/map-surface.png" "$R/build-runs/map-underground.png" "$out/"
+keep=$(mktemp -d "$R/build-runs/.keep-XXXX"); mv "$out"/*.png "$out"/snaps.txt "$keep/" 2>/dev/null || true
+rm -rf "$out"; mv "$keep" "$out"
 echo "$name: $out/map-surface.png $out/map-underground.png; FATAL $(grep -c FATAL $out.txt)"
 $R/.agents/talk say $POSTER "RUN done: $name" >/dev/null

@@ -188,39 +188,22 @@ if(PORT_ENABLE_SPU)
     endif()
 endif()
 
-# TJ: the firmware's own font libraries, lifted by scripts/lift_firmware.py
-# (docs/FONT_LLE_PLAN.md). Optional: without them the game's cellFont imports
-# fall back to ps3recomp's HLE, which renders no glyphs.
-set(TJ_PRX_DIR "${CMAKE_CURRENT_SOURCE_DIR}/generated/prx" CACHE PATH
-    "Lifted firmware modules (scripts/lift_firmware.py output); override for a private diagnostic lift")
-set(PRX_DIR "${TJ_PRX_DIR}")
-set(PRX_SOURCES "")
-if(EXISTS "${PRX_DIR}/prx_modules.cpp")
-    file(GLOB PRX_SOURCES CONFIGURE_DEPENDS
-        "${PRX_DIR}/prx_modules.cpp"
-        "${PRX_DIR}/*/src/*.cpp"
-        "${PRX_DIR}/*/src/*_image.c")
-    list(LENGTH PRX_SOURCES _n_prx)
-    message(STATUS "Lifted firmware: ${_n_prx} sources in ${PRX_DIR}")
-else()
-    message(STATUS "Lifted firmware: none (run scripts/lift_firmware.py)")
-endif()
+# TJ: no firmware module runs lifted any more (generated/prx, from
+# scripts/lift_firmware.py, held libsail and libpamf last): the fonts and the
+# movie player are answered natively in src/.
 
 add_executable(${PROJECT_NAME}
     src/main.cpp
     src/settings_menu.cpp
     src/stubs.cpp
     src/font_hle.cpp         # cellFont/cellFontFT, HLE over stb_truetype
+    src/sail_hle.cpp         # cellSail (movies) + its cellPamf calls, over FFmpeg
     src/tj_mlaa.cpp          # TJ_DISABLE_MLAA (linker --wrap below)
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
     ${RECOMP_SOURCES}
     ${SPU_SOURCES}
-    ${PRX_SOURCES}
 )
-if(PRX_SOURCES)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE TJ_HAVE_PRX=1)
-endif()
 # src/tj_mlaa.cpp sits in front of the game's per-frame MLAA wrapper
 # (func_001536EC); its one caller is in another lifted translation unit, so the
 # linker can route that call without editing the lifted source.
