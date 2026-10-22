@@ -1,26 +1,67 @@
-# Game data: never commit copyrighted files
+# --- Never commit anything of the game ------------------------------------
+# Packages, licences, firmware, the decrypted game and anything made from it.
+# Each player makes these on their own computer from their own copy.
 *.pkg
 *.rap
 *.rif
+*.edat
+*.sdat
+*.PUP
+*.pup
+*.self
+*.sprx
+*.prx
+EBOOT.*
+PARAM.SFO
 gamefiles/
 /gamedata
+gamedata/
 # old locations (moved under gamefiles/ 2026-10-21)
 input/
 extracted/
+# lifted code and captured SPU jobs (scripts/analyze.py, scripts/lift_spu.py)
 generated/
+
+# --- Builds ----------------------------------------------------------------
 build*/
+# in-source CMake runs (configure into build/ instead)
+/CMakeCache.txt
+/CMakeFiles/
+/Makefile
+/cmake_install.cmake
+/ps3recomp_sdk/
+/compile_commands.json
+# Steam Deck release output (tools/release/)
+/release/
+
+# --- Run output ------------------------------------------------------------
+# logs, frame dumps, RSX captures (they show the game: keep them local)
+*.log
+*.ppm
+*.rrc
+*.rrc.gz
+*.tsv
+build-runs/
+build-oracle/
+
+# --- Tools -----------------------------------------------------------------
 .venv/
 __pycache__/
+*.pyc
+
+# --- Editors and agents ----------------------------------------------------
+.claude/settings.local.json
+.vscode/
+.idea/
+*.swp
+.cache/
 # agent board runtime state
 .agents/board.log
 .agents/*.lock
 .agents/names
 .agents/.seen/
 .agents/board.*.log
-*.tsv
-.claude/settings.local.json
-# Steam Deck release output (tools/release/)
-/release/
+
 # in-source CMake builds of the dashboard (build into build-*/ instead)
 /dashboard/CMakeCache.txt
 /dashboard/CMakeFiles/
