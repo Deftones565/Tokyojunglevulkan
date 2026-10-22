@@ -31,12 +31,14 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "ppu_context.h"
@@ -48,6 +50,9 @@ extern "C" void vm_write32(uint64_t addr, uint32_t v);
 extern "C" int64_t sys_memory_allocate(ppu_context* ctx);
 extern "C" int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size);
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+extern "C" int cellGcm_rsx_wait_consumed(unsigned timeout_ms);
+extern "C" uint32_t cellGcm_flip_request_count(void);
+extern "C" unsigned long long ps3_ms_now(void);
 
 namespace {
 
@@ -617,6 +622,34 @@ void FontRenderSurfaceInit(ppu_context* ctx)
 {
     const uint32_t s_ea = u32_arg(ctx, 3);
     if (!s_ea) return;
+    /* The game draws every map-tag name into one scratch surface, copies it
+     * into one of two 6-name staging buffers in RSX memory and queues an
+     * NV3089 blit of each full buffer into its name sheet; it refills a
+     * staging buffer as soon as its turn comes again, trusting the RSX to
+     * have copied it by then. A real RSX consumes the command stream in
+     * microseconds, and the firmware takes milliseconds a name; our FIFO
+     * drain trails the PPU by up to a frame, so names 13-18 overwrote 1-6
+     * before their blit ran and the tags showed other labels (and, with the
+     * lifted libfont, nothing). So each new surface first waits until the
+     * drain has consumed what the game has queued. TJ_FONT_RSX_SYNC=0: off.
+     *
+     * That alone is not enough: the blits sit in the game's command buffer
+     * unkicked until its render thread flushes at the end of the frame, so
+     * PUT == GET and the wait returned at once (all nine surface tags blank,
+     * m12-map3). So it first waits for the game's next flip request (the
+     * frame's commands are kicked by then), then for the drain. ~35 surfaces
+     * a session, all on the font thread. TJ_FONT_RSX_SYNC=2: the drain only. */
+    static const int sync = getenv("TJ_FONT_RSX_SYNC") ? atoi(getenv("TJ_FONT_RSX_SYNC")) : 1;
+    if (sync) {
+        if (sync == 1) {
+            const uint32_t f0 = cellGcm_flip_request_count();
+            const unsigned long long t0 = ps3_ms_now();
+            while (cellGcm_flip_request_count() == f0 && ps3_ms_now() - t0 < 100)
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
+        }
+        const int ok = cellGcm_rsx_wait_consumed(100);
+        FLOG("RenderSurfaceInit: RSX %s\n", ok ? "caught up" : "wait timed out");
+    }
     const uint32_t w = (int32_t)ctx->gpr[7] > 0 ? u32_arg(ctx, 7) : 0;
     const uint32_t h = (int32_t)ctx->gpr[8] > 0 ? u32_arg(ctx, 8) : 0;
     vm_write32(s_ea + 0, u32_arg(ctx, 4));
