@@ -6,7 +6,7 @@
 # container (Ubuntu 24.04, glibc 2.39: runs on SteamOS 3.8's glibc 2.41). Needs Docker running.
 # The game data goes beside it separately: tools/release/make_data_dir.sh.
 set -euo pipefail
-cd /opt/git/tokyoJungleRecomp
+cd "$(dirname "$0")/../.."
 out=$(realpath -m "${1:-release}"); mkdir -p "$out/.build"
 # JOBS (default 10 of 20 threads) at low priority, the container capped at MEM (14g): the two
 # ~19 MB lifted PPU sources need several GB each, and running out must not freeze the desktop.

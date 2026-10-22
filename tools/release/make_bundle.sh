@@ -7,7 +7,7 @@
 # Needs release/TokyoJungle-x86_64.AppImage (make_appimage.sh) and release/TokyoJungle-data
 # (make_data_dir.sh).
 set -euo pipefail
-cd /opt/git/tokyoJungleRecomp
+cd "$(dirname "$0")/../.."
 out=$(realpath -m "${1:-release/TokyoJungle-SteamDeck.tar.zst}")
 save=$(realpath "${SAVE:-gamedata}")
 for f in release/TokyoJungle-x86_64.AppImage release/TokyoJungle-data/EBOOT.ELF "$save/dev_hdd0"; do

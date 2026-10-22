@@ -5,7 +5,7 @@
 # (dev_flash/data/font). Copy the folder next to the AppImage (or to ~/TokyoJungle-data).
 # Your own copy of the game: for your own devices, not for sharing.
 set -euo pipefail
-cd /opt/git/tokyoJungleRecomp
+cd "$(dirname "$0")/../.."
 out=${1:?usage: make_data_dir.sh <out-dir>}
 mkdir -p "$out/game" "$out/dev_flash/data"
 cp gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF "$out/EBOOT.ELF"
