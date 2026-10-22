@@ -72,10 +72,13 @@ per-build data; see "SPU images" below.
 
 ## Open blockers carried over
 
-### SPU images have to be captured at runtime, not extracted
+### SPU images: raw blobs, but inside the EBOOT
 
-- Tokyo Jungle's SPURS jobs are **raw code+data blobs loaded from its data
-  files**, not SPU ELFs inside the EBOOT. `extract_spu_images.py` finds nothing.
+- Tokyo Jungle's SPURS jobs are **raw code+data blobs**, not SPU ELFs, so
+  `extract_spu_images.py` finds nothing. (Correction, 2026-10-22: they are not
+  loaded from the data files. All 18 sit byte for byte in the decrypted 1.01
+  EBOOT, and `scripts/extract_spu_jobs.py` cuts them out; the capture below is
+  how they were first found.)
 - The runtime matches each one by FNV-1a-64 content fingerprint. With no match it
   logs `[spurs-job] dispatch MISS fp=… size=…`, **runs nothing**, and the title
   waits forever on work that never happens.

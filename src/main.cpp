@@ -53,6 +53,7 @@
 #include "win32_compat.h"
 
 #include "settings_menu.h"   /* settings.ini and the in-game settings menu */
+#include "game_data.h"       /* the data folder the launcher fills */
 
 #include <atomic>
 #include <chrono>
@@ -974,9 +975,12 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
 
 int main(int argc, char** argv)
 {
-    if (argc < 2) {
-        printf("usage: %s <EBOOT.ELF> [<game dir holding USRDIR/>]\n", argv[0]);
-        return 2;
+    if (argc > 1 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
+        printf("usage: %s                      the game from the data folder (%s),\n"
+               "                                 which tokyojungle-launcher sets up\n"
+               "       %s <EBOOT.ELF> [<game dir holding USRDIR/>]\n",
+               argv[0], tj_data_root().c_str(), argv[0]);
+        return 0;
     }
 
     /* SDL (cellPad, cellAudio, the window) otherwise installs SIGINT/SIGTERM
@@ -985,6 +989,24 @@ int main(int argc, char** argv)
      * Default signal behaviour; closing the window still quits through the
      * frame clock. Must be set before the first SDL_InitSubSystem. */
     setenv("SDL_NO_SIGNAL_HANDLERS", "1", 0);
+
+    /* TJ: no executable named -- the launcher's Play, a shortcut -- runs the
+     * game from the data folder the launcher fills (game_data.h). */
+    const char* eboot = argc > 1 ? argv[1] : nullptr;
+    const char* game_arg = argc > 2 ? argv[2] : nullptr;
+    static TjGamePaths s_data;
+    if (argc < 2) {
+        std::string why;
+        if (!tj_data_ready(&s_data, &why)) {
+            fprintf(stderr, "The game isn't set up yet (%s in %s).\n"
+                            "Run tokyojungle-launcher: it sets everything up (docs/SETUP_GUIDE.md).\n",
+                    why.c_str(), tj_data_root().c_str());
+            return 2;
+        }
+        eboot = s_data.eboot.c_str();
+        game_arg = s_data.game.c_str();
+        setenv("PS3_DEV_FLASH", s_data.dev_flash.c_str(), 0);
+    }
 
 #ifdef _WIN32
 #pragma comment(lib, "winmm.lib")
@@ -1024,13 +1046,13 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    uint32_t entry = ppu_load_elf(argv[1]);
+    uint32_t entry = ppu_load_elf(eboot);
     if (!entry) {
-        fprintf(stderr, "ERROR: could not load %s\n", argv[1]);
+        fprintf(stderr, "ERROR: could not load %s\n", eboot);
         return 1;
     }
 
-    if (!setup_vfs(argv[1], argc > 2 ? argv[2] : nullptr))
+    if (!setup_vfs(eboot, game_arg))
         return 1;
 
     /* argv[0] for the guest. ppu_run defaults to a /dev_bdvd disc path, which is

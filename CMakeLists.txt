@@ -195,6 +195,7 @@ endif()
 add_executable(${PROJECT_NAME}
     src/main.cpp
     src/settings_menu.cpp
+    src/game_data.cpp        # the data folder the launcher fills (game_data.h)
     src/stubs.cpp
     src/font_hle.cpp         # cellFont/cellFontFT, HLE over stb_truetype
     src/sail_hle.cpp         # cellSail (movies) + its cellPamf calls, over FFmpeg

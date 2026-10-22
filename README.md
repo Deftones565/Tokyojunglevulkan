@@ -5,9 +5,16 @@ with [ps3recomp](https://github.com/sp00nznet/ps3recomp). The game's PowerPC cod
 is lifted to C++ and compiled as a native x86-64 program that renders through
 Vulkan. No emulator runs at play time.
 
-**Status:** the project, toolchain and debugging tools are set up and tested
-against ps3recomp's built-in boot test. **The game itself hasn't been lifted
-yet.** That's waiting on a decryption licence (see step 1).
+**Status:** the game is lifted and playable; [docs/STATUS.md](docs/STATUS.md) has
+what works and what's open.
+
+**Players:** install and decrypt your own copy in RPCS3, then run `./tokyojungle.sh`.
+It installs the build tools, and its launcher finds the game in RPCS3 (or takes the
+folder you drop on it), builds the port on your computer from your copy, and starts
+it. See [docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md). This repository holds no keys and
+ships nothing of the game; the game and its executable are decrypted by RPCS3. (DLC
+`.edat` files are the one exception: ps3recomp's runtime decrypts those while the
+game runs, with keys in its upstream source, `libs/filesystem/edat.c`.)
 
 **This repo contains no game data.** You need your own copies of the game's PSN
 packages and your own licence. All of it lives under `gamefiles/` (packages, RAPs,
@@ -104,6 +111,10 @@ cmake --build build
 ```sh
 PS3_VERBOSE=0 ./build/tokyojungle gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF
 ```
+
+Or with no arguments: the game then runs from the data folder the launcher fills
+(`~/TokyoJungle-data`, or `$TJ_DATA`). `./tokyojungle.sh` does every step of this
+section for you ([docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md)).
 
 - The game data is read from `gamefiles/games/NPUA80523/` (the folder holding the EBOOT's `USRDIR`).
 - The runner builds a PS3-shaped directory tree in `build/vfs/` that links to

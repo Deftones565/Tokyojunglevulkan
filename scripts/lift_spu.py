@@ -2,8 +2,10 @@
 """
 Lift Tokyo Jungle's SPURS job images and register them with the runtime.
 
-Tokyo Jungle's SPU jobs are raw code+data blobs the game loads from its data
-files, not SPU ELFs inside the EBOOT, so they can only be captured while it runs:
+Tokyo Jungle's SPU jobs are raw code+data blobs, not SPU ELFs, so
+extract_spu_images.py finds none. All 18 sit inside the decrypted EBOOT, and
+scripts/extract_spu_jobs.py cuts them out (what the launcher does). A job not in
+its table would be captured while the game runs:
 
   SPU_DUMP_MISS=$PWD/generated/spu/dumps ./build/tokyojungle gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF
 
