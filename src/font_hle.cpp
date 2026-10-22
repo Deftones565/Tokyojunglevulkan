@@ -31,6 +31,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -53,6 +54,9 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(
 extern "C" int cellGcm_rsx_wait_consumed(unsigned timeout_ms);
 extern "C" uint32_t cellGcm_flip_request_count(void);
 extern "C" unsigned long long ps3_ms_now(void);
+extern "C" int32_t _cellGcmSetFlipCommand(void* ctx, uint32_t bufferId);
+extern "C" int32_t _cellGcmSetFlipCommandWithWaitLabel(void* ctx, uint32_t bufferId,
+                                                    uint32_t labelIndex, uint32_t labelValue);
 
 namespace {
 
@@ -66,6 +70,8 @@ constexpr int32_t CELL_FONT_ERROR_RENDERER_ALREADY_BIND = (int32_t)0x80540011;
 constexpr uint32_t kMaxFonts     = 32;
 constexpr uint32_t kMaxRenderers = 8;
 constexpr uint32_t kUnbound      = 0xFFFFFFFFu;
+/* Surfaces another thread may start between two flips (FontRenderSurfaceInit). */
+constexpr uint32_t kNamesPerFlip = 3;
 
 /* Guest memory this module hands the game: the library object, one glyph
  * image per open font (valid until that font renders its next glyph, as with
@@ -125,6 +131,8 @@ FontSlot g_fonts[kMaxFonts];
 bool g_renderers[kMaxRenderers];
 uint32_t g_arena;
 bool g_glyph_used[kGlyphCount];
+/* The guest thread that issues the flips (FlipCommand*). */
+std::atomic<uint64_t> g_flip_tid{~0ull};
 
 #define FLOG(...) do { if (g_log) { printf("[font] " __VA_ARGS__); fflush(stdout); } } while (0)
 
@@ -636,16 +644,33 @@ void FontRenderSurfaceInit(ppu_context* ctx)
      * That alone is not enough: the blits sit in the game's command buffer
      * unkicked until its render thread flushes at the end of the frame, so
      * PUT == GET and the wait returned at once (all nine surface tags blank,
-     * m12-map3). So it first waits for the game's next flip request (the
-     * frame's commands are kicked by then), then for the drain. ~35 surfaces
-     * a session, all on the font thread. TJ_FONT_RSX_SYNC=2: the drain only. */
+     * m12-map3). The flip count only moves when the drain reaches a flip, so
+     * a flip seen means everything queued before it has run. Waiting for one
+     * at every surface was too slow (user, 2026-10-22): the render thread
+     * also starts surfaces and can't flip while it waits (a 100 ms freeze
+     * each, m12-wait1), and the font thread took a frame a name. So the
+     * thread that issues the flips never waits for one, and other threads
+     * start at most kNamesPerFlip surfaces between two flips: a staging
+     * buffer is refilled 7+ names after its last name, so at least two flips
+     * (its blit queued, kicked and drained) fall in between.
+     * TJ_FONT_RSX_SYNC=2: the drain only. */
     static const int sync = getenv("TJ_FONT_RSX_SYNC") ? atoi(getenv("TJ_FONT_RSX_SYNC")) : 1;
     if (sync) {
-        if (sync == 1) {
-            const uint32_t f0 = cellGcm_flip_request_count();
-            const unsigned long long t0 = ps3_ms_now();
-            while (cellGcm_flip_request_count() == f0 && ps3_ms_now() - t0 < 100)
-                std::this_thread::sleep_for(std::chrono::microseconds(500));
+        if (sync == 1 && ctx->thread_id != g_flip_tid.load(std::memory_order_relaxed)) {
+            static std::mutex m;
+            static uint32_t win_flip, win_n;
+            std::lock_guard<std::mutex> lock(m);
+            uint32_t f = cellGcm_flip_request_count();
+            if (f != win_flip) { win_flip = f; win_n = 0; }
+            if (win_n >= kNamesPerFlip) {
+                const unsigned long long t0 = ps3_ms_now();
+                while ((f = cellGcm_flip_request_count()) == win_flip && ps3_ms_now() - t0 < 100)
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                FLOG("RenderSurfaceInit: thread %llu waited %llu ms for a flip\n",
+                     (unsigned long long)ctx->thread_id, ps3_ms_now() - t0);
+                win_flip = f; win_n = 0;
+            }
+            ++win_n;
         }
         const int ok = cellGcm_rsx_wait_consumed(100);
         FLOG("RenderSurfaceInit: RSX %s\n", ok ? "caught up" : "wait timed out");
@@ -876,6 +901,21 @@ void OracleLleLayout(ppu_context* ctx)
            v[0], v[1], v[2]);
 }
 
+/* The game's flip imports, unchanged, noting which thread calls them: that
+ * thread must never wait for a flip in FontRenderSurfaceInit. */
+void FlipCommand(ppu_context* ctx)
+{
+    g_flip_tid.store(ctx->thread_id, std::memory_order_relaxed);
+    ret(ctx, _cellGcmSetFlipCommand((void*)(uintptr_t)u32_arg(ctx, 3), u32_arg(ctx, 4)));
+}
+
+void FlipCommandWithWaitLabel(ppu_context* ctx)
+{
+    g_flip_tid.store(ctx->thread_id, std::memory_order_relaxed);
+    ret(ctx, _cellGcmSetFlipCommandWithWaitLabel((void*)(uintptr_t)u32_arg(ctx, 3), u32_arg(ctx, 4),
+                                                 u32_arg(ctx, 5), u32_arg(ctx, 6)));
+}
+
 } // namespace
 
 /* True unless TJ_FONT_LLE=1 asks for the lifted firmware libfont. */
@@ -923,6 +963,8 @@ extern "C" void tj_font_hle_register(void)
         {0x88BE4799u, "cellFontRenderCharGlyphImage", FontRenderCharGlyphImage},
         {0xC17259DEu, "cellFontGenerateCharGlyph", FontGenerateCharGlyph},
         {0xD62F5D76u, "cellFontDeleteGlyph", FontDeleteGlyph},
+        {0x21397818u, "_cellGcmSetFlipCommand", FlipCommand},
+        {0xD8F88E1Au, "_cellGcmSetFlipCommandWithWaitLabel", FlipCommandWithWaitLabel},
     };
     for (const auto& e : t) ps3_hle_register_ctx(e.nid, e.name, e.fn);
     if (getenv("TJ_FONT_ORACLE"))
