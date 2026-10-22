@@ -19,9 +19,10 @@
  * it. Layout, metrics, slant and bold follow the lifted libfont, checked
  * against it with TJ_FONT_ORACLE=1.
  *
- * TJ_FONT_LLE=1 keeps the lifted firmware libfont instead (for A/B).
+ * The lifted libfont was removed on 2026-10-22 (no firmware code in the port,
+ * user decision); TJ_FONT_ORACLE logs are what it was matched against.
  * TJ_FONT_LOG=1 logs every call. TJ_FONT_ORACLE=1 logs a few glyphs' metrics
- * and images, from whichever of the two runs.
+ * and images.
  *
  * Guest ABI notes. Floating-point arguments still take a GPR slot (64-bit
  * PowerPC ELF), so cellFontRenderCharGlyphImage(font, code, surface, x, y,
@@ -834,9 +835,8 @@ void FontDeleteGlyph(ppu_context* ctx)
 /* ---- TJ_FONT_ORACLE=1: what a glyph call returned ---------------------------
  *
  * Logs, for the first glyphs of a few characters, the metrics, where the image
- * lands relative to (x, y) and the image itself as text. Run once with
- * TJ_FONT_LLE=1 (the lifted firmware libfont, the reference) and once without,
- * and compare. */
+ * lands relative to (x, y) and the image itself as text. Matched against
+ * the lifted firmware libfont this way before it was removed. */
 void oracle_log(const char* who, ppu_context* in, ppu_context* out)
 {
     static int budget = 200;
@@ -874,33 +874,6 @@ void OracleHle(ppu_context* ctx)
     oracle_log("hle", &in, ctx);
 }
 
-/* The lifted libfont's cellFontRenderCharGlyphImage: its OPD in the libfont
- * image (generated/prx/prx_modules.cpp, x_libfont_88BE4799). */
-extern "C" void ps3_indirect_call(ppu_context* ctx);
-void OracleLle(ppu_context* ctx)
-{
-    ppu_context in = *ctx;
-    const uint32_t opd = 0x31012798u;
-    ctx->gpr[2] = vm_read32(opd + 4);
-    ctx->ctr = vm_read32(opd);
-    ps3_indirect_call(ctx);
-    oracle_log("lle", &in, ctx);
-}
-
-/* The lifted libfont's cellFontGetHorizontalLayout (x_libfont_1387C45C). */
-void OracleLleLayout(ppu_context* ctx)
-{
-    const uint32_t l_ea = (uint32_t)ctx->gpr[4];
-    const uint32_t opd = 0x310127B8u;
-    ctx->gpr[2] = vm_read32(opd + 4);
-    ctx->ctr = vm_read32(opd);
-    ps3_indirect_call(ctx);
-    float v[3];
-    for (int i = 0; i < 3; ++i) { uint32_t b = vm_read32(l_ea + 4 * i); memcpy(&v[i], &b, 4); }
-    printf("[font-oracle] lle layout baseLineY %.3f lineHeight %.3f effectHeight %.3f\n",
-           v[0], v[1], v[2]);
-}
-
 /* The game's flip imports, unchanged, noting which thread calls them: that
  * thread must never wait for a flip in FontRenderSurfaceInit. */
 void FlipCommand(ppu_context* ctx)
@@ -918,16 +891,8 @@ void FlipCommandWithWaitLabel(ppu_context* ctx)
 
 } // namespace
 
-/* True unless TJ_FONT_LLE=1 asks for the lifted firmware libfont. */
-extern "C" int tj_font_hle_enabled(void)
-{
-    const char* e = getenv("TJ_FONT_LLE");
-    return !(e && *e && *e != '0');
-}
-
 /* Every cellFont/cellFontFT import the game has (generated/analysis/
- * EBOOT.imports.json). Registered after the lifted modules' exports, so these
- * replace them. */
+ * EBOOT.imports.json), and the two flip imports (FlipCommand). */
 extern "C" void tj_font_hle_register(void)
 {
     struct { uint32_t nid; const char* name; void (*fn)(ppu_context*); } const t[] = {
@@ -969,13 +934,4 @@ extern "C" void tj_font_hle_register(void)
     for (const auto& e : t) ps3_hle_register_ctx(e.nid, e.name, e.fn);
     if (getenv("TJ_FONT_ORACLE"))
         ps3_hle_register_ctx(0x88BE4799u, "cellFontRenderCharGlyphImage", OracleHle);
-}
-
-/* TJ_FONT_LLE=1 TJ_FONT_ORACLE=1: the lifted libfont, with its glyphs logged. */
-extern "C" void tj_font_oracle_register(void)
-{
-    if (getenv("TJ_FONT_ORACLE")) {
-        ps3_hle_register_ctx(0x88BE4799u, "cellFontRenderCharGlyphImage", OracleLle);
-        ps3_hle_register_ctx(0x1387C45Cu, "cellFontGetHorizontalLayout", OracleLleLayout);
-    }
 }

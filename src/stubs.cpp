@@ -42,16 +42,14 @@
 
 #ifdef TJ_HAVE_PRX
 /* generated/prx/prx_modules.cpp (scripts/lift_firmware.py): the firmware's
- * libfont, libfontFT and libfreetype, lifted. */
+ * libsail and libpamf (loading movies), lifted. */
 extern "C" void tj_prx_load_images(void);
 extern "C" void tj_prx_register_exports(void);
 extern "C" void tj_prx_module_start(uint32_t sysmodule_id);
 #endif
 
 /* src/font_hle.cpp: cellFont/cellFontFT over stb_truetype. */
-extern "C" int tj_font_hle_enabled(void);
 extern "C" void tj_font_hle_register(void);
-extern "C" void tj_font_oracle_register(void);
 
 extern "C" void ps3_load_prx_modules(void)
 {
@@ -85,7 +83,6 @@ namespace {
 
 constexpr uint32_t NID_cellSysmoduleLoadModule   = 0x32267A31u;
 constexpr uint32_t NID_cellSysmoduleUnloadModule = 0x112A5EE9u;
-constexpr uint32_t NID_cellFontInit              = 0x36AFFB85u;
 
 /* cellSysmoduleLoadModuleEx(u16 id, ...): the trailing arguments select a
  * memory container, which the runtime does not model. The id is already in r3. */
@@ -99,18 +96,6 @@ void UnloadModuleEx(ppu_context* ctx) { ps3_hle_call(NID_cellSysmoduleUnloadModu
 void LoadModuleInternal(ppu_context* ctx)   { ps3_hle_call(NID_cellSysmoduleLoadModule, ctx); }
 void UnloadModuleInternal(ppu_context* ctx) { ps3_hle_call(NID_cellSysmoduleUnloadModule, ctx); }
 
-/* The SDK's cellFontInit(config) is a macro for
- * cellFontInitializeWithRevision(CELL_FONT_REVISION, config); the game imports
- * the latter. Drop the revision so config lands in r3 where cellFontInit
- * expects it. */
-#ifndef TJ_HAVE_PRX
-void FontInitializeWithRevision(ppu_context* ctx)
-{
-    ctx->gpr[3] = ctx->gpr[4];
-    ps3_hle_call(NID_cellFontInit, ctx);
-}
-#endif
-
 #ifdef TJ_HAVE_PRX
 extern "C" s32 cellSysmoduleLoadModule(u16 id);   /* libs/system/cellSysmodule.c */
 
@@ -121,9 +106,7 @@ void LoadModuleWithStart(ppu_context* ctx)
 {
     const u16 id = (u16)ctx->gpr[3];
     const s32 rc = cellSysmoduleLoadModule(id);
-    /* 0x0019 is libfont: with the HLE cellFont its lifted copy is never
-     * called, so it is not started either. */
-    if (rc == CELL_OK && !(id == 0x0019 && tj_font_hle_enabled())) tj_prx_module_start(id);
+    if (rc == CELL_OK) tj_prx_module_start(id);
     ctx->gpr[3] = (uint64_t)(int64_t)rc;
 }
 #endif
@@ -150,24 +133,14 @@ extern "C" void tj_register_hle_overrides(void)
     ps3_hle_register_ctx(0xD9B8C0EEu, "cellSysmoduleLoadModuleInternal", LoadModuleInternal);
     ps3_hle_register_ctx(0xB498BF77u, "cellSysmoduleUnloadModuleInternal", UnloadModuleInternal);
 #ifdef TJ_HAVE_PRX
-    /* The real cellFont/cellFontFT/cell_FreeType2 run lifted from the firmware;
-     * this binds every export they have, cellFontInitializeWithRevision among
-     * them, so the cellFontInit forwarder below is for builds without them. */
+    /* libsail and libpamf run lifted from the firmware; this binds every
+     * export they have. */
     tj_prx_register_exports();
     ps3_hle_register_ctx(NID_cellSysmoduleLoadModule, "cellSysmoduleLoadModule",
                          LoadModuleWithStart);
 #endif
-    /* The game's text: cellFont answered natively (src/font_hle.cpp), over the
-     * lifted libfont's exports. TJ_FONT_LLE=1 keeps the lifted one. */
-    if (tj_font_hle_enabled()) {
-        tj_font_hle_register();
-    } else {
-#ifdef TJ_HAVE_PRX
-        tj_font_oracle_register();
-#else
-        ps3_hle_register_ctx(0xF03DCC29u, "cellFontInitializeWithRevision", FontInitializeWithRevision);
-#endif
-    }
+    /* The game's text: cellFont answered natively (src/font_hle.cpp). */
+    tj_font_hle_register();
     ps3_hle_register_ctx(0x9638F766u, "cellHttpInitCookie", HttpCookieOk);
     ps3_hle_register_ctx(0x61B2BADEu, "cellHttpEndCookie", HttpCookieOk);
 }
