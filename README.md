@@ -21,13 +21,12 @@ on your computer from it.
 | Saves and trophies | ✅ Work |
 | DLC | ✅ Works |
 | Settings | ✅ In-game menu: display mode, resolution, internal resolution, aspect ratio, V-sync, FPS counter |
-| Frame rate | ⚠️ 40-60 FPS in gameplay on an RTX 5060 laptop (the PS3 runs it at 60) |
+| Frame rate | ✅ 60 FPS in gameplay on an RTX 5060 laptop, like the PS3 |
 | Steam Deck | ⚠️ 30 FPS at the right speed; 60 is being worked on. Build in a distrobox (SteamOS is read-only) |
 | Platforms | Linux, x86-64, Vulkan |
 
-Known issues: a one-frame flicker of the Pomeranian's fur on close-ups (about 1 frame in
-1300); some frame-rate drops whose cause isn't found yet. Details and everything else in
-progress: [docs/STATUS.md](docs/STATUS.md).
+Known issue: a one-frame flicker of the Pomeranian's fur on close-ups (about 1 frame in
+1300). Details and everything else in progress: [docs/STATUS.md](docs/STATUS.md).
 
 ## Playing
 
