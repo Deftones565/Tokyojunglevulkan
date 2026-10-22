@@ -36,6 +36,8 @@ build*/
 
 # --- Run output ------------------------------------------------------------
 # logs, frame dumps, RSX captures (they show the game: keep them local)
+# A/B comparison frames too: they show the game (kept in ~/TokyoJungle-ab-images)
+docs/ab/
 *.log
 *.ppm
 *.rrc
