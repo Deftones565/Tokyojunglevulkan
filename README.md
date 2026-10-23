@@ -14,7 +14,7 @@ on your computer from it.
 |---|---|
 | Boot, menus, movies | ✅ Works |
 | Survival mode | ✅ Fully playable: hunting, bosses, mating, generations, game over |
-| Story mode | ⚠️ Not re-tested since a fix for a hang after a Survival game over |
+| Story mode | ✅ Works |
 | Graphics | ✅ Vulkan, with the game's own shaders; colours match RPCS3; up to 400% internal resolution |
 | Text | ✅ Drawn natively, with the PS3's own fonts |
 | Audio | ✅ Works |
