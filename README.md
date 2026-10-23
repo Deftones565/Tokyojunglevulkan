@@ -21,8 +21,6 @@ your computer.
 | Frame rate | ✅ 60 FPS |
 | Steam Deck | ⚠️ 30 FPS |
 
-Known issue: a rare one-frame flicker of the Pomeranian's fur in close-ups.
-
 ## Playing
 
 You need Linux with a Vulkan GPU, RPCS3, and your own copy of the game (PSN package,
