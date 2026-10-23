@@ -21,7 +21,7 @@
  *                   with both lifts in it
  *
  * All of it happens before the game runs: the game stays lifted, compiled
- * code only (AGENTS.md). The build tools themselves are checked and installed
+ * code only (README.md, "No emulation"). The build tools themselves are checked and installed
  * by ./tokyojungle.sh, which builds this launcher and starts it.
  *
  * The window is SDL2 with the SDL renderer and stb_truetype. Long steps run

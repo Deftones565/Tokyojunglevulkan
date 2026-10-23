@@ -8,7 +8,7 @@
 # fps.py / fps_timeline.py read frame mtimes).
 #
 # Never touched: build-runs/archive/, directories holding code (.py .c .cpp .h
-# .sh .patch .md: atlas-ref, handoffs, harnesses -- STATUS links to them),
+# .sh .patch .md: atlas-ref, handoffs, harnesses -- the docs link to them),
 # loose code files (.diff .patch .so .py), a run with anything modified in the
 # last MIN_AGE_MIN minutes (default 30), and a run a live process has open.
 # (Project rule, user 2026-10-16: compress huge logs; delete stale ones.)

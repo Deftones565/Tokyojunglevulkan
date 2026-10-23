@@ -102,7 +102,7 @@ set(PS3RECOMP_FFMPEG_RUNTIME ON CACHE BOOL
 add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk"
                  EXCLUDE_FROM_ALL)
 
-# Recompilation only, no emulation (see AGENTS.md): the runtime's SPU
+# Recompilation only, no emulation (README.md, "No emulation"): the runtime's SPU
 # interpreter aborts with the unlifted address instead of running guest code.
 target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_NO_INTERP=1)
 
@@ -188,9 +188,8 @@ if(PORT_ENABLE_SPU)
     endif()
 endif()
 
-# TJ: no firmware module runs lifted any more (generated/prx, from
-# scripts/lift_firmware.py, held libsail and libpamf last): the fonts and the
-# movie player are answered natively in src/.
+# TJ: no firmware module runs lifted any more (generated/prx held libsail and
+# libpamf last): the fonts and the movie player are answered natively in src/.
 
 add_executable(${PROJECT_NAME}
     src/main.cpp
@@ -213,7 +212,7 @@ if(NOT MSVC)
         "-Wl,--wrap=_Z13func_001536ECP11ppu_context")
 endif()
 
-# Recompilation only, no emulation (see AGENTS.md): after every link, check that
+# Recompilation only, no emulation (README.md, "No emulation"): after every link, check that
 # the interpreter guard is still compiled in and that no interpreter, JIT or
 # instruction stepper has been added to the toolkit tree this build uses (a
 # private copy included) or to src/. A violation fails the build.
@@ -271,7 +270,7 @@ if(SPU_SOURCES)
         # The flags never changed a result (tools/spu-bisect/harness: SPU image 9's
         # functions are bit-identical either way); the faster fur task exposed a
         # race with our RSX, fixed by patch 0055 + the drain-on-put loop in
-        # src/main.cpp (docs/STATUS.md). On again: ~60% more gameplay frames.
+        # src/main.cpp. On again: ~60% more gameplay frames.
         option(PORT_SPU_HOST_SIMD "Build the lifted SPU sources with SSE4.1 + FMA (x86-64)" ${SPU_HOST_SIMD_DEFAULT})
         if(PORT_SPU_HOST_SIMD AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
             list(APPEND SPU_COMPILE_OPTIONS -msse4.1 -mfma -ffp-contract=off)
@@ -404,7 +403,7 @@ else()
     # With it, ppu_vmx.h's vaddfp/vsubfp/vmaddfp/vnmsubfp run four lanes at
     # once (0114; bit-exact, runtime/ppu/tests/test_ppu_vmx_simd.c). Windowed
     # gameplay: main thread 8.6 -> 5.5 ms of guest code a frame, frames over
-    # 16.7 ms 22% -> 6% (docs/STATUS.md). On by default when the building
+    # 16.7 ms 22% -> 6%. On by default when the building
     # machine has SSE4.1 + FMA, as for the SPU (same check, same SIGILL caveat).
     set(TJ_PPU_HOST_SIMD_DEFAULT OFF)
     if(PORT_BUILD_HOST_HAS_SSE41_FMA)

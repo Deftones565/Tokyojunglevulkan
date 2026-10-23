@@ -44,7 +44,7 @@ index 8adba0b..bcd9cf8 100644
 +}
 +
 +/* PSNR_TLS (default 1), PSNR_CERT_SHA256 and PSNR_KEY / PSNR_KEY_FILE
-+ * (docs/ONLINE.md) into psnr_set_security. 0 if one is malformed, or if the
++ * (environment) into psnr_set_security. 0 if one is malformed, or if the
 + * key would go out unencrypted to anything but this machine. */
 +static int setup_security(const char* host)
 +{
@@ -359,7 +359,7 @@ index 61a4f86..2d366a3 100644
  /* Message types; payloads in docs/api.md. */
  enum {
      PSNR_HELLO = 0x01, PSNR_HEARTBEAT = 0x02,
-+    PSNR_HELLO_AUTH = 0x03,   /* HELLO + key [32]: servers that check who you are (tjnetd) */
++    PSNR_HELLO_AUTH = 0x03,   /* HELLO + key [32]: servers that check who you are */
      PSNR_CREATE_ROOM = 0x10, PSNR_SEARCH_ROOMS = 0x11, PSNR_JOIN_ROOM = 0x12,
      PSNR_LEAVE_ROOM = 0x13, PSNR_SET_ROOM_DATA = 0x14, PSNR_ROOM_MESSAGE = 0x15,
      PSNR_KICK_MEMBER = 0x16,
@@ -369,7 +369,7 @@ index 61a4f86..2d366a3 100644
      PSNR_E_NOT_OWNER = 4, PSNR_E_NOT_IN_ROOM = 5, PSNR_E_LIMIT = 6, PSNR_E_NO_HELLO = 7,
 -    PSNR_E_NAME_TAKEN = 8, PSNR_E_NO_RELAY = 9
 +    PSNR_E_NAME_TAKEN = 8, PSNR_E_NO_RELAY = 9,
-+    PSNR_E_AUTH = 10, PSNR_E_UNKNOWN_TITLE = 12   /* tjnetd: wrong key / title not served */
++    PSNR_E_AUTH = 10, PSNR_E_UNKNOWN_TITLE = 12   /* wrong key / title not served */
  };
  
  typedef struct psnr_client psnr_client;

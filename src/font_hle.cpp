@@ -6,9 +6,9 @@
  * strings glyph by glyph into CPU-side "name sheets" that it then uploads as
  * textures (the pause map's area tags come from one, a 368x832 sheet with one
  * name per 32-pixel row). Until 2026-10-21 the firmware's own libfont,
- * libfontFT and libfreetype ran here statically lifted (docs/FONT_LLE_PLAN.md),
+ * libfontFT and libfreetype ran here statically lifted,
  * and some of those rows came out empty: three of the nine map tags had a bar
- * and no name. The other Tokyo Jungle port (/opt/git/tokyojungle) answers the
+ * and no name. The other Tokyo Jungle port (sp00nznet/tokyojungle) answers the
  * same 31 imports with an stb_truetype cellFont and its tags are complete, so
  * this port does the same.
  *

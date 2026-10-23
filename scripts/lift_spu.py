@@ -52,7 +52,7 @@ KNOWN = {
 # as --extra-funcs), on top of the jump-table targets found below. Each one
 # was a lift gap: the runtime, built with PS3RECOMP_NO_INTERP, stops with
 # "no lifted code at LS 0x....". Add the address here and re-lift; never
-# interpret it (AGENTS.md).
+# interpret it (README.md, "No emulation").
 EXTRA_ENTRIES: dict[int, list[int]] = {}
 
 NOPS = {0x40200000, 0x00200000}            # nop, lnop

@@ -5,7 +5,7 @@
 # governor mode (last [tj-flipgov] line), memory, thread count and the three
 # busiest threads by CPU. Written to build-runs/<run>/monitor.txt, so a stall
 # the player reports can be matched to what the game was doing at the time.
-cd /opt/git/tokyoJungleRecomp
+cd "$(dirname "$0")/../.."
 run=$1; d=build-runs/$run; out=$d/monitor.txt
 while [ -z "$(pgrep -x tokyojungle)" ]; do sleep 1; done
 P=$(pgrep -x tokyojungle | head -1)

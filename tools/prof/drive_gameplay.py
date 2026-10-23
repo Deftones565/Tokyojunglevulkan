@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Closed-loop gameplay perf run: boot -> Survival tutorial street, then measure.
 
-usage: POSTER=<MAGI name> drive_gameplay.py <binary> <run-name> [--measure 60]
+usage: drive_gameplay.py <binary> <run-name> [--measure 60]
          [--settle 15] [--no-prof] [--keep-frames] [VAR=value ...]
 
 A fixed wall-clock PAD_SCRIPT misses gameplay whenever the machine is loaded
@@ -30,15 +30,12 @@ unless --keep-frames. Extra VAR=value arguments go into the game's environment.
 """
 import argparse, os, re, shutil, signal, subprocess, sys, time
 
-R = '/opt/git/tokyoJungleRecomp'
+R = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 CROSS, START = '0x4000', '0x0008'
 
 
 def say(msg):
-    if os.environ.get('POSTER'):
-        subprocess.run([R + '/.agents/talk', 'say', os.environ['POSTER'], msg], stdout=subprocess.DEVNULL)
-    else:
-        print(msg, flush=True)
+    print(msg, flush=True)
 
 
 def frames(d):

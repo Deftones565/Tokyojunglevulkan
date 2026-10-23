@@ -26,7 +26,7 @@ on your computer from it.
 | Platforms | Linux, x86-64, Vulkan |
 
 Known issue: a one-frame flicker of the Pomeranian's fur on close-ups (about 1 frame in
-1300). Details and everything else in progress: [docs/STATUS.md](docs/STATUS.md).
+1300).
 
 ## Playing
 
@@ -67,10 +67,21 @@ ninja -C build
 Use clang: the lifted SPU code needs its `musttail`. Run-time options are listed in
 [config/tokyojungle.toml](config/tokyojungle.toml).
 
+## No emulation
+
+This is a static recompilation, and nothing emulates the PS3 while the game runs: there is
+no PPU or SPU interpreter, no JIT, and no instruction stepping, not even as a fallback.
+Game code is lifted to C/C++ ahead of time. If a jump lands on an address with no lifted
+function, that is a lift gap, and the fix is to add the entry point and lift again. Sony's
+system libraries are reimplemented natively. The one exception is the GPU command stream,
+which is translated to Vulkan. ps3recomp ships an SPU interpreter, but this port builds it
+with `PS3RECOMP_NO_INTERP`, so the game stops with an error instead of interpreting.
+`scripts/check_no_emulation.py` runs after every link and fails the build if the guard is
+gone or anything that interprets, JITs or steps guest code appears.
+
 ## Docs
 
 - [docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md): setting up and playing
-- [docs/STATUS.md](docs/STATUS.md): what works, what's open, every patch
 - [docs/RESEARCH.md](docs/RESEARCH.md): how PS3 static recompilation works
 - [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md): the build toolchain and render backends
 - [docs/PRIOR_PORT.md](docs/PRIOR_PORT.md): what the earlier port solved

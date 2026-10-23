@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fail if anything in the port could emulate the PS3 at run time.
 
-This is a static recompilation (AGENTS.md, "Hard rule"): game and firmware
+This is a static recompilation (README.md, "No emulation"): game and firmware
 code is lifted ahead of time, and nothing may interpret, JIT or single-step
 guest instructions, not even as a fallback. ps3recomp ships an SPU
 interpreter; this project builds it with PS3RECOMP_NO_INTERP so every entry
@@ -221,7 +221,7 @@ def main():
                               "interpreter may be live" % args.binary)
 
     if errors:
-        print("check_no_emulation: FAILED (recompilation only, no emulation; see AGENTS.md)",
+        print("check_no_emulation: FAILED (recompilation only, no emulation; see README.md)",
               file=sys.stderr)
         for e in errors:
             print("  - " + e, file=sys.stderr)

@@ -1,5 +1,5 @@
 #!/bin/bash
-# usage: POSTER=<MAGI name> tools/prof/run_windowed.sh <binary> <run-name> [VAR=value ...]
+# usage: tools/prof/run_windowed.sh <binary> <run-name> [VAR=value ...]
 # A scripted gameplay run in a real window, like the user's sessions (the
 # headless runs never showed the 0103-0106 FPS drop): tools/play/fast_pad.sh
 # to the Survival tutorial street, the user's build/settings.ini but windowed
@@ -12,13 +12,12 @@
 # DUMP_EVERY=<n> dumps every nth frame to build-runs/<run>/frames (2.7 MB each).
 # Output: build-runs/<run-name>.txt, build-runs/<run-name>/{flips.txt,settings.ini}.
 set -e
-R=/opt/git/tokyoJungleRecomp
+R="$(cd "$(dirname "$0")/../.." && pwd)"
 bin=$(realpath "$1"); name=$2; shift 2
 out=$R/build-runs/$name; log=$R/build-runs/$name.txt
 if [ "$(pgrep -x tokyojungle | wc -l)" -ge 2 ]; then echo "2 slots busy"; exit 2; fi
 rm -rf "$out"; mkdir -p "$out/cwd"
 sed 's/^display_mode *=.*/display_mode = windowed/' $R/build/settings.ini > "$out/settings.ini"
-$R/.agents/talk say ${POSTER:?set POSTER} "RUN start: $name ($bin, WINDOWED scripted, fast pad, fresh vfs, ${RUN_S:-240}s) $*" >/dev/null
 if [ -n "$SAVE" ]; then mkdir -p "$out/cwd/gamedata"; cp -a $R/gamedata/dev_hdd0 "$out/cwd/gamedata/"; fi
 dump=(); if [ -n "$DUMP_EVERY" ]; then mkdir -p "$out/frames"; dump=(TJ_FRAME_DUMP=$out/frames TJ_FRAME_DUMP_EVERY=$DUMP_EVERY TJ_FRAME_DUMP_MAX=400); fi
 cd "$out/cwd"
@@ -37,4 +36,3 @@ awk 'NR==1{t0=$1} {t=$1-t0; f[NR]=$2; tt[NR]=t}
      END{for(i=1;i+10<=NR;i+=10) printf "%d:%.0f ", tt[i], (f[i+10]-f[i])/(tt[i+10]-tt[i]);
          print ""; for(i=1;i<=NR;i++) if(tt[i]>=40){a=i;break}
          if(a) printf "gameplay (t>=40s) %.2f flips/s\n", (f[NR]-f[a])/(tt[NR]-tt[a])}' "$out/flips.txt"
-$R/.agents/talk say $POSTER "RUN done: $name" >/dev/null

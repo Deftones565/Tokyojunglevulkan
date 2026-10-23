@@ -1,9 +1,9 @@
 #!/bin/bash
-# usage: POSTER=<your MAGI name> tools/rsx/run_nv3089_census.sh <build-dir> <run-name> [gate-open-s] [gate-close-s]
+# usage: tools/rsx/run_nv3089_census.sh <build-dir> <run-name> [gate-open-s] [gate-close-s]
 # One scripted run (scripts/run_e2e.sh) with NV3089_GATE open from gate-open-s
 # to gate-close-s of wall time (default 180-190 = tutorial gameplay), then
 # tools/rsx/nv3089_census.py on its log.
-cd /opt/git/tokyoJungleRecomp
+cd "$(dirname "$0")/../.."
 B=$1; name=$2; t0=${3:-180}; t1=${4:-190}
 gate=$PWD/build-runs/$name.gate; rm -f "$gate"
 ( sleep "$t0"; touch "$gate"; sleep $((t1 - t0)); rm -f "$gate" ) &

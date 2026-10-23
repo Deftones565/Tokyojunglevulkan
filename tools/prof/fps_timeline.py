@@ -2,7 +2,7 @@
 """fps_timeline.py <frames dir> [--step N] [--from-flip F]: guest flips per wall
 second over time from a frame dump (frame_NNNNNN_flipFFFFFF.ppm, file mtimes =
 wall time), one line per N dumped frames, then the mean over flips >= F
-(default 4200: the Survival tutorial street with STATUS.md's 11-press script)."""
+(default 4200: the Survival tutorial street with the 11-press script)."""
 import argparse, os, re
 
 

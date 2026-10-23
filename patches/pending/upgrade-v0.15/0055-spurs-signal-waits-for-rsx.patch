@@ -11,7 +11,7 @@ index a40eeea..5252c5f 100644
 +     * output; on hardware the RSX has consumed them by then, but our drain
 +     * trails the PPU by up to a frame. Tokyo Jungle's fur task (taskset
 +     * 0x441D0B00) rewrites vertex data the queued fur draws still had to read:
-+     * the Pomeranian's fur exploded whenever that task ran fast (docs/STATUS.md,
++     * the Pomeranian's fur exploded whenever that task ran fast (bisected to
 +     * SPU image 9). Bounded: SPURS_SIGNAL_RSX_SYNC_MS (default 50, 0 = off). */
 +    { static long ms = -1;
 +      if (ms < 0) { const char* e = getenv("SPURS_SIGNAL_RSX_SYNC_MS"); ms = e ? atol(e) : 50; }

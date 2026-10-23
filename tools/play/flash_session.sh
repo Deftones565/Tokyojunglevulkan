@@ -1,5 +1,5 @@
 #!/bin/bash
-# usage: tools/play/flash_session.sh <run-name> [binary]   (env: POSTER=<MAGI name>)
+# usage: tools/play/flash_session.sh <run-name> [binary]
 # The user's own play session for the flashing / hang hunt: windowed with real
 # audio and controller and the user's save (like tools/play/user_session.sh),
 # with RSX_FLASH_DETECT=1 (each flash logs what the flash frame and its
@@ -15,13 +15,12 @@
 # while the last second ran under ${SLOW_FPS:-45} FPS. Report:
 #   python3 tools/prof/report.py build-runs/<run>/prof-slow.bin <binary>
 #   grep -a '\[flash\]' build-runs/<run>.txt
-cd /opt/git/tokyoJungleRecomp
+cd "$(dirname "$0")/../.."
 name=$1; bin=${2:-build-magi7/b/tokyojungle}; d=build-runs/$name
 mkdir -p $d
 bdir=$(dirname "$bin")
 [ -f "$bdir/settings.ini" ] || cp build/settings.ini "$bdir/settings.ini"
 vfs=$bdir/vfs-$name; rm -rf "$vfs"
-.agents/talk say ${POSTER:?set POSTER} "RUN start: $name ($bin, gdb=${GDB:-1} prof=${PROF:-0}, USER PLAYING windowed, flash detector)" >/dev/null
 
 [ -n "$PROF" ] && GDB=0
 gate=$PWD/$d/prof.gate; rm -f $gate
@@ -85,5 +84,4 @@ env -u TJ_HEADLESS -u PAD_SCRIPT -u PAD_FILE -u PS3_STRICT_LIFT -u SDL_AUDIODRIV
   RSX_FLASH_DETECT=1 "${profenv[@]}" "${pdenv[@]}" \
   "${gdbargs[@]}" ./$bin gamefiles/games/NPUA80523/USRDIR/EBOOT.ELF > $d.txt 2>&1
 echo "$name: FATAL $(grep -ac FATAL $d.txt); LIFT-GAP $(grep -ac LIFT-GAP $d.txt); flashes $(grep -ac '\[flash\] frame' $d.txt)"
-.agents/talk say $POSTER "RUN done: $name" >/dev/null
 wait

@@ -4,7 +4,7 @@
 #   a new log line matching FATAL / [LIFT-GAP] / UNIMPLEMENTED / UNRESOLVED /
 #   unresolved / stuck, the flip counter not moving across two frame dumps
 #   (hang), or the process ending. Run it again with the printed from-line.
-cd /opt/git/tokyoJungleRecomp
+cd "$(dirname "$0")/../.."
 name=$1; pid=$2; from=${3:-1}; log=build-runs/$name.txt; fd=build-runs/$name/frames
 pat='FATAL|\[LIFT-GAP\]|UNIMPLEMENTED|UNRESOLVED|unresolved|stuck|Segmentation|Aborted'
 lastflip=; same=0

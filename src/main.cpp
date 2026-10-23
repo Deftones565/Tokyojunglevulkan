@@ -554,7 +554,7 @@ static DWORD WINAPI frame_clock(LPVOID)
      * every 4 ms (plus the pass itself) left our RSX up to a frame behind the
      * PPU, and Tokyo Jungle's SPU fur task (image 9) then rewrote vertex data
      * that queued draws had not read yet: the exploding Pomeranian fur whenever
-     * that task ran fast (bal-9 vs bal-17 in docs/STATUS.md). So the loop now
+     * that task ran fast. So the loop now
      * polls `put` every TJ_DRAIN_POLL_US (default 250 us; 0 = the old fixed
      * Sleep(4)) and wakes as soon as it moved, a vblank tick is due, or 4 ms
      * passed. A walker parked on a segment an SPU hasn't patched yet leaves

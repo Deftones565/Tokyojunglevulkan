@@ -8,8 +8,8 @@ Finds which lifted SPU function misbehaves when built with the inlined pshufb `s
   function is wrapped in `#define spu_shufb spu_shufb_ref` (the byte-loop reference). Prints the
   kept function names. Use `<dst>=/dev/null` to just list a range.
 - `run.sh <name>`: one 240 s run of `$BISECT_BUILD` (default build-mel) with the 32-press script
-  to the tutorial, frame dumps to `build-runs/<name>/frames`, posting RUN start/done on the board
-  as `$BISECT_AGENT`. Dump window: `BISECT_EVERY` (presents per dump, default 30),
+  to the tutorial, frame dumps to `build-runs/<name>/frames`. Dump window: `BISECT_EVERY`
+  (presents per dump, default 30),
   `BISECT_SKIP` (dumps to drop, default 340), `BISECT_MAX` (dumps to keep, default 80). Dumps count
   presents, not flips, so a run under load reaches a given dump later: use a wide window
   (e.g. EVERY=10 SKIP=800 MAX=450).

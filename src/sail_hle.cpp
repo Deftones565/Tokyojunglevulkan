@@ -6,7 +6,7 @@
  * screens, the openings, the credits) through cellSail: a player with one
  * graphics and one sound adapter it polls once a frame (GetFrame), plus a
  * player callback that reports progress as events. This replaces the
- * firmware's libsail and libpamf, which ran lifted (scripts/lift_firmware.py).
+ * firmware's libsail and libpamf, which ran lifted.
  *
  * What the game sees is taken from a trace of the lifted libsail
  * (tools/sail/sail_trace.cpp, 2026-10-22): the events and their order, which
